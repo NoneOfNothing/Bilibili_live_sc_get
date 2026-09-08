@@ -49,6 +49,17 @@ def _fmt_ts(value: Any) -> str:
     return ""
 
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv_field(value: str) -> str:
+    """防 Excel 公式注入（OWASP CSV Injection）：以 = + - @ 或制表符开头的
+    单元格内容前缀单引号，避免被 Excel 当作公式执行。前缀本身不显示。"""
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 class SCStorage:
     """所有方法都应在事件循环内调用；写入均为小量追加，不做并发文件锁。"""
 
@@ -228,9 +239,9 @@ class SCStorage:
             writer.writerow([
                 sc.get("id", ""),
                 sc.get("price", ""),
-                user.get("uname") or sc.get("uname") or "",
+                _sanitize_csv_field(user.get("uname") or sc.get("uname") or ""),
                 sc.get("uid", ""),
-                message,
+                _sanitize_csv_field(message),
                 _fmt_ts(sc.get("start_time")),
                 _fmt_ts(sc.get("end_time")),
                 sc.get("time", ""),

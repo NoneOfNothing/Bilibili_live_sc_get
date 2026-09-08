@@ -18,7 +18,7 @@
 - CSV/JSONL 被占用（如 Excel 打开 CSV）时自动进入重试队列，每 5 秒补写；中途退出重启后也会恢复队列继续补写
 - 房间级互斥锁：同一房间不会被多个实例重复监听，避免并发写入损坏数据
 - 一个进程可同时监听多个直播间
-- `--auto` 自动跟随浏览器：扫描 Edge/Chrome 会话，把浏览器里打开的直播间自动加入监听（每 30 秒重扫，动态新增、不自动停止）
+- `--auto` 自动跟随浏览器（**实验性**）：扫描 Edge/Chrome 会话，把浏览器里打开的直播间自动加入监听（每 30 秒重扫，动态新增、不自动停止）。该实现方式存在明显局限，**日常使用推荐 GUI 启动方式手动管理房间**，详见[自动检测](#自动检测浏览器里的直播间auto)一节
 - 图形界面：房间管理（添加/删除/启停）、实时标题、房间备注、历史 SC 查看 + 实时显示、调试日志页签
 
 ## 快速开始
@@ -32,17 +32,17 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt          # Linux / macOS
 
 # 监听单个房间（可粘贴直播间链接），Ctrl+C 停止
-.venv\Scripts\python main.py 22625025
+.venv\Scripts\python main.py 直播间号
 
 # 监听多个房间、指定输出目录和日志文件
-.venv\Scripts\python main.py 22625025 21452505 -o data --log-file logs/sc.log
+.venv\Scripts\python main.py 直播间号1 直播间号2 -o data --log-file logs/sc.log
 ```
 
 Windows 下也可以直接**双击 `start_sc_get.bat`**（首次运行自动建虚拟环境装依赖；默认监听房间 1727071052，可在文件里修改，或从命令行传其他房间号）。
 
 **多开**：复制 `start_room_模板.bat` 并重命名为 `start_room_你的房间号.bat`，把里面的「房间号」替换成实际直播间号，双击即可启动一个独立实例窗口（窗口标题带房间号），**无需拷贝整个项目文件夹**。含房间号的启动脚本已被 `.gitignore` 排除，不会提交到 git。
 
-**自动跟随浏览器**：双击 `start_auto.bat`（或命令行 `python main.py --auto`），程序扫描 Edge/Chrome 当前打开的标签页，自动监听其中所有 B 站直播间；之后浏览器里**新开的直播间每 30 秒自动加入**，已加入的不会因关闭标签页而停止，详见下文[自动检测](#自动检测浏览器里的直播间auto)。
+**自动跟随浏览器（实验性，不推荐）**：双击 `start_auto.bat`（或命令行 `python main.py --auto`），程序扫描 Edge/Chrome 当前打开的标签页，自动监听其中所有 B 站直播间。⚠️ 该功能实现方式依赖对浏览器磁盘快照的字节扫描，可靠性有限（见下文说明），**日常使用建议改用 GUI 启动方式**（`start_gui.bat`），在界面中添加/启停直播间更直观可控。技术细节见[自动检测](#自动检测浏览器里的直播间auto)一节。
 
 ### 参数说明
 
@@ -59,9 +59,9 @@ Windows 下也可以直接**双击 `start_sc_get.bat`**（首次运行自动建�
 
 ```
 data/
-  room_22625025/
-    sc_20260906.jsonl     每日完整记录，一行一条 JSON
-    sc_20260906.csv       每日关键信息，utf-8-sig，Excel 可直接打开
+  room_直播间号/
+    sc_直播间号.jsonl     每日完整记录，一行一条 JSON
+    sc_直播间号.csv       每日关键信息，utf-8-sig，Excel 可直接打开
     deleted_ids.json      被删除（退款）的 SC id -> 删除时间
     pending_records.jsonl 因文件被占用暂未写入的记录（补写成功后自动删除）
     .room_lock            房间互斥锁（进程退出自动释放，文件残留无害）
@@ -70,7 +70,7 @@ data/
 JSONL 中一条 SC 记录（`sc` 字段保留了 B 站推送的完整原始数据，含头像、勋章、背景色等）：
 
 ```json
-{"type": "sc", "time_received": "2026-09-06T20:15:30", "room_id": 22625025,
+{"type": "sc", "time_received": "2026-09-06T20:15:30", "room_id": 114514,
  "sc": {"id": 123456, "price": 30, "message": "主播加油", "start_time": ..., "end_time": ..., "user_info": {"uname": "..."}}}
 ```
 
@@ -93,6 +93,18 @@ CSV 列：`sc_id, price_cny, username, uid, message, start_time, end_time, durat
 cookie 只用于读取弹幕连接 token，请注意保管，不要泄露或提交到仓库。
 
 ## 自动检测浏览器里的直播间（--auto）
+
+> ⚠️ **该功能为实验性实现，存在固有问题，推荐改用 GUI 启动方式（`start_gui.bat`）手动管理房间。**
+>
+> 当前实现是直接按字节扫描 Edge/Chrome 写到磁盘的**会话快照文件**，这带来一系列不可靠因素：
+>
+> - 依赖浏览器把标签页快照落盘的时机，刚打开的直播间最长要等一个扫描周期（30 秒）才能被发现；
+> - 仅支持 Edge / Chrome（Chromium 目录结构），Firefox 等浏览器无法识别；
+> - 已关闭但仍在 24 小时快照残留中的直播间会被**误包含**；
+> - 快照格式属于浏览器内部实现，随版本更新可能变化导致功能失效；
+> - 扫描得到的信息只有房间号，主播名等仍需额外接口查询。
+>
+> 相比之下，GUI 方式通过界面直接添加/启停/排序直播间，状态与标题实时更新，无上述问题。
 
 `start_auto.bat`（或 `python main.py --auto`）的工作方式：
 

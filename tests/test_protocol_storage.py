@@ -75,6 +75,19 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.flatten_packets(raw)
 
+    def test_zlib_decompression_bomb_rejected(self):
+        # 解压后超过上限的报文应被拒绝而不是耗尽内存
+        bomb = zlib.compress(b"\x00" * (protocol.MAX_DECOMPRESSED_SIZE + 1024))
+        packet = _packet(protocol.Operation.MESSAGE, bomb, protocol.PROTOCOL_ZLIB)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.flatten_packets(packet)
+
+    def test_normal_sized_compressed_packet_ok(self):
+        inner = _packet(protocol.Operation.MESSAGE, b'{"a": 1}')
+        packet = _packet(protocol.Operation.MESSAGE, zlib.compress(inner), protocol.PROTOCOL_ZLIB)
+        packets = protocol.flatten_packets(packet)
+        self.assertEqual(json.loads(packets[0][2]), {"a": 1})
+
 
 class SuperChatHandlerTests(unittest.TestCase):
     def setUp(self):
@@ -200,6 +213,17 @@ class RetryQueueTests(unittest.TestCase):
             self.assertTrue(self._pending_path().exists())
         self.assertEqual(self.storage.flush_pending(9527), 1)      # 解锁后补写成功
         self.assertEqual(self.storage.flush_pending(9527), 0)      # 队列已清空
+
+    def test_csv_formula_injection_guard(self):
+        # 以 = + - @ 开头的内容在 Excel 中会被当作公式，须前缀单引号防护。
+        # 注意 user_info 必须整体替换而非原地修改，避免污染共享的 SAMPLE_SC
+        sc = self._sc()
+        sc["message"] = '=HYPERLINK("http://evil.example")'
+        sc["user_info"] = {"uname": "+8613800000000"}
+        self.storage.save_sc(9527, sc, RECEIVED_AT)
+        rows = self._csv_rows()
+        self.assertTrue(rows[1][4].startswith("'="), rows[1][4])   # message 列
+        self.assertTrue(rows[1][2].startswith("'+"), rows[1][2])   # username 列
 
 
 class RoomLockTests(unittest.TestCase):

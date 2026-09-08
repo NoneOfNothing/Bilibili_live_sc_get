@@ -29,6 +29,12 @@ PROTOCOL_RAW = 0
 PROTOCOL_ZLIB = 2
 PROTOCOL_BROTLI = 3
 
+MAX_DECOMPRESSED_SIZE = 16 * 1024 * 1024
+"""单次解压输出的上限（字节），防解压炸弹导致内存耗尽。
+
+WebSocket 层已有 8MB 单消息限制，正常弹幕报文解压后远小于该值。
+"""
+
 
 class ProtocolError(Exception):
     """报文解析或解压失败。"""
@@ -65,11 +71,21 @@ def iter_packets(data: bytes) -> Iterator[Tuple[int, int, bytes]]:
 
 def _decompress(protocol: int, body: bytes) -> bytes:
     if protocol == PROTOCOL_ZLIB:
-        return zlib.decompress(body)
+        d = zlib.decompressobj()
+        out = d.decompress(body, MAX_DECOMPRESSED_SIZE + 1)
+        if len(out) > MAX_DECOMPRESSED_SIZE:
+            raise ProtocolError(f"解压后数据超过上限 {MAX_DECOMPRESSED_SIZE} 字节，疑似解压炸弹")
+        return out
     if protocol == PROTOCOL_BROTLI:
         if brotli is None:
             raise ProtocolError("收到 brotli 压缩报文但未安装 Brotli 库（pip install Brotli）")
-        return brotli.decompress(body)
+        try:
+            out = brotli.Decompressor().process(body)
+        except AttributeError:  # 旧版 Brotli 库无 Decompressor 类
+            out = brotli.decompress(body)
+        if len(out) > MAX_DECOMPRESSED_SIZE:
+            raise ProtocolError(f"解压后数据超过上限 {MAX_DECOMPRESSED_SIZE} 字节，疑似解压炸弹")
+        return out
     raise ProtocolError(f"未知的协议版本: {protocol}")
 
 
