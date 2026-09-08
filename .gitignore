@@ -9,6 +9,11 @@ data/
 logs/
 *.log
 
+# 个人直播间启动脚本（含房间号/主播名，请勿提交）；模板脚本不受影响
+start_room_*.bat
+start_sc_*.bat
+!start_room_模板.bat
+
 # 个人 cookie，切勿提交
 cookie.txt
 
