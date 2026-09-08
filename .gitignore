@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 运行产生的数据与日志
+data/
+logs/
+*.log
+
+# 个人 cookie，切勿提交
+cookie.txt
+
+.zcode/
+.vscode/
+.codebuddy/
