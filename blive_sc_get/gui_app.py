@@ -253,7 +253,7 @@ class ScMonitorApp:
 
         add_bar = ttk.Frame(tab)
         add_bar.pack(side="top", fill="x", padx=6, pady=(6, 4))
-        ttk.Label(add_bar, text="直播间号 / 直播间地址：").pack(side="left")
+        ttk.Label(add_bar, text="直播间号 / 直播间地址 / 主播主页地址：").pack(side="left")
         self.add_var = tk.StringVar()
         add_entry = ttk.Entry(add_bar, textvariable=self.add_var)
         add_entry.pack(side="left", fill="x", expand=True, padx=(4, 6))
