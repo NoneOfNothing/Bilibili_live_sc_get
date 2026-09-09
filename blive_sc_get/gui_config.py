@@ -25,6 +25,7 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     "pin_live": False,
     "notify_overlay": True,
     "notify_sound": DEFAULT_NOTIFY_SOUND,
+    "dm_visible": False,
 }
 
 
@@ -104,4 +105,5 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
         "notify_overlay", ui.get("notify_system", True)))  # 兼容旧键名
     if ui.get("notify_sound") in NOTIFY_SOUNDS:
         prefs["notify_sound"] = ui["notify_sound"]
+    prefs["dm_visible"] = bool(ui.get("dm_visible", False))
     return prefs

@@ -149,16 +149,18 @@ class GuiConfigTests(unittest.TestCase):
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "status", "pin_live": True,
                               "notify_overlay": False,
-                              "notify_sound": "三连音"})
+                              "notify_sound": "三连音", "dm_visible": True})
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "status", "pin_live": True,
-                          "notify_overlay": False, "notify_sound": "三连音"})
+                          "notify_overlay": False, "notify_sound": "三连音",
+                          "dm_visible": True})
         # 旧配置没有 notify_overlay 字段时缺省为开启
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "manual", "pin_live": False})
         prefs = load_ui_prefs(self.path)
         self.assertTrue(prefs["notify_overlay"])
         self.assertEqual(prefs["notify_sound"], "上行双音")
+        self.assertFalse(prefs["dm_visible"])
 
     def test_ui_prefs_legacy_key_migrates(self):
         # 旧键名 notify_system 迁移到 notify_overlay
@@ -169,11 +171,13 @@ class GuiConfigTests(unittest.TestCase):
     def test_ui_prefs_defaults(self):
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"),
                          {"sort_mode": "manual", "pin_live": False,
-                          "notify_overlay": True, "notify_sound": "上行双音"})
+                          "notify_overlay": True, "notify_sound": "上行双音",
+                          "dm_visible": False})
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "manual", "pin_live": False,
-                          "notify_overlay": True, "notify_sound": "上行双音"})
+                          "notify_overlay": True, "notify_sound": "上行双音",
+                          "dm_visible": False})
         # 非法排序方式/音效回退默认
         self.path.write_text(
             '{"rooms": [], "ui": {"sort_mode": "bogus", "notify_sound": "bogus"}}',
@@ -285,6 +289,41 @@ class ParseAddInputTests(unittest.TestCase):
         self.assertIsNone(room_id)
         self.assertEqual(uid, 12345678901)
 
+
+class BrowserCookieHelperTests(unittest.TestCase):
+    """浏览器 Cookie 提取的纯函数（不读真实浏览器数据）。"""
+
+    def test_is_bilibili_host(self):
+        from blive_sc_get.browser_cookie import is_bilibili_host
+        self.assertTrue(is_bilibili_host(".bilibili.com"))
+        self.assertTrue(is_bilibili_host("bilibili.com"))
+        self.assertTrue(is_bilibili_host("live.bilibili.com"))
+        self.assertFalse(is_bilibili_host("evil-bilibili.com"))
+        self.assertFalse(is_bilibili_host("bilibili.com.evil.com"))
+        self.assertFalse(is_bilibili_host(""))
+
+    def test_build_cookie_string(self):
+        from blive_sc_get.browser_cookie import build_cookie_string
+        self.assertEqual(build_cookie_string([("a", "1"), ("b", "2")]), "a=1; b=2")
+        self.assertEqual(build_cookie_string([]), "")
+
+    def test_decrypt_chromium_v10_roundtrip(self):
+        import os
+        from blive_sc_get.browser_cookie import decrypt_chromium_value
+        from Crypto.Cipher import AES
+        key = os.urandom(32)
+        nonce = os.urandom(12)
+        plain = "SESSDATA=abc%2Cdef"
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(plain.encode("utf-8"))
+        encrypted = b"v10" + nonce + ciphertext + tag
+        self.assertEqual(decrypt_chromium_value(encrypted, key), plain)
+
+    def test_decrypt_chromium_app_bound_unsupported(self):
+        from blive_sc_get.browser_cookie import decrypt_chromium_value
+        self.assertIsNone(decrypt_chromium_value(b"v20" + b"\x00" * 40, b"\x00" * 32))
+        self.assertIsNone(decrypt_chromium_value(b"app_bound" + b"\x00" * 40, b"\x00" * 32))
+    """悬浮窗堆叠位置的纯函数计算（不创建窗口）。"""
 
 class ToastGeometryTests(unittest.TestCase):
     """悬浮窗堆叠位置的纯函数计算（不创建窗口）。"""

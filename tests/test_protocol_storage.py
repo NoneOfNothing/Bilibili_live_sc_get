@@ -143,6 +143,112 @@ class SuperChatHandlerTests(unittest.TestCase):
         self.assertEqual(record["sc"]["id"], 10002)
 
 
+class DanmakuTests(unittest.TestCase):
+    """DANMU_MSG 解析、门控与弹幕落盘（dm_*.jsonl 与 SC 文件隔离）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.storage = SCStorage(self.tmp)
+        self.events = []
+        self.client = RoomClient(api=None, room_id=9527, storage=self.storage,
+                                 event_callback=lambda et, p: self.events.append((et, p)))
+        self.room_dir = self.tmp / "room_9527"
+
+    @staticmethod
+    def _dm(text="你好", uname="弹幕哥"):
+        return {"cmd": "DANMU_MSG",
+                "info": [[0, 1, 25, 16777271], text, [0, uname, 1, 0]]}
+
+    def test_disabled_by_default(self):
+        self.client._handle_business_message(json.dumps(self._dm()).encode("utf-8"))
+        self.assertEqual(self.events, [])
+        self.assertFalse(list(self.room_dir.glob("dm_*.jsonl")))
+
+    def test_enabled_emits_and_saves(self):
+        self.client.set_danmaku_enabled(True)
+        self.client._handle_business_message(json.dumps(self._dm()).encode("utf-8"))
+        self.assertEqual(len(self.events), 1)
+        etype, payload = self.events[0]
+        self.assertEqual(etype, "dm")
+        self.assertEqual(payload["room_id"], 9527)
+        self.assertEqual(payload["uname"], "弹幕哥")
+        self.assertEqual(payload["text"], "你好")
+        self.storage.flush_danmaku_buffers()  # 缓冲写，周期刷盘后落盘
+        files = list(self.room_dir.glob("dm_*.jsonl"))
+        self.assertEqual(len(files), 1)
+        record = json.loads(files[0].read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["type"], "dm")
+        self.assertEqual(record["text"], "你好")
+        # 弹幕文件不混入 SC 读取
+        self.assertEqual(self.storage.load_sc_page(9527), [])
+
+    def test_malformed_info_tolerated(self):
+        self.client.set_danmaku_enabled(True)
+        for bad in ({"cmd": "DANMU_MSG"},
+                    {"cmd": "DANMU_MSG", "info": [1, 2]},
+                    {"cmd": "DANMU_MSG", "info": [[], "", []]}):
+            self.client._handle_business_message(json.dumps(bad).encode("utf-8"))
+        self.assertEqual(self.events, [])
+
+    def test_emote_danmu_wrapped_in_brackets(self):
+        # 表情包弹幕（dm_type=1，info[0][13]）：info[1] 为触发词，显示为 [触发词]
+        self.client.set_danmaku_enabled(True)
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 1, 25, 16777215, 0, 0, 0, "h", 0, 0, 0, "", 0, 1, 0,
+                         '{"dm_type": 1}'], "百岁山", [0, "弹幕哥", 1, 0]]}
+        self.client._handle_business_message(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0][1]["text"], "[百岁山]")
+        self.storage.flush_danmaku_buffers()
+        record = json.loads(next(self.room_dir.glob("dm_*.jsonl"))
+                            .read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["text"], "[百岁山]")
+
+    def test_emote_danmu_with_brackets_unchanged(self):
+        # 触发词本身已带 [] 时不重复包裹
+        self.client.set_danmaku_enabled(True)
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 1, 25, 16777215, 0, 0, 0, "h", 0, 0, 0, "", 0, 1, 0, "{}"],
+                        "[已带括号]", [0, "弹幕哥", 1, 0]]}
+        self.client._handle_business_message(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+        self.assertEqual(self.events[0][1]["text"], "[已带括号]")
+
+    def test_emote_danmu_real_structure(self):
+        # 真实结构：info[0][13] 是表情图片信息对象（不是 dm_type），
+        # info[1] 为空时触发词从 extra 的 content 回退提取
+        extra = json.dumps({"dm_type": 1, "content": "打call",
+                            "emoticon_unique": "room_9527_109824"}, ensure_ascii=False)
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 4, 25, 14893055, 0, 0, 0, "h", 0, 0, 43, "", 1,
+                         {"bulge_display": 1, "emoticon_unique": "room_9527_109824",
+                          "url": "https://i0.hdslb.com/bfs/garb/x.jpg", "width": 162},
+                         "{}", {"extra": extra}],
+                        "", [0, "弹幕哥", 1, 0]]}
+        self.client.set_danmaku_enabled(True)
+        self.client._handle_business_message(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0][1]["text"], "[打call]")
+        self.storage.flush_danmaku_buffers()
+        record = json.loads(next(self.room_dir.glob("dm_*.jsonl"))
+                            .read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["text"], "[打call]")
+
+    def test_close_buffer_flushes_to_disk(self):
+        self.client.set_danmaku_enabled(True)
+        self.client._handle_business_message(json.dumps(self._dm()).encode("utf-8"))
+        self.storage.close_danmaku_buffers()
+        files = list(self.room_dir.glob("dm_*.jsonl"))
+        self.assertEqual(len(files), 1)
+        self.assertIn("你好", files[0].read_text(encoding="utf-8"))
+
+    def test_set_danmaku_enabled_disables_again(self):
+        self.client.set_danmaku_enabled(True)
+        self.client.set_danmaku_enabled(False)
+        self.client._handle_business_message(json.dumps(self._dm()).encode("utf-8"))
+        self.assertEqual(self.events, [])
+
+
 RECEIVED_AT = datetime(2026, 9, 6, 20, 0, 0)
 
 

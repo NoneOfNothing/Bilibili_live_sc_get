@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-file", default=None, help="同时把日志写入指定文件")
     parser.add_argument("--gui", action="store_true", help="启动图形界面（忽略房间号等参数）")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志（全部消息类型、人气值）")
-    parser.add_argument("--version", action="version", version="blive_sc_get 1.4.0")
+    parser.add_argument("--version", action="version", version="blive_sc_get 1.5.0")
     return parser
 
 
@@ -107,11 +107,12 @@ AUTO_RESCAN_INTERVAL = 30.0
 
 
 async def _pending_flush_loop(storage: SCStorage) -> None:
-    """定期补写因文件被占用（如 Excel 打开 CSV）而暂存的记录。"""
+    """定期补写因文件被占用（如 Excel 打开 CSV）而暂存的记录，并刷弹幕缓冲。"""
     while True:
         await asyncio.sleep(PENDING_FLUSH_INTERVAL)
         try:
             storage.flush_all_pending()
+            storage.flush_danmaku_buffers()
         except Exception:
             logger.exception("重试队列补写出错")
 
@@ -213,6 +214,7 @@ async def run(args: argparse.Namespace) -> bool:
                 task.cancel()
             await asyncio.gather(*everything, return_exceptions=True)
             storage.flush_all_pending()  # 退出前最后补写一次
+            storage.close_danmaku_buffers()  # 关闭弹幕句柄并刷盘
         return all_ok
 
 

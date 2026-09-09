@@ -74,6 +74,20 @@ class BilibiliLiveAPI:
     def has_cookie(self) -> bool:
         return bool(self._cookie)
 
+    async def refresh_login(self) -> None:
+        """登录状态变化后（如 GUI 获取到新 cookie）刷新登录 uid。"""
+        if self._cookie:
+            await self._fetch_uid()
+
+    def set_cookie(self, cookie: str) -> None:
+        """运行时更新 cookie（GUI 获取浏览器 Cookie 后调用），并刷新 buvid3。"""
+        self._cookie = (cookie or "").strip()
+        match = re.search(r"buvid3=([^;]+)", self._cookie)
+        if match:
+            self.buvid3 = match.group(1).strip()
+        logger.info("会话 cookie 已更新（长度 %d，含 buvid3=%s）",
+                    len(self._cookie), "是" if self.buvid3 else "否")
+
     def _headers(self) -> Dict[str, str]:
         headers = {
             "User-Agent": USER_AGENT,

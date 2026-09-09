@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, List, Set, Union
 logger = logging.getLogger(__name__)
 
 JSONL_PREFIX = "sc_"
+DM_PREFIX = "dm_"
 DELETED_FILE_NAME = "deleted_ids.json"
 PENDING_FILE_NAME = "pending_records.jsonl"
 
@@ -68,6 +69,8 @@ class SCStorage:
         # room_id -> 待补写记录列表，元素形如
         # {"sc": {...}, "received_at": iso, "jsonl_done": bool, "csv_done": bool}
         self._pending: Dict[int, List[Dict[str, Any]]] = {}
+        # room_id -> 追加模式弹幕文件句柄（缓冲写，定期 flush）
+        self._dm_files: Dict[int, Any] = {}
 
     @property
     def base_dir(self) -> Path:
@@ -188,6 +191,65 @@ class SCStorage:
     def flush_all_pending(self) -> int:
         """补写所有房间的重试队列，由定时任务周期性调用。"""
         return sum(self.flush_pending(room_id) for room_id in list(self._pending))
+
+    # ---------- 弹幕落盘（dm_YYYYMMDD.jsonl，缓冲写） ----------
+
+    def save_danmaku(self, room_id: int, uname: str, text: str,
+                     received_at: datetime) -> None:
+        """追加写入一条弹幕（缓冲句柄，跨日自动切换文件）。
+
+        高频写入不做每条开关文件，由 flush_danmaku_buffers 周期性刷盘；
+        写入失败抛 OSError，由调用方决定丢弃（弹幕非关键数据）。
+        """
+        room_dir = self._room_dir(room_id)
+        expected = room_dir / f"{DM_PREFIX}{received_at.strftime('%Y%m%d')}.jsonl"
+        handle = self._dm_files.get(room_id)
+        if handle is None or getattr(handle, "_blive_path", None) != expected:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            handle = expected.open("a", encoding="utf-8")
+            handle._blive_path = expected  # 标记当前句柄对应的文件，用于跨日检测
+            self._dm_files[room_id] = handle
+        record = {
+            "type": "dm",
+            "time_received": received_at.isoformat(timespec="seconds"),
+            "room_id": room_id,
+            "uname": uname,
+            "text": text,
+        }
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def flush_danmaku_buffers(self) -> None:
+        """把缓冲中的弹幕刷盘，由定时任务周期性调用。"""
+        for handle in self._dm_files.values():
+            try:
+                handle.flush()
+            except OSError as exc:
+                logger.debug("弹幕缓冲刷盘失败: %s", exc)
+
+    def close_danmaku_buffer(self, room_id: int) -> None:
+        """关闭并移除单个房间的弹幕句柄（停止监听该房间时调用）。"""
+        handle = self._dm_files.pop(room_id, None)
+        if handle is None:
+            return
+        try:
+            handle.flush()
+            handle.close()
+        except OSError:
+            pass
+
+    def close_danmaku_buffers(self) -> None:
+        """关闭所有弹幕句柄（程序退出前调用）。"""
+        for handle in self._dm_files.values():
+            try:
+                handle.flush()
+                handle.close()
+            except OSError:
+                pass
+        self._dm_files.clear()
 
     @staticmethod
     def _parse_received_at(item: Dict[str, Any]) -> datetime:
