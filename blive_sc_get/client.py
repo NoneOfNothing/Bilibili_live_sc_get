@@ -70,9 +70,17 @@ class RoomClient:
         self._last_status_refresh = 0.0  # monotonic 时间戳，用于状态刷新防抖
         self._status_refresh_pending = False  # 防抖窗口内已有待发的合并刷新
         self._offline_signal = False  # 收到 PREPARING/STOP_LIVE_ROOM_LIST 等确定性关播信号
+        self._dm_enabled = False  # 弹幕接收开关（GUI 按当前选中房间设置）
         self._title = ""  # 最近一次已知的直播标题（离线兜底 emit 用）
         self._uid = 0  # 最近一次已知的主播 uid
         self._offline_confirm_task: Optional[asyncio.Task] = None
+
+    def set_danmaku_enabled(self, enabled: bool) -> None:
+        """开关弹幕接收（GUI 按当前选中房间设置；bool 赋值线程安全）。
+
+        开启后收到的弹幕会落盘并广播 dm 事件；关闭则解析后直接丢弃。
+        """
+        self._dm_enabled = bool(enabled)
 
     def _emit(self, event_type: str, payload: dict) -> None:
         """向外部（如 GUI）推送事件；回调异常不影响监听本身。"""
@@ -129,6 +137,7 @@ class RoomClient:
                 self._room_lock.release()
                 self._room_lock = None
                 self._log.debug("已释放房间锁")
+            self._storage.close_danmaku_buffer(self._room_id)  # 刷盘并关闭弹幕句柄
 
     async def _run_once(self) -> None:
         room_info = await self._api.get_full_room_info(self._room_id_input)
@@ -291,8 +300,49 @@ class RoomClient:
             self._on_stop_live_room_list(command)
         elif cmd in ("ONLINE_RANK_COUNT", "ONLINE_RANK_V2"):
             self._on_online_rank_count(command)
+        elif cmd.startswith("DANMU_MSG"):
+            self._on_danmu_msg(command)
         else:
             self._log.debug("消息 %s", cmd)
+
+    def _on_danmu_msg(self, command: dict) -> None:
+        """普通弹幕：开关开启时落盘并广播 dm 事件，关闭则直接丢弃。
+
+        表情包弹幕（dm_type=1，见 info[0][13]）的 info[1] 为表情触发词，
+        统一以 [名称] 形式显示/落盘。
+        """
+        if not self._dm_enabled:
+            return
+        # DANMU_MSG 的 info 在 cmd 同级（不在 data 下）：info[1]=内容、info[2]=用户信息
+        info = command.get("info")
+        if not isinstance(info, list) or len(info) < 3:
+            return
+        text = info[1] if isinstance(info[1], str) else ""
+        user = info[2] if isinstance(info[2], list) else []
+        uname = user[1] if len(user) > 1 and isinstance(user[1], str) else "未知用户"
+        try:
+            uid = int(user[0]) if user and isinstance(user[0], (int, str)) else 0
+        except (TypeError, ValueError):
+            uid = 0
+        if self._is_emote_danmu(info):
+            word = text.strip() or str(self._parse_dm_extra(info).get("content", "")).strip()
+            text = word if (word.startswith("[") and word.endswith("]") and len(word) > 2) \
+                else f"[{word or '表情包'}]"
+        if not text:
+            return
+        received_at = datetime.now()
+        try:
+            self._storage.save_danmaku(self._room_id, uname, text, received_at)
+        except OSError as exc:
+            # 弹幕非关键数据：落盘失败（如文件被占用）直接丢弃，不影响显示
+            self._log.debug("弹幕落盘失败: %s", exc)
+        self._emit("dm", {
+            "room_id": self._room_id,
+            "time": received_at.isoformat(timespec="seconds"),
+            "uname": uname,
+            "uid": uid,
+            "text": text,
+        })
 
     def _on_online_rank_count(self, command: dict) -> None:
         """直播间实时在线人数（同接），弹幕服务器随流推送。"""
@@ -395,6 +445,37 @@ class RoomClient:
             "anchor_name": self._anchor_name,
             "uid": self._uid,
         })
+
+    @staticmethod
+    def _parse_dm_extra(info: list) -> dict:
+        """解析 DANMU_MSG 的 extra（info[0][15]）。
+
+        实测结构为 {"extra": "<JSON 字符串>"}（dm_type/content 在内层），
+        旧版为平铺对象或 JSON 字符串，三种形态都兼容。
+        """
+        meta = info[0] if isinstance(info[0], list) else []
+        extra = meta[15] if len(meta) > 15 else {}
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except ValueError:
+                return {}
+        if isinstance(extra, dict) and isinstance(extra.get("extra"), str):
+            try:
+                inner = json.loads(extra["extra"])
+            except ValueError:
+                return {}
+            if isinstance(inner, dict):
+                return inner
+        return extra if isinstance(extra, dict) else {}
+
+    @staticmethod
+    def _is_emote_danmu(info: list) -> bool:
+        """判断是否表情包弹幕：dm_type 位于 info[0][15] 的 extra JSON 内。
+
+        注意实测中 info[0][13] 是表情图片信息对象，不是 dm_type。
+        """
+        return RoomClient._parse_dm_extra(info).get("dm_type") == 1
 
     def _on_super_chat(self, command: dict) -> None:
         data = command.get("data")

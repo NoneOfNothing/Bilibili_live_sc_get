@@ -28,8 +28,9 @@ except ImportError:
     winsound = None
 
 from .api import BilibiliLiveAPI
+from .browser_cookie import get_bilibili_cookie
 from .browser_rooms import is_room_being_recorded
-from .cli import _pending_flush_loop, parse_room_id, resolve_cookie
+from .cli import COOKIE_FILE_NAME, _pending_flush_loop, parse_room_id, resolve_cookie
 from .client import LIVE_STATUS_TEXT, RoomClient
 from .gui_config import (
     NOTIFY_SOUNDS,
@@ -42,6 +43,8 @@ from .storage import SCStorage
 from .overlay import ToastOverlayManager
 
 logger = logging.getLogger("gui")
+
+COOKIE_FILE_PATH = Path(__file__).resolve().parent.parent / COOKIE_FILE_NAME
 
 DEBUG_LOG_MAX_LINES = 4000
 
@@ -173,6 +176,7 @@ class AsyncHub:
                 flush_task.cancel()
                 await asyncio.gather(flush_task, return_exceptions=True)
                 self.storage.flush_all_pending()  # 退出前最后补写一次
+                self.storage.close_danmaku_buffers()  # 关闭弹幕句柄并刷盘
         except Exception as exc:
             self.ui_queue.put(("hub_init_failed", {"error": str(exc)}))
 
@@ -214,6 +218,9 @@ class ScMonitorApp:
         self.viewers: Dict[int, int] = {}     # 房间号 -> 观众数量（同接）
         self._autoscroll_anchor_y = 0  # 中键滚动锚点（屏幕坐标）
         self._autoscroll_widget: Optional[tk.Text] = None
+        self._dm_grew = False  # 窗口化时弹幕区是否已向下扩展
+        self._dm_grew_delta = 0  # 弹幕区向下扩展的像素数
+        self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -245,12 +252,14 @@ class ScMonitorApp:
             scale = max(dpi / 96.0, 1.0)
         except Exception:
             scale = 1.0
-        self.root.geometry(f"{int(1000 * scale)}x{int(680 * scale)}")
+        self._default_window_size = (int(1000 * scale), int(680 * scale))
+        self.root.geometry(f"{self._default_window_size[0]}x{self._default_window_size[1]}")
         self.root.minsize(int(820 * scale), int(540 * scale))
 
         style = ttk.Style(self.root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
+        style.configure("TPanedwindow", background="#9e9e9e")
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=6, pady=6)
@@ -300,11 +309,16 @@ class ScMonitorApp:
                   foreground="#888888").pack(side="left", padx=(8, 0))
 
         columns = ("room", "anchor", "status", "notify", "title", "note")
+        # 三个板块（房间列表 / SC / 弹幕）放入垂直 PanedWindow：
+        # 拖动分隔条即可调整各板块占用空间，窗口变化时按权重自动分配
+        self.paned = ttk.Panedwindow(tab, orient="vertical")
+        self.paned.pack(side="top", fill="both", expand=True)
         # 横向滚动条：用户拖宽 room/anchor 等固定列后，总宽可能超过窗口宽度，
         # 通过滚动条保证内容仍可完整查看
-        tree_wrap = ttk.Frame(tab)
-        tree_wrap.pack(side="top", fill="x", padx=6)
+        tree_wrap = ttk.Frame(self.paned)
+        self.tree_wrap = tree_wrap
         xscroll = ttk.Scrollbar(tree_wrap, orient="horizontal")
+        self.xscroll = xscroll
         xscroll.pack(side="bottom", fill="x")
         self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings",
                                  selectmode="extended", height=7,
@@ -325,8 +339,11 @@ class ScMonitorApp:
         for tag, color in (("live", "#1a7f37"), ("offline", "#555555"),
                            ("stopped", "#c62828"), ("disabled", "#999999")):
             self.tree.tag_configure(tag, foreground=color)
-        self.tree.pack(side="top", fill="x")
+        self.tree.pack(side="top", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_room_selected)
+        self.paned.add(tree_wrap, weight=3)
+        # 房间列表行数自适应窗格高度（拖动分隔条/窗口变化时自动调整）
+        tree_wrap.bind("<Configure>", self._fit_tree_height, add=True)
         # 拖动列分隔条时，把总列宽收紧到可视宽度内，防止列被拖出窗口右侧。
         # 注意：组件绑定先于 ttk 类绑定执行，此时新列宽还没生效，必须用
         # after_idle 延迟到类绑定处理完再计算；B1-Motion 让拖动过程中持续生效。
@@ -339,8 +356,19 @@ class ScMonitorApp:
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release, add=True)
         self.tree.bind("<<TreeviewColumnResize>>", self._clamp_columns_soon, add=True)
 
+        # 弹幕开关条（窗口最下方）；弹幕区开启时插在备注行之上、SC 区之下
+        dm_bar = ttk.Frame(tab)
+        self.dm_bar = dm_bar
+        dm_bar.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        self.dm_var = tk.BooleanVar(value=bool(self.ui_prefs.get("dm_visible", False)))
+        ttk.Checkbutton(dm_bar, text="弹幕", variable=self.dm_var,
+                        command=self._on_dm_toggled).pack(side="left")
+        ttk.Label(dm_bar, text="（开启后显示并保存当前选中房间的弹幕）",
+                  foreground="#888888").pack(side="left", padx=(6, 0))
+
         bottom = ttk.Frame(tab)
         bottom.pack(side="bottom", fill="x", padx=6, pady=(4, 6))
+        self.bottom_bar = bottom  # 弹幕区 pack(before=) 的定位参照
         ttk.Label(bottom, text="备注:").pack(side="left")
         self.note_var = tk.StringVar()
         self.note_entry = ttk.Entry(bottom, textvariable=self.note_var)
@@ -353,15 +381,20 @@ class ScMonitorApp:
         self.delete_btn.pack(side="left", padx=(0, 4))
         self.refresh_btn = ttk.Button(bottom, text="刷新历史", command=self._on_refresh_history)
         self.refresh_btn.pack(side="left")
+        self.cookie_btn = ttk.Button(bottom, text="获取Cookie", command=self._on_fetch_cookie)
+        self.cookie_btn.pack(side="left", padx=(8, 0))
 
-        self.sc_frame = ttk.LabelFrame(tab, text="醒目留言")
-        self.sc_frame.pack(side="bottom", fill="both", expand=True, padx=6, pady=4)
+        self.sc_frame = ttk.LabelFrame(self.paned, text="醒目留言")
+        self.paned.add(self.sc_frame, weight=5)
         # 底部常显当前房间的 SC 总数（区别于历史加载完成时插入文末的一次性提示）
         self.sc_total_var = tk.StringVar(value="")
         ttk.Label(self.sc_frame, textvariable=self.sc_total_var,
                   anchor="e").pack(side="bottom", fill="x")
+        # height 只影响请求高度：实际高度由 PanedWindow 分配；
+        # 请求过高会把底部备注/按钮行挤出窗口（Tk 控件不被父容器裁剪）
         self.sc_text = tk.Text(self.sc_frame, wrap="word", state="disabled",
-                               font=("Microsoft YaHei UI", 10), padx=6, pady=4)
+                               font=("Microsoft YaHei UI", 10), padx=6, pady=4,
+                               height=10)
         scroll = ttk.Scrollbar(self.sc_frame, command=self._on_sc_scroll)
         self.sc_text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -374,8 +407,24 @@ class ScMonitorApp:
                            ("price_0", "#1f1f1f"), ("price_50", "#b8860b"),
                            ("price_100", "#cc4444"), ("price_500", "#9932cc")):
             self.sc_text.tag_configure(tag, foreground=color)
-        self.sc_text.tag_configure("user", underline=1)
         self.sc_text.bind("<Button-1>", self._on_sc_click)
+
+        # 弹幕区（默认隐藏；开启时加入 PanedWindow 挤占其他板块空间）
+        self.dm_frame = ttk.LabelFrame(self.paned, text="弹幕")
+        self.dm_text = tk.Text(self.dm_frame, wrap="word", state="disabled",
+                               font=("Microsoft YaHei UI", 9), padx=6, pady=4,
+                               height=6)
+        dm_scroll = ttk.Scrollbar(self.dm_frame, command=self.dm_text.yview)
+        self.dm_text.configure(yscrollcommand=dm_scroll.set)
+        dm_scroll.pack(side="right", fill="y")
+        self.dm_text.pack(side="left", fill="both", expand=True)
+        for tag, color in (("dm_time", "#888888"), ("dm_user", "#0055cc")):
+            self.dm_text.tag_configure(tag, foreground=color)
+        self.dm_text.bind("<Button-1>", self._on_dm_click)
+        if self.dm_var.get():
+            self.paned.add(self.dm_frame, weight=2)
+            self._dm_grew = True
+            self._dm_adjust_window(True)
 
     def _build_debug_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook)
@@ -512,6 +561,7 @@ class ScMonitorApp:
         overflow = sum(widths.values()) - avail
         if overflow <= 0:
             self._tree_widths_cache = widths
+            self._update_tree_xscroll()
             return
         cache = self._tree_widths_cache
         flex = ("title", "note")
@@ -613,6 +663,102 @@ class ScMonitorApp:
         self.ui_prefs["notify_sound"] = self.sound_var.get()
         self._save_config()
         self._play_notify_sound()
+
+    # ---------- 弹幕区 ----------
+
+    def _on_dm_toggled(self) -> None:
+        visible = bool(self.dm_var.get())
+        self.ui_prefs["dm_visible"] = visible
+        self._save_config()
+        try:
+            if visible:
+                self.paned.add(self.dm_frame, weight=2)
+                self._clear_dm_view()
+            else:
+                self.paned.remove(self.dm_frame)
+        except tk.TclError:
+            pass  # 已处于目标状态（如启动恢复时重复 add）
+        self._dm_adjust_window(visible)
+        self._apply_dm_gate()
+
+    def _dm_adjust_window(self, visible: bool) -> None:
+        """弹幕区显隐的窗口尺寸策略：最大化时挤占现有空间；窗口化时向下扩展。
+
+        扩展量按弹幕区的实际请求高度动态计算——固定值在高 DPI 或内容较高时
+        不足，会导致 PanedWindow 内容溢出覆盖底部备注/按钮行。
+        注意：启动恢复时 root.geometry() 可能尚未生效（返回 1x1），
+        此时回退到默认窗口尺寸计算。
+        """
+        try:
+            if self.root.state() == "zoomed":
+                return  # 最大化：弹幕区自然挤占 SC 区空间，不动窗口
+        except tk.TclError:
+            return
+        if not visible and not self._dm_grew:
+            return
+        self.root.update_idletasks()
+        if visible:
+            delta = self.dm_frame.winfo_reqheight() + 8  # 实际请求高度 + 边距
+            self._dm_grew_delta = delta
+        else:
+            delta = -getattr(self, "_dm_grew_delta", 0)
+            self._dm_grew_delta = 0
+        try:
+            w, h = (int(v) for v in self.root.geometry().split("+")[0].split("x"))
+        except ValueError:
+            w, h = 0, 0
+        if w < 200 or h < 200:  # 几何尚未生效，使用默认尺寸
+            w, h = getattr(self, "_default_window_size", (1000, 680))
+        if h + delta < 400:  # 防止收缩得过小
+            return
+        parts = self.root.geometry().split("+")
+        geo = f"{w}x{h + delta}"
+        if len(parts) > 1:
+            geo += "+" + "+".join(parts[1:])
+        self.root.geometry(geo)
+        self._dm_grew = visible
+
+    def _apply_dm_gate(self) -> None:
+        """按开关与当前选中房间设置各 client 的弹幕接收门控。"""
+        enabled = bool(self.dm_var.get())
+        selected = self._selected_room_id
+        for room_id, (client, _task) in self.room_tasks.items():
+            client.set_danmaku_enabled(enabled and room_id == selected)
+
+    def _clear_dm_view(self) -> None:
+        self.dm_text.configure(state="normal")
+        self.dm_text.delete("1.0", "end")
+        self.dm_text.configure(state="disabled")
+
+    def _on_dm_click(self, event) -> None:
+        """点击弹幕中的用户名 → 打开其个人空间。"""
+        index = self.dm_text.index(f"@{event.x},{event.y}")
+        for tag in self.dm_text.tag_names(index):
+            tag = str(tag)
+            if tag.startswith("dmuid:"):
+                try:
+                    uid = int(tag.split(":", 1)[1])
+                except ValueError:
+                    return
+                if uid:
+                    webbrowser.open(f"https://space.bilibili.com/{uid}")
+                return
+
+    def _append_dm_batch(self, batch: List[dict]) -> None:
+        """批量插入当前房间的弹幕（本轮 poll 聚合一次插入，降低重排开销）。"""
+        if not batch:
+            return
+        text = self.dm_text
+        text.configure(state="normal")
+        for dm in batch:
+            time_str = str(dm.get("time", ""))
+            uid = int(dm.get("uid") or 0)
+            text.insert("end", f"[{time_str[11:19] or time_str}] ", "dm_time")
+            user_tag = f"dm_user dmuid:{uid}" if uid else "dm_user"
+            text.insert("end", f"{dm.get('uname', '')}：", user_tag)
+            text.insert("end", f"{dm.get('text', '')}\n")
+        text.configure(state="disabled")
+        text.see("end")
 
     def _sorted_room_ids(self) -> List[int]:
         mode = next(k for k, v in SORT_MODE_TEXTS.items() if v == self.sort_mode_var.get())
@@ -779,7 +925,105 @@ class ScMonitorApp:
     def _on_refresh_history(self) -> None:
         self._on_room_selected()
 
+    # ---------- 获取浏览器 Cookie ----------
+
+    def _on_fetch_cookie(self) -> None:
+        """确认后从本机浏览器 Cookie 数据库获取 B 站 Cookie（后台线程）。"""
+        if not messagebox.askyesno(
+            "获取 Cookie",
+            "将从本机浏览器的 Cookie 数据库中读取 bilibili.com 的 Cookie：\n\n"
+            "· 支持 Edge / Chrome / Brave / Vivaldi / Opera / Firefox\n"
+            "· 正在运行的浏览器优先，自动选择可用的 Cookie\n"
+            "· 仅写本地 cookie.txt（不会上传），并立即应用到当前会话\n\n"
+            "注意：\n"
+            "· 新版浏览器运行时会独占锁定 Cookie 数据库，获取时可能需要"
+            "**暂时完全退出对应浏览器**再重试\n"
+            "· 新版浏览器的 App-Bound 加密 Cookie 可能无法解密\n\n是否继续？",
+        ):
+            return
+        if self.hub.api is None:
+            messagebox.showwarning("请稍候", "后台网络初始化中，请稍后再试")
+            return
+        self.cookie_btn.configure(state="disabled")
+        logger.info("开始从本机浏览器获取 B 站 Cookie…")
+        threading.Thread(target=self._fetch_cookie_worker,
+                         name="fetch-cookie", daemon=True).start()
+
+    def _fetch_cookie_worker(self) -> None:
+        try:
+            cookie, source, errors = get_bilibili_cookie()
+        except Exception as exc:
+            logger.exception("获取浏览器 Cookie 异常")
+            cookie, source, errors = None, None, [f"获取过程异常：{exc}"]
+        self.ui_queue.put(("cookie_result",
+                           {"cookie": cookie, "source": source, "errors": errors}))
+
+    def _on_cookie_result(self, payload: dict) -> None:
+        self.cookie_btn.configure(state="normal")
+        cookie = payload.get("cookie")
+        source = payload.get("source")
+        errors = payload.get("errors") or []
+        for err in errors:
+            logger.info("Cookie 获取提示：%s", err)
+        if not cookie:
+            detail = "\n".join(errors) if errors else "未找到可用 Cookie"
+            messagebox.showerror(
+                "获取 Cookie 失败",
+                f"未能从本机浏览器获取到可用的 B 站 Cookie：\n\n{detail}\n\n"
+                "可手动从浏览器复制 Cookie 后保存为项目根目录的 cookie.txt\n"
+                "（浏览器 F12 → Network → 任选请求 → 复制 Cookie 请求头）")
+            return
+        try:
+            Path(COOKIE_FILE_PATH).write_text(cookie, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("获取 Cookie 失败", f"写入 cookie.txt 失败：{exc}")
+            return
+        self.hub.submit(self._async_apply_cookie(cookie))
+        logger.info("已获取 B 站 Cookie（来源：%s，长度 %d），已保存并应用到当前会话",
+                    source, len(cookie))
+        suffix = ("\n\n注意：\n" + "\n".join(errors)) if errors else ""
+        messagebox.showinfo("获取 Cookie 成功",
+                            f"来源：{source}\n已保存到 cookie.txt 并应用到当前会话。{suffix}")
+
+    async def _async_apply_cookie(self, cookie: str) -> None:
+        if self.hub.api is None:
+            return
+        self.hub.api.set_cookie(cookie)
+        try:
+            await self.hub.api.refresh_login()
+        except Exception as exc:
+            logger.debug("刷新登录 uid 失败: %s", exc)
+
     # ---------- 选中房间与 SC 显示 ----------
+
+    def _fit_tree_height(self, _event=None) -> None:
+        """房间列表行数随窗格高度自适应（拖动分隔条/窗口变化时触发）。"""
+        wrap_h = self.tree_wrap.winfo_height()
+        if wrap_h <= 1:
+            return
+        self._update_tree_xscroll()
+        try:
+            import tkinter.font as tkfont
+            row_h = tkfont.Font(font=self.tree.cget("font")).metrics("linespace") + 8
+        except Exception:
+            row_h = 28
+        scroll_h = self.xscroll.winfo_height() if self.xscroll.winfo_manager() else 0
+        rows = max(1, int((wrap_h - row_h - scroll_h - 8) // row_h))  # 扣除表头与滚动条
+        if rows != int(self.tree["height"]):
+            self.tree.configure(height=rows)
+
+    def _update_tree_xscroll(self) -> None:
+        """横向滚动条自动显隐：仅当列总宽超出窗格宽度时显示。"""
+        try:
+            total = sum(self.tree.column(c, "width") for c in self._tree_columns)
+            overflow = total > self.tree.winfo_width() + 2
+        except tk.TclError:
+            return
+        shown = bool(self.xscroll.winfo_manager())
+        if overflow and not shown:
+            self.xscroll.pack(side="bottom", fill="x")
+        elif not overflow and shown:
+            self.xscroll.pack_forget()
 
     def _on_room_selected(self, _event=None) -> None:
         self._flush_note()
@@ -788,6 +1032,8 @@ class ScMonitorApp:
         self._note_room_id = room_id
         self._refresh_buttons()
         self._clear_sc_view()
+        self._clear_dm_view()
+        self._apply_dm_gate()
         if room_id is None:
             self.sc_frame.configure(text="醒目留言")
             return
@@ -867,9 +1113,15 @@ class ScMonitorApp:
     @staticmethod
     def _render_record(text: tk.Text, record: dict, deleted: dict, at: str) -> None:
         sc = record["sc"]
-        for chunk, tag in build_sc_segments(record["time_received"], sc,
-                                            deleted=str(sc.get("id")) in deleted):
-            text.insert(at, chunk, tag or ())
+        segments = build_sc_segments(record["time_received"], sc,
+                                     deleted=str(sc.get("id")) in deleted)
+        mark = f"sc:{sc.get('id')}"
+        last = len(segments) - 1
+        for i, (chunk, tag) in enumerate(segments):
+            tags = tag or ()
+            if i < last:  # 结尾换行不打标记，删除标记可插在行尾
+                tags = f"{tags} {mark}".strip()
+            text.insert(at, chunk, tags or ())
 
     def _on_history_loaded(self, payload: dict) -> None:
         """渲染一页历史 SC；首次加载整页渲染，向上翻页时在顶部插入并保持视口。"""
@@ -918,9 +1170,15 @@ class ScMonitorApp:
         block: list = []
         for record in records:
             sc = record["sc"]
-            for chunk, tag in build_sc_segments(record["time_received"], sc,
-                                                deleted=str(sc.get("id")) in deleted):
-                block.append((chunk, tag))
+            mark = f"sc:{sc.get('id')}"
+            segments = build_sc_segments(record["time_received"], sc,
+                                         deleted=str(sc.get("id")) in deleted)
+            last = len(segments) - 1
+            for i, (chunk, tag) in enumerate(segments):
+                tags = tag or ()
+                if i < last:  # 结尾换行不打标记，删除标记可插在行尾
+                    tags = f"{tags} {mark}".strip()
+                block.append((chunk, tags))
         # 先插分割点再插本页内容（均插在 "1.0"，倒序保证段顺序）
         text.insert("1.0", f"（已读取 {loaded_before} 条历史记录）\n", "info")
         for chunk, tag in reversed(block):
@@ -1002,6 +1260,22 @@ class ScMonitorApp:
         self.sc_text.delete("1.0", "end")
         self.sc_text.configure(state="disabled")
 
+    def _mark_sc_deleted(self, sc_id) -> None:
+        """实时标记已删除/退款的 SC：在原弹幕行尾追加说明并整条置灰。
+
+        该条不在当前视图（如分页尚未加载到）时，退回为独立提示行。
+        """
+        tag = f"sc:{sc_id}"
+        ranges = self.sc_text.tag_ranges(tag)
+        if not ranges:
+            self._append_info(f"SC {sc_id} 已被删除（退款）")
+            return
+        text = self.sc_text
+        text.configure(state="normal")
+        text.insert(str(ranges[-1]), "  （已删除，退款）", "del")
+        text.tag_add("del", ranges[0], ranges[-1])  # 整条置灰，与历史行为一致
+        text.configure(state="disabled")
+
     def _append_info(self, text: str) -> None:
         self.sc_text.configure(state="normal")
         self.sc_text.insert("end", text + "\n", "info")
@@ -1026,8 +1300,14 @@ class ScMonitorApp:
     def _append_sc(self, time_str: str, sc: dict, deleted: bool = False,
                    pending: bool = False) -> None:
         self.sc_text.configure(state="normal")
-        for chunk, tag in build_sc_segments(time_str, sc, deleted, pending):
-            self.sc_text.insert("end", chunk, tag or ())
+        segments = build_sc_segments(time_str, sc, deleted, pending)
+        mark = f"sc:{sc.get('id')}"  # 打标记便于删除事件实时定位该条
+        last = len(segments) - 1
+        for i, (chunk, tag) in enumerate(segments):
+            tags = tag or ()
+            if i < last:  # 结尾换行不打标记，删除标记可插在行尾
+                tags = f"{tags} {mark}".strip()
+            self.sc_text.insert("end", chunk, tags or ())
         self.sc_text.configure(state="disabled")
         self.sc_text.see("end")
 
@@ -1146,6 +1426,7 @@ class ScMonitorApp:
             self.tree.selection_set(children[0])
         elif self._selected_room_id is not None:
             self._load_history(self._selected_room_id)
+        self._apply_dm_gate()
 
     def _on_hub_failed(self, error: str) -> None:
         logger.error("后台初始化失败：%s", error)
@@ -1197,13 +1478,16 @@ class ScMonitorApp:
         elif event_type == "delete":
             if room_id == self._selected_room_id:
                 for sc_id in payload.get("ids", []):
-                    self._append_info(f"SC {sc_id} 已被删除（退款）")
+                    self._mark_sc_deleted(sc_id)
         elif event_type == "stopped":
             self.client_states[room_id] = "stopped"
             self._refresh_row(room_id)
         elif event_type == "occupied":
             self.client_states[room_id] = "occupied"
             self._refresh_row(room_id)
+        elif event_type == "dm":
+            # 弹幕：加入待渲染批次，由 _poll_queue 周期末统一插入当前房间视图
+            self._dm_batch.append(payload)
         elif event_type == "online_count":
             # 同接：弹幕服务器推送的实时在线人数
             count = int(payload.get("count") or 0)
@@ -1315,10 +1599,18 @@ class ScMonitorApp:
                     self._on_add_result(item[1])
                 elif kind == "uid_result":
                     self._on_uid_result(item[1])
+                elif kind == "cookie_result":
+                    self._on_cookie_result(item[1])
         except queue.Empty:
             pass
         # 本轮所有日志行合并为一次插入，缓解拖动窗口时的卡顿
         self._append_logs(log_lines)
+        # 弹幕仅渲染当前选中房间的，本轮聚合一次插入
+        if self._dm_batch:
+            batch, self._dm_batch = self._dm_batch, []
+            selected = self._selected_room_id
+            self._append_dm_batch(
+                [d for d in batch if d.get("room_id") == selected])
         self.root.after(100, self._poll_queue)
 
     def _on_close(self) -> None:
