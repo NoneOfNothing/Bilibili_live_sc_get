@@ -32,13 +32,14 @@ from .browser_rooms import is_room_being_recorded
 from .cli import _pending_flush_loop, parse_room_id, resolve_cookie
 from .client import LIVE_STATUS_TEXT, RoomClient
 from .gui_config import (
-    SORT_MODES,
+    NOTIFY_SOUNDS,
     RoomEntry,
     load_room_entries,
     load_ui_prefs,
     save_room_entries,
 )
 from .storage import SCStorage
+from .overlay import ToastOverlayManager
 
 logger = logging.getLogger("gui")
 
@@ -81,6 +82,14 @@ def parse_add_input(raw: str) -> Tuple[Optional[int], Optional[int]]:
     return parse_room_id(raw), None
 
 PRICE_TAGS = ((500, "price_500"), (100, "price_100"), (50, "price_50"), (0, "price_0"))
+
+# 开播提示音播放器：键与 gui_config.NOTIFY_SOUNDS 一致，值为 winsound 播放函数
+NOTIFY_SOUND_PLAYERS = {
+    "上行双音": lambda ws: (ws.Beep(880, 120), ws.Beep(1318, 200)),
+    "三连音": lambda ws: (ws.Beep(988, 100), ws.Beep(1175, 100), ws.Beep(1568, 180)),
+    "Windows 系统提示音": lambda ws: ws.MessageBeep(ws.MB_ICONASTERISK),
+    "静音": lambda ws: None,
+}
 
 
 def build_sc_segments(time_str: str, sc: dict, deleted: bool = False,
@@ -187,6 +196,7 @@ class ScMonitorApp:
         self.root = root
         self.output_dir = output_dir
         self.config_path = Path(output_dir) / "gui_rooms.json"
+        self.overlay = ToastOverlayManager(root)
         self.ui_queue: "queue.Queue" = queue.Queue()
         self.hub = AsyncHub(output_dir, self.ui_queue)
 
@@ -273,6 +283,19 @@ class ScMonitorApp:
         self.pin_live_var = tk.BooleanVar(value=bool(self.ui_prefs["pin_live"]))
         ttk.Checkbutton(sort_bar, text="直播中置顶", variable=self.pin_live_var,
                         command=self._on_pin_live_toggled).pack(side="left")
+        self.notify_overlay_var = tk.BooleanVar(
+            value=bool(self.ui_prefs.get("notify_overlay", True)))
+        ttk.Checkbutton(sort_bar, text="悬浮窗通知", variable=self.notify_overlay_var,
+                        command=self._on_overlay_toggled).pack(side="left", padx=(8, 0))
+        ttk.Label(sort_bar, text="音效：").pack(side="left", padx=(8, 0))
+        self.sound_var = tk.StringVar(
+            value=str(self.ui_prefs.get("notify_sound", "上行双音")))
+        sound_box = ttk.Combobox(sort_bar, textvariable=self.sound_var, width=12,
+                                 values=list(NOTIFY_SOUNDS), state="readonly")
+        sound_box.pack(side="left")
+        sound_box.bind("<<ComboboxSelected>>", self._on_sound_selected)
+        ttk.Button(sort_bar, text="试听",
+                   command=self._play_notify_sound).pack(side="left", padx=(4, 0))
         ttk.Label(sort_bar, text="（按住行拖动可调整顺序，Ctrl 可多选）",
                   foreground="#888888").pack(side="left", padx=(8, 0))
 
@@ -580,6 +603,16 @@ class ScMonitorApp:
     def _on_pin_live_toggled(self) -> None:
         self.ui_prefs["pin_live"] = bool(self.pin_live_var.get())
         self._save_config()
+
+    def _on_overlay_toggled(self) -> None:
+        self.ui_prefs["notify_overlay"] = bool(self.notify_overlay_var.get())
+        self._save_config()
+        logger.info("开播悬浮窗提醒已%s", "开启" if self.ui_prefs["notify_overlay"] else "关闭")
+
+    def _on_sound_selected(self, _event=None) -> None:
+        self.ui_prefs["notify_sound"] = self.sound_var.get()
+        self._save_config()
+        self._play_notify_sound()
 
     def _sorted_room_ids(self) -> List[int]:
         mode = next(k for k, v in SORT_MODE_TEXTS.items() if v == self.sort_mode_var.get())
@@ -999,14 +1032,34 @@ class ScMonitorApp:
         self.sc_text.see("end")
 
     def _notify_live(self, room_id: int, title: str) -> None:
-        """开播提醒：系统提示音 + 任务栏图标闪烁（不弹窗，不干扰操作）。"""
+        """开播提醒：提示音 + 任务栏图标闪烁（悬浮窗由主开关另控）。"""
         logger.info("房间 %s 开播了：%s", room_id, title or "（无标题）")
-        if winsound is not None:
-            try:
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            except Exception:
-                pass
+        self._play_notify_sound()
         self._flash_taskbar()
+
+    def _play_notify_sound(self) -> None:
+        """按音效设置播放开播提示音（后台线程播放，不阻塞界面）。
+
+        Beep 直接驱动扬声器，不依赖系统声音方案；MessageBeep 播放系统
+        声音方案里的"星号"音（方案为"无"时无声，故仅作为显式选项提供）。
+        """
+        if winsound is None:
+            return
+        player = NOTIFY_SOUND_PLAYERS.get(
+            str(self.ui_prefs.get("notify_sound", "上行双音")))
+        if player is None:  # 静音
+            return
+
+        def _play() -> None:
+            try:
+                player(winsound)
+            except Exception:
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_play, name="notify-sound", daemon=True).start()
 
     def _flash_taskbar(self) -> None:
         """闪烁任务栏图标（Windows FlashWindowEx），其他平台静默跳过。"""
@@ -1033,6 +1086,13 @@ class ScMonitorApp:
             ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
         except Exception:
             pass
+
+    def _notify_overlay(self, room_id: int, title: str) -> None:
+        """弹右下角自绘悬浮提醒窗（不受勿扰模式影响，不抢占焦点）。"""
+        anchor = self.anchor_names.get(room_id)
+        head = f"{anchor} 开播了" if anchor else f"直播间 {room_id} 开播了"
+        message = title if len(title) <= 60 else title[:57] + "…"
+        self.overlay.show(head, message)
 
     def _flush_note(self) -> None:
         room_id = self._note_room_id
@@ -1111,9 +1171,14 @@ class ScMonitorApp:
                 self._save_config()
             # 开播提醒：仅在监听过程中从非直播中变为直播中时触发
             # （程序启动时已在直播中的房间不提醒，避免启动时连响）
-            if (prev_text and prev_text != "直播中" and status_text == "直播中"
-                    and (entry is None or entry.notify_live)):
-                self._notify_live(room_id, payload.get("title") or "")
+            if prev_text and prev_text != "直播中" and status_text == "直播中":
+                room_remind = entry is None or entry.notify_live
+                if room_remind:
+                    title = payload.get("title") or ""
+                    self._notify_live(room_id, title)
+                    # 悬浮窗提醒：全局主开关控制这一通道，房间级开关上面已判过
+                    if self.ui_prefs.get("notify_overlay", True):
+                        self._notify_overlay(room_id, title)
             if self.client_states.get(room_id) == "starting":
                 self.client_states[room_id] = "running"
             if self.tree.exists(str(room_id)):

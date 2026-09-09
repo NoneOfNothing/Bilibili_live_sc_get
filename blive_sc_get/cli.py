@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-file", default=None, help="同时把日志写入指定文件")
     parser.add_argument("--gui", action="store_true", help="启动图形界面（忽略房间号等参数）")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志（全部消息类型、人气值）")
-    parser.add_argument("--version", action="version", version="blive_sc_get 1.3.0")
+    parser.add_argument("--version", action="version", version="blive_sc_get 1.4.0")
     return parser
 
 

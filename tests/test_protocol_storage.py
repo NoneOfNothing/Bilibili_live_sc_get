@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from blive_sc_get import protocol
+from blive_sc_get import client as client_module
 from blive_sc_get.client import RoomClient
 from blive_sc_get.room_lock import RoomLock, RoomLockAcquireError
 from blive_sc_get.storage import SCStorage
@@ -332,6 +333,119 @@ class RoomClientLockTests(unittest.TestCase):
         self.assertIsNotNone(client._room_lock)
         self.assertTrue((self.tmp / "room_9527" / ".room_lock").exists())
         client._room_lock.release()
+
+
+class _CachedLiveAPI:
+    """模拟关播瞬间接口缓存：get_full_room_info 永远返回 live_status=1。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def get_full_room_info(self, room_id):
+        self.calls += 1
+        return {"room_id": room_id, "uid": 42, "title": "缓存标题", "live_status": 1}
+
+
+class OfflineSignalTests(unittest.TestCase):
+    """关播信号链路：乐观置为未开播、纠正接口缓存、确认刷新、节流合并。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # 常量调小让确认刷新在测试里立刻执行
+        self._orig = (client_module.OFFLINE_CONFIRM_DELAY,
+                      client_module.OFFLINE_CONFIRM_RETRY_DELAY,
+                      client_module.STATUS_REFRESH_DEBOUNCE)
+        client_module.OFFLINE_CONFIRM_DELAY = 0.01
+        client_module.OFFLINE_CONFIRM_RETRY_DELAY = 0.01
+        client_module.STATUS_REFRESH_DEBOUNCE = 0.05
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (client_module.OFFLINE_CONFIRM_DELAY,
+         client_module.OFFLINE_CONFIRM_RETRY_DELAY,
+         client_module.STATUS_REFRESH_DEBOUNCE) = self._orig
+
+    def _make_client(self, api, events):
+        return RoomClient(api=api, room_id=9527, storage=SCStorage(self.tmp),
+                          event_callback=lambda t, p: events.append((t, p)))
+
+    def _feed(self, client, command: dict) -> None:
+        client._handle_business_message(json.dumps(command).encode("utf-8"))
+
+    def test_preparing_emits_offline_despite_cached_api(self):
+        events = []
+        api = _CachedLiveAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            client._emit_status(1, "旧标题", 42)  # 连接时的基线：直播中
+            self._feed(client, {"cmd": "PREPARING"})
+            await asyncio.sleep(0)
+            # 立即乐观置为未开播，携带缓存标题
+            self.assertTrue(client._offline_signal)
+            self.assertEqual(events[-1][0], "status")
+            self.assertEqual(events[-1][1]["live_status"], 0)
+            self.assertEqual(events[-1][1]["title"], "旧标题")
+            await asyncio.sleep(0.1)  # 等待延迟确认刷新
+            statuses = [p for t, p in events if t == "status"]
+            # 确认刷新也发出 0：接口缓存的 1 被关播信号纠正
+            self.assertGreaterEqual(len(statuses), 3)
+            self.assertTrue(all(p["live_status"] == 0 for p in statuses[1:]))
+            self.assertEqual(statuses[-1]["title"], "缓存标题")
+            self.assertGreaterEqual(api.calls, 1)
+
+        asyncio.run(scenario())
+
+    def test_stop_live_room_list_hit_and_miss(self):
+        events = []
+        api = _CachedLiveAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            self._feed(client, {"cmd": "STOP_LIVE_ROOM_LIST",
+                                "data": {"room_id_list": [9527, 111]}})
+            await asyncio.sleep(0)
+            self.assertTrue(client._offline_signal)
+            self.assertEqual(events[-1][1]["live_status"], 0)
+
+            miss = self._make_client(_CachedLiveAPI(), [])
+            self._feed(miss, {"cmd": "STOP_LIVE_ROOM_LIST",
+                              "data": {"room_id_list": [111, 222]}})
+            await asyncio.sleep(0)
+            self.assertFalse(miss._offline_signal)
+
+        asyncio.run(scenario())
+
+    def test_live_clears_offline_signal(self):
+        events = []
+        api = _CachedLiveAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            self._feed(client, {"cmd": "PREPARING"})
+            await asyncio.sleep(0.1)  # 乐观 + 确认刷新均为 0
+            self._feed(client, {"cmd": "LIVE"})
+            await asyncio.sleep(0.1)
+            self.assertFalse(client._offline_signal)
+            self.assertEqual(events[-1][1]["live_status"], 1)  # 开播信号权威
+
+        asyncio.run(scenario())
+
+    def test_throttle_merges_burst_into_trailing_refresh(self):
+        events = []
+        api = _CachedLiveAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            for _ in range(3):
+                self._feed(client, {"cmd": "ROOM_CHANGE"})
+            await asyncio.sleep(0.3)
+            # 3 次触发 → 1 次立即刷新 + 1 次窗口末合并补发（而非丢弃或 3 次）
+            self.assertEqual(api.calls, 2)
+            self.assertEqual(len([p for t, p in events if t == "status"]), 2)
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

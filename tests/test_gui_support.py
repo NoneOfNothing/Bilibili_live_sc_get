@@ -16,6 +16,7 @@ from blive_sc_get.gui_config import (
     load_ui_prefs,
     save_room_entries,
 )
+from blive_sc_get.overlay import toast_geometry
 from blive_sc_get.storage import SCStorage
 
 
@@ -146,20 +147,40 @@ class GuiConfigTests(unittest.TestCase):
 
     def test_ui_prefs_roundtrip(self):
         save_room_entries(self.path, [RoomEntry(123)],
-                          ui={"sort_mode": "status", "pin_live": True})
+                          ui={"sort_mode": "status", "pin_live": True,
+                              "notify_overlay": False,
+                              "notify_sound": "三连音"})
         self.assertEqual(load_ui_prefs(self.path),
-                         {"sort_mode": "status", "pin_live": True})
+                         {"sort_mode": "status", "pin_live": True,
+                          "notify_overlay": False, "notify_sound": "三连音"})
+        # 旧配置没有 notify_overlay 字段时缺省为开启
+        save_room_entries(self.path, [RoomEntry(123)],
+                          ui={"sort_mode": "manual", "pin_live": False})
+        prefs = load_ui_prefs(self.path)
+        self.assertTrue(prefs["notify_overlay"])
+        self.assertEqual(prefs["notify_sound"], "上行双音")
+
+    def test_ui_prefs_legacy_key_migrates(self):
+        # 旧键名 notify_system 迁移到 notify_overlay
+        self.path.write_text(
+            '{"rooms": [], "ui": {"notify_system": false}}', encoding="utf-8")
+        self.assertFalse(load_ui_prefs(self.path)["notify_overlay"])
 
     def test_ui_prefs_defaults(self):
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"),
-                         {"sort_mode": "manual", "pin_live": False})
+                         {"sort_mode": "manual", "pin_live": False,
+                          "notify_overlay": True, "notify_sound": "上行双音"})
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path),
-                         {"sort_mode": "manual", "pin_live": False})
-        # 非法排序方式回退默认
-        self.path.write_text('{"rooms": [], "ui": {"sort_mode": "bogus"}}',
-                             encoding="utf-8")
-        self.assertEqual(load_ui_prefs(self.path)["sort_mode"], "manual")
+                         {"sort_mode": "manual", "pin_live": False,
+                          "notify_overlay": True, "notify_sound": "上行双音"})
+        # 非法排序方式/音效回退默认
+        self.path.write_text(
+            '{"rooms": [], "ui": {"sort_mode": "bogus", "notify_sound": "bogus"}}',
+            encoding="utf-8")
+        prefs = load_ui_prefs(self.path)
+        self.assertEqual(prefs["sort_mode"], "manual")
+        self.assertEqual(prefs["notify_sound"], "上行双音")
 
 
 class StorageHistoryTests(unittest.TestCase):
@@ -263,6 +284,30 @@ class ParseAddInputTests(unittest.TestCase):
         room_id, uid = parse_add_input(raw)
         self.assertIsNone(room_id)
         self.assertEqual(uid, 12345678901)
+
+
+class ToastGeometryTests(unittest.TestCase):
+    """悬浮窗堆叠位置的纯函数计算（不创建窗口）。"""
+
+    def _parse(self, geom: str):
+        size, _, pos = geom.partition("+")
+        w, h = size.split("x")
+        x, y = pos.split("+")
+        return int(w), int(h), int(x), int(y)
+
+    def test_first_toast_sits_above_taskbar(self):
+        w, h, x, y = self._parse(toast_geometry(0, 1920, 1080, 60))
+        self.assertEqual(x, 1920 - 320 - 12)          # 右缘留边距
+        self.assertEqual(y, 1080 - 48 - 12 - 60)      # 任务栏之上
+
+    def test_stack_goes_upward_with_spacing(self):
+        _, _, _, y0 = self._parse(toast_geometry(0, 1920, 1080, 60))
+        _, _, _, y1 = self._parse(toast_geometry(1, 1920, 1080, 60))
+        self.assertEqual(y0 - y1, 60 + 8)             # 一个窗高 + 一个间距
+
+    def test_geometry_uses_fixed_width(self):
+        w, _h, _x, _y = self._parse(toast_geometry(0, 1920, 1080, 60))
+        self.assertEqual(w, 320)
 
 
 class BuildScSegmentsTests(unittest.TestCase):

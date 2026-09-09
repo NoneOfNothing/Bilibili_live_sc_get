@@ -36,6 +36,12 @@ AUTH_TIMEOUT = 10
 STATUS_REFRESH_DEBOUNCE = 2.0
 """实时刷新房间状态的最小间隔（秒），防止短时间内重复请求接口触发风控。"""
 
+OFFLINE_CONFIRM_DELAY = 3.0
+"""收到关播信号后，延迟多少秒重拉接口确认（避开接口 live_status 的缓存窗口）。"""
+
+OFFLINE_CONFIRM_RETRY_DELAY = 5.0
+"""关播确认刷新失败后的重试间隔（秒）。"""
+
 LIVE_STATUS_TEXT = {0: "未开播", 1: "直播中", 2: "轮播中"}
 
 
@@ -62,6 +68,11 @@ class RoomClient:
         self._connect_attempts = 0
         self._room_lock: Optional[RoomLock] = None
         self._last_status_refresh = 0.0  # monotonic 时间戳，用于状态刷新防抖
+        self._status_refresh_pending = False  # 防抖窗口内已有待发的合并刷新
+        self._offline_signal = False  # 收到 PREPARING/STOP_LIVE_ROOM_LIST 等确定性关播信号
+        self._title = ""  # 最近一次已知的直播标题（离线兜底 emit 用）
+        self._uid = 0  # 最近一次已知的主播 uid
+        self._offline_confirm_task: Optional[asyncio.Task] = None
 
     def _emit(self, event_type: str, payload: dict) -> None:
         """向外部（如 GUI）推送事件；回调异常不影响监听本身。"""
@@ -112,6 +123,8 @@ class RoomClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
         finally:
+            if self._offline_confirm_task is not None:
+                self._offline_confirm_task.cancel()
             if self._room_lock is not None:
                 self._room_lock.release()
                 self._room_lock = None
@@ -132,17 +145,15 @@ class RoomClient:
             self._log.info("输入的 %s 是短号，已转换为真实房间号 %s", self._room_id_input, self._room_id)
         status_text = LIVE_STATUS_TEXT.get(int(room_info.get("live_status") or 0), "未知")
         self._log.info("房间 %s（%s）标题：%s", self._room_id, status_text, room_info.get("title") or "未知")
+        live_status = int(room_info.get("live_status") or 0)
+        if live_status == 1:
+            # 连接时拉到的是新鲜数据，可清除可能残留的陈旧关播信号
+            self._offline_signal = False
         if not self._anchor_name:
             # 主播名基本不变，取一次即可；失败留空，下次重连再试
             self._anchor_name = await self._api.get_anchor_name(int(room_info.get("uid") or 0))
-        self._emit("status", {
-            "room_id": self._room_id,
-            "input_room_id": self._room_id_input,
-            "title": room_info.get("title") or "",
-            "live_status": int(room_info.get("live_status") or 0),
-            "anchor_name": self._anchor_name,
-            "uid": int(room_info.get("uid") or 0),
-        })
+        self._emit_status(live_status, room_info.get("title") or "",
+                          int(room_info.get("uid") or 0))
 
         danmu_info = await self._api.get_danmu_info(self._room_id)
         # 舰长数：非关键数据，失败不影响监听（v2 接口需要主播 uid）
@@ -270,11 +281,14 @@ class RoomClient:
         elif cmd.startswith("SUPER_CHAT_MESSAGE"):
             self._on_super_chat(command)
         elif cmd == "LIVE":
+            self._offline_signal = False  # 开播信号同样权威，清除关播信号
             self._schedule_status_refresh("开播")
         elif cmd == "PREPARING":
-            self._schedule_status_refresh("下播/准备中")
+            self._on_offline_signal("下播/准备中")
         elif cmd == "ROOM_CHANGE":
             self._schedule_status_refresh("房间信息变更（标题/分区）")
+        elif cmd == "STOP_LIVE_ROOM_LIST":
+            self._on_stop_live_room_list(command)
         elif cmd in ("ONLINE_RANK_COUNT", "ONLINE_RANK_V2"):
             self._on_online_rank_count(command)
         else:
@@ -287,33 +301,99 @@ class RoomClient:
         if isinstance(count, (int, float)) and count > 0:
             self._emit("online_count", {"room_id": self._room_id, "count": int(count)})
 
+    def _on_stop_live_room_list(self, command: dict) -> None:
+        """批量下播通知：名单包含本房间时视为确定性关播信号。"""
+        data = command.get("data") or {}
+        raw_list = data.get("room_id_list") or []
+        try:
+            ids = {int(r) for r in raw_list}
+        except (TypeError, ValueError):
+            ids = set()
+        if self._room_id in ids or self._room_id_input in ids:
+            self._on_offline_signal("下播(STOP_LIVE_ROOM_LIST)")
+        else:
+            self._log.debug("下播名单不含本房间: %s", raw_list)
+
+    def _on_offline_signal(self, reason: str) -> None:
+        """确定性关播信号处理：立即本地兜底置为未开播，并安排延迟确认刷新。
+
+        关播瞬间 room/v1/Room/get_info 常返回缓存的 live_status=1，因此本地状态
+        以弹幕推送为准，随后延迟重拉接口复核并刷新标题等字段。
+        """
+        if not self._offline_signal:
+            self._offline_signal = True
+            self._log.info("收到关播信号（%s），状态置为未开播", reason)
+            self._emit_status(0)
+        self._schedule_offline_confirm()
+
+    def _schedule_offline_confirm(self) -> None:
+        if self._offline_confirm_task is not None and not self._offline_confirm_task.done():
+            return  # 已有待执行的确认任务
+        self._offline_confirm_task = asyncio.create_task(self._confirm_offline())
+
+    async def _confirm_offline(self) -> None:
+        await asyncio.sleep(OFFLINE_CONFIRM_DELAY)
+        for delay in (0.0, OFFLINE_CONFIRM_RETRY_DELAY):
+            if delay:
+                await asyncio.sleep(delay)
+            if await self._refresh_room_status("关播确认"):
+                return
+
     def _schedule_status_refresh(self, reason: str) -> None:
-        """带防抖地安排一次房间状态刷新（LIVE/PREPARING/ROOM_CHANGE 触发）。"""
+        """带防抖地安排一次房间状态刷新；节流窗口内的请求合并为窗口结束后补发。"""
         now = time.monotonic()
-        if now - self._last_status_refresh < STATUS_REFRESH_DEBOUNCE:
-            self._log.debug("状态刷新过于频繁（%s），跳过本次", reason)
+        elapsed = now - self._last_status_refresh
+        if elapsed < STATUS_REFRESH_DEBOUNCE:
+            if self._status_refresh_pending:
+                self._log.debug("状态刷新合并（%s）", reason)
+                return
+            self._status_refresh_pending = True
+            delay = STATUS_REFRESH_DEBOUNCE - elapsed
+
+            async def _trailing() -> None:
+                await asyncio.sleep(delay)
+                self._status_refresh_pending = False
+                self._last_status_refresh = time.monotonic()
+                await self._refresh_room_status(f"{reason}（合并补发）")
+
+            asyncio.create_task(_trailing())
+            self._log.debug("状态刷新合并到 %.1f 秒后（%s）", delay, reason)
             return
         self._last_status_refresh = now
         asyncio.create_task(self._refresh_room_status(reason))
 
-    async def _refresh_room_status(self, reason: str) -> None:
-        """重新拉取房间信息并广播 status 事件，实现直播状态/标题实时更新。"""
+    async def _refresh_room_status(self, reason: str) -> bool:
+        """重新拉取房间信息并广播 status 事件，返回是否成功。"""
         try:
             info = await self._api.get_full_room_info(self._room_id_input)
         except (ApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             self._log.debug("刷新房间状态失败（%s）: %s", reason, exc)
-            return
+            return False
         live_status = int(info.get("live_status") or 0)
+        if self._offline_signal and live_status == 1:
+            # 关播瞬间接口常返回缓存的旧状态，以弹幕推送的关播信号为准
+            self._log.info("接口返回直播中但近期收到过关播信号，按未开播处理")
+            live_status = 0
         status_text = LIVE_STATUS_TEXT.get(live_status, "未知")
         title = info.get("title") or ""
         self._log.info("房间状态更新（%s）：%s，标题：%s", reason, status_text, title or "未知")
+        self._emit_status(live_status, title, int(info.get("uid") or 0))
+        return True
+
+    def _emit_status(self, live_status: int, title: Optional[str] = None,
+                     uid: Optional[int] = None) -> None:
+        """统一构造并广播 status 事件，同时维护本地缓存（离线兜底 emit 依赖）。"""
+        if title is not None:
+            self._title = title
+        if uid is not None:
+            self._uid = uid
         self._emit("status", {
             "room_id": self._room_id,
             "input_room_id": self._room_id_input,
-            "title": title,
+            "title": self._title,
             "live_status": live_status,
             "anchor_name": self._anchor_name,
-            "uid": int(info.get("uid") or 0),
+            "uid": self._uid,
         })
 
     def _on_super_chat(self, command: dict) -> None:
