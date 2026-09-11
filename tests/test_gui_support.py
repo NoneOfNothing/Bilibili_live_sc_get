@@ -152,17 +152,18 @@ class GuiConfigTests(unittest.TestCase):
     def test_ui_prefs_roundtrip(self):
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "status", "pin_live": True,
-                              "notify_overlay": False,
+                              "notify_overlay": False, "notify_persist": True,
                               "notify_sound": "三连音", "dm_visible": True})
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "status", "pin_live": True,
-                          "notify_overlay": False, "notify_sound": "三连音",
-                          "dm_visible": True})
-        # 旧配置没有 notify_overlay 字段时缺省为开启
+                          "notify_overlay": False, "notify_persist": True,
+                          "notify_sound": "三连音", "dm_visible": True})
+        # 旧配置没有 notify_overlay / notify_persist 字段时的缺省值
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "manual", "pin_live": False})
         prefs = load_ui_prefs(self.path)
         self.assertTrue(prefs["notify_overlay"])
+        self.assertFalse(prefs["notify_persist"])
         self.assertEqual(prefs["notify_sound"], "上行双音")
         self.assertFalse(prefs["dm_visible"])
 
@@ -175,13 +176,13 @@ class GuiConfigTests(unittest.TestCase):
     def test_ui_prefs_defaults(self):
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"),
                          {"sort_mode": "manual", "pin_live": False,
-                          "notify_overlay": True, "notify_sound": "上行双音",
-                          "dm_visible": False})
+                          "notify_overlay": True, "notify_persist": False,
+                          "notify_sound": "上行双音", "dm_visible": False})
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "manual", "pin_live": False,
-                          "notify_overlay": True, "notify_sound": "上行双音",
-                          "dm_visible": False})
+                          "notify_overlay": True, "notify_persist": False,
+                          "notify_sound": "上行双音", "dm_visible": False})
         # 非法排序方式/音效回退默认
         self.path.write_text(
             '{"rooms": [], "ui": {"sort_mode": "bogus", "notify_sound": "bogus"}}',

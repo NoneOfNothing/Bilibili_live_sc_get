@@ -7,8 +7,8 @@
 - 名称、图标、样式完全由本程序控制。
 
 悬浮窗由 :class:`ToastOverlayManager` 统一管理：右下角自下而上堆叠、
-超时自动消失、点击立即关闭、超出同时显示上限时关闭最旧一条。
-所有操作都在 tkinter 主线程执行。
+超时自动消失（可切换为常驻，仅点击关闭）、点击立即关闭、超出同时
+显示上限时关闭最旧一条。所有操作都在 tkinter 主线程执行。
 """
 
 from __future__ import annotations
@@ -65,8 +65,9 @@ class ToastWindow:
     """单条悬浮提醒窗。由 :class:`ToastOverlayManager` 创建与回收。"""
 
     def __init__(self, manager: "ToastOverlayManager", root: tk.Misc,
-                 title: str, body: str):
+                 title: str, body: str, persist: bool = False):
         self._manager = manager
+        self._persist = persist
         self._after_id: Optional[str] = None
         win = self._win = tk.Toplevel(root)
         win.overrideredirect(True)   # 无边框
@@ -82,6 +83,9 @@ class ToastWindow:
             tk.Label(inner, text=body, bg=_BG, fg=_FG_BODY, anchor="w",
                      justify="left", wraplength=WIDTH - 46,
                      font=("Microsoft YaHei UI", 9)).pack(fill="x", pady=(2, 0))
+        if persist:
+            tk.Label(inner, text="（点击关闭）", bg=_BG, fg=_FG_BODY, anchor="w",
+                     font=("Microsoft YaHei UI", 8)).pack(fill="x", pady=(4, 0))
         # 点击任意位置立即关闭；NOACTIVATE 风格下点击不会夺走焦点
         for widget in (win, accent, inner, *inner.winfo_children()):
             widget.bind("<Button-1>", lambda _e: self.close())
@@ -93,10 +97,11 @@ class ToastWindow:
         self._win.geometry(geom)
 
     def reveal(self) -> None:
-        """完成布局、应用不抢焦点风格并启动超时定时器。"""
+        """完成布局、应用不抢焦点风格；非常驻时启动超时自动关闭。"""
         self._win.update_idletasks()
         _apply_noactivate(self._win)
-        self._after_id = self._win.after(SHOW_DURATION_MS, self.close)
+        if not self._persist:
+            self._after_id = self._win.after(SHOW_DURATION_MS, self.close)
 
     def close(self) -> None:
         if self._after_id is not None:
@@ -119,11 +124,14 @@ class ToastOverlayManager:
         self._root = root
         self._toasts: List[ToastWindow] = []
 
-    def show(self, title: str, body: str = "") -> None:
-        """弹出一悬浮提醒；超过同时显示上限时关闭最旧一条。"""
+    def show(self, title: str, body: str = "", persist: bool = False) -> None:
+        """弹出一悬浮提醒；超过同时显示上限时关闭最旧一条。
+
+        persist=True 时该条常驻显示（不自动关闭），需点击才消失。
+        """
         while len(self._toasts) >= MAX_VISIBLE:
             self._toasts[0].close()
-        toast = ToastWindow(self, self._root, title, body)
+        toast = ToastWindow(self, self._root, title, body, persist=persist)
         self._toasts.append(toast)
         toast.reveal()
         self._relayout()

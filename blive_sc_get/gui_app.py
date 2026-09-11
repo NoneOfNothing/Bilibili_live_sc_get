@@ -69,6 +69,17 @@ TREE_COLUMN_MIN_WIDTHS = {"room": 60, "anchor": 60, "status": 60, "notify": 40,
 SORT_MODE_TEXTS = {"manual": "手动拖动", "room": "按房间号", "anchor": "按主播名",
                    "status": "按直播状态"}
 
+PANE_RATIO = (2.0, 3.5, 4.5)
+"""三个板块（房间列表 : 醒目留言 : 弹幕）的默认高度占比 2:3.5:4.5。
+
+PanedWindow 的初始布局由各窗格请求高度决定、weight 只影响多余空间的分配，
+因此默认占比需在首次布局后用 sashpos 显式设置（见 _apply_default_pane_ratio）。
+"""
+
+PANE_WEIGHTS = (4, 7, 9)
+"""与 PANE_RATIO 等比的整数 weight（2:3.5:4.5 = 4:7:9）；窗口尺寸变化时
+PanedWindow 按 weight 分配增减空间，从而保持该占比。"""
+
 SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)")
 
 
@@ -234,6 +245,7 @@ class ScMonitorApp:
         self._autoscroll_widget: Optional[tk.Text] = None
         self._dm_grew = False  # 窗口化时弹幕区是否已向下扩展
         self._dm_grew_delta = 0  # 弹幕区向下扩展的像素数
+        self._pane_ratio_done = False  # 三板块默认占比是否已应用（仅首次布局）
         self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
@@ -310,6 +322,15 @@ class ScMonitorApp:
             value=bool(self.ui_prefs.get("notify_overlay", True)))
         ttk.Checkbutton(sort_bar, text="悬浮窗通知", variable=self.notify_overlay_var,
                         command=self._on_overlay_toggled).pack(side="left", padx=(8, 0))
+        self.notify_persist_var = tk.BooleanVar(
+            value=bool(self.ui_prefs.get("notify_persist", False)))
+        self.notify_persist_check = ttk.Checkbutton(
+            sort_bar, text="弹窗常驻", variable=self.notify_persist_var,
+            command=self._on_persist_toggled)
+        self.notify_persist_check.pack(side="left", padx=(8, 0))
+        # 悬浮窗总开关关闭时，常驻选项无意义，初始即置灰（保留取值）
+        if not self.ui_prefs.get("notify_overlay", True):
+            self.notify_persist_check.configure(state="disabled")
         ttk.Label(sort_bar, text="音效：").pack(side="left", padx=(8, 0))
         self.sound_var = tk.StringVar(
             value=str(self.ui_prefs.get("notify_sound", "上行双音")))
@@ -324,9 +345,12 @@ class ScMonitorApp:
 
         columns = ("room", "anchor", "status", "notify", "title", "note")
         # 三个板块（房间列表 / SC / 弹幕）放入垂直 PanedWindow：
-        # 拖动分隔条即可调整各板块占用空间，窗口变化时按权重自动分配
+        # 初始高度按 PANE_RATIO（2:3.5:4.5）分配，窗口变化时按 PANE_WEIGHTS 等比伸缩，
+        # 拖动分隔条即可调整各板块占用空间
         self.paned = ttk.Panedwindow(tab, orient="vertical")
         self.paned.pack(side="top", fill="both", expand=True)
+        # 首次完成布局后按默认占比设置分隔条位置（此后不再干预用户手动拖动）
+        self.paned.bind("<Configure>", self._on_paned_configure, add=True)
         # 横向滚动条：用户拖宽 room/anchor 等固定列后，总宽可能超过窗口宽度，
         # 通过滚动条保证内容仍可完整查看
         tree_wrap = ttk.Frame(self.paned)
@@ -355,7 +379,7 @@ class ScMonitorApp:
             self.tree.tag_configure(tag, foreground=color)
         self.tree.pack(side="top", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_room_selected)
-        self.paned.add(tree_wrap, weight=3)
+        self.paned.add(tree_wrap, weight=PANE_WEIGHTS[0])
         # 房间列表行数自适应窗格高度（拖动分隔条/窗口变化时自动调整）
         tree_wrap.bind("<Configure>", self._fit_tree_height, add=True)
         # 拖动列分隔条时，把总列宽收紧到可视宽度内，防止列被拖出窗口右侧。
@@ -399,7 +423,7 @@ class ScMonitorApp:
         self.cookie_btn.pack(side="left", padx=(8, 0))
 
         self.sc_frame = ttk.LabelFrame(self.paned, text="醒目留言")
-        self.paned.add(self.sc_frame, weight=5)
+        self.paned.add(self.sc_frame, weight=PANE_WEIGHTS[1])
         # 底部常显当前房间的 SC 总数（区别于历史加载完成时插入文末的一次性提示）
         self.sc_total_var = tk.StringVar(value="")
         ttk.Label(self.sc_frame, textvariable=self.sc_total_var,
@@ -436,9 +460,37 @@ class ScMonitorApp:
             self.dm_text.tag_configure(tag, foreground=color)
         self.dm_text.bind("<Button-1>", self._on_dm_click)
         if self.dm_var.get():
-            self.paned.add(self.dm_frame, weight=2)
+            self.paned.add(self.dm_frame, weight=PANE_WEIGHTS[2])
             self._dm_grew = True
             self._dm_adjust_window(True)
+
+    def _on_paned_configure(self, _event=None) -> None:
+        """首次布局完成后应用一次默认占比；之后不再干预用户手动拖动。"""
+        if self._pane_ratio_done or self.paned.winfo_height() <= 20:
+            return
+        self._pane_ratio_done = True
+        self._apply_default_pane_ratio()
+
+    def _apply_default_pane_ratio(self) -> None:
+        """按 PANE_RATIO 设置各分隔条位置，使板块默认占比为 2:3.5:4.5。
+
+        PanedWindow 的初始尺寸取决于各窗格请求高度，weight 只决定多余空间
+        的分配，故这里显式设置 sashpos。弹幕区隐藏时只剩两个板块，取占比
+        前两项（房间列表:醒目留言 = 2:3.5）。
+        """
+        panes = self.paned.panes()
+        height = self.paned.winfo_height()
+        if len(panes) < 2 or height <= 1:
+            return
+        ratios = PANE_RATIO[:len(panes)]
+        total = sum(ratios)
+        accumulated = 0.0
+        for index, ratio in enumerate(ratios[:-1]):
+            accumulated += ratio
+            try:
+                self.paned.sashpos(index, int(height * accumulated / total))
+            except tk.TclError:
+                return
 
     def _build_debug_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook)
@@ -680,7 +732,17 @@ class ScMonitorApp:
     def _on_overlay_toggled(self) -> None:
         self.ui_prefs["notify_overlay"] = bool(self.notify_overlay_var.get())
         self._save_config()
+        # 悬浮窗总开关关闭时，常驻选项无意义，置灰（保留其取值）
+        self.notify_persist_check.configure(
+            state="normal" if self.ui_prefs["notify_overlay"] else "disabled")
         logger.info("开播悬浮窗提醒已%s", "开启" if self.ui_prefs["notify_overlay"] else "关闭")
+
+    def _on_persist_toggled(self) -> None:
+        self.ui_prefs["notify_persist"] = bool(self.notify_persist_var.get())
+        self._save_config()
+        logger.info(
+            "开播悬浮窗已设为%s",
+            "常驻（需点击关闭）" if self.ui_prefs["notify_persist"] else "超时自动关闭")
 
     def _on_sound_selected(self, _event=None) -> None:
         self.ui_prefs["notify_sound"] = self.sound_var.get()
@@ -695,13 +757,15 @@ class ScMonitorApp:
         self._save_config()
         try:
             if visible:
-                self.paned.add(self.dm_frame, weight=2)
+                self.paned.add(self.dm_frame, weight=PANE_WEIGHTS[2])
                 self._clear_dm_view()
             else:
                 self.paned.remove(self.dm_frame)
         except tk.TclError:
             pass  # 已处于目标状态（如启动恢复时重复 add）
         self._dm_adjust_window(visible)
+        # 板块增减会打乱占比，布局完成后按默认占比重新分配
+        self.root.after_idle(self._apply_default_pane_ratio)
         self._apply_dm_gate()
 
     def _dm_adjust_window(self, visible: bool) -> None:
@@ -1402,11 +1466,15 @@ class ScMonitorApp:
             pass
 
     def _notify_overlay(self, room_id: int, title: str) -> None:
-        """弹右下角自绘悬浮提醒窗（不受勿扰模式影响，不抢占焦点）。"""
+        """弹右下角自绘悬浮提醒窗（不受勿扰模式影响，不抢占焦点）。
+
+        「弹窗常驻」开启时不自动关闭，需点击才消失。
+        """
         anchor = self.anchor_names.get(room_id)
         head = f"{anchor} 开播了" if anchor else f"直播间 {room_id} 开播了"
         message = title if len(title) <= 60 else title[:57] + "…"
-        self.overlay.show(head, message)
+        self.overlay.show(head, message,
+                          persist=bool(self.ui_prefs.get("notify_persist", False)))
 
     def _flush_note(self) -> None:
         room_id = self._note_room_id

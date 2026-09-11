@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 SORT_MODES = ("manual", "room", "anchor", "status")
 
 # notify_overlay：开播时是否弹右下角自绘悬浮窗（全局主开关；每房间提醒列独立控制是否提醒）
+# notify_persist：悬浮窗是否常驻（不自动关闭，需点击才消失；仅在 notify_overlay 开启时生效）
 # notify_sound：开播提示音效（键名与 GUI 播放器映射表一致）
 NOTIFY_SOUNDS = ("上行双音", "三连音", "Windows 系统提示音", "静音")
 DEFAULT_NOTIFY_SOUND = "上行双音"
@@ -24,6 +25,7 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     "sort_mode": "manual",
     "pin_live": False,
     "notify_overlay": True,
+    "notify_persist": False,
     "notify_sound": DEFAULT_NOTIFY_SOUND,
     "dm_visible": False,
 }
@@ -103,6 +105,7 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     prefs["pin_live"] = bool(ui.get("pin_live", False))
     prefs["notify_overlay"] = bool(ui.get(
         "notify_overlay", ui.get("notify_system", True)))  # 兼容旧键名
+    prefs["notify_persist"] = bool(ui.get("notify_persist", False))
     if ui.get("notify_sound") in NOTIFY_SOUNDS:
         prefs["notify_sound"] = ui["notify_sound"]
     prefs["dm_visible"] = bool(ui.get("dm_visible", False))
