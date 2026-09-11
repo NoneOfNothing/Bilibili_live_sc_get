@@ -123,6 +123,20 @@ def build_sc_segments(time_str: str, sc: dict, deleted: bool = False,
     return segments
 
 
+def text_scrolled_to_bottom(yview: tuple, tolerance: float = 0.001) -> bool:
+    """根据 tk.Text.yview() 返回值判断视图是否位于（接近）最底部。
+
+    内容不足以产生滚动条时 yview() 返回 (0.0, 1.0)，同样视为在底部。
+    用于决定追加新内容后是否自动跟随滚动到底部：用户向上翻阅历史时，
+    新到达的消息不应把视图强制拉回底部。
+    """
+    try:
+        bottom = float(yview[1])
+    except (TypeError, ValueError, IndexError):
+        return True
+    return bottom >= 1.0 - tolerance
+
+
 class _QueueLogHandler(logging.Handler):
     """把日志记录转发到 UI 队列，由主线程轮询显示。"""
 
@@ -583,16 +597,25 @@ class ScMonitorApp:
     # ---------- 行拖动排序与点击跳转 ----------
 
     def _on_tree_press(self, event) -> None:
-        """记录按下的行：仅单元格区域可发起拖动排序（列分隔条排除）。"""
+        """记录按下的行：仅单元格区域可发起拖动排序（列分隔条排除）。
+
+        房间号(#1) / 主播(#2) 列是「点击跳转」列：返回 "break" 阻止 ttk 类绑定
+        改变选中行，避免跳转浏览器的同时连带切换下方 SC/弹幕面板（松手时仍由
+        _on_tree_release → _open_tree_link 完成跳转）。拖动排序不受影响，仍由
+        本方法记录的行在 B1-Motion 中完成移动。
+        """
         self._drag_iid = None
         self._drag_moved = False
         if self.tree.identify("region", event.x, event.y) != "cell":
             return
-        if self.tree.identify_column(event.x) == "#0":
+        col = self.tree.identify_column(event.x)
+        if col == "#0":
             return
         iid = self.tree.identify_row(event.y)
         if iid:
             self._drag_iid = iid
+        if col in ("#1", "#2"):  # 房间号 / 主播：点击跳转，不切换选中直播间
+            return "break"
 
     def _on_tree_drag_motion(self, event) -> None:
         # 列分隔条拖动时同步做列宽收紧
@@ -745,10 +768,15 @@ class ScMonitorApp:
                 return
 
     def _append_dm_batch(self, batch: List[dict]) -> None:
-        """批量插入当前房间的弹幕（本轮 poll 聚合一次插入，降低重排开销）。"""
+        """批量插入当前房间的弹幕（本轮 poll 聚合一次插入，降低重排开销）。
+
+        用户已向上翻阅历史（滚动条不在最底部）时保持视口不动，仅在原本位于
+        底部时才跟随滚动到最新弹幕。
+        """
         if not batch:
             return
         text = self.dm_text
+        follow = text_scrolled_to_bottom(text.yview())
         text.configure(state="normal")
         for dm in batch:
             time_str = str(dm.get("time", ""))
@@ -758,7 +786,8 @@ class ScMonitorApp:
             text.insert("end", f"{dm.get('uname', '')}：", user_tag)
             text.insert("end", f"{dm.get('text', '')}\n")
         text.configure(state="disabled")
-        text.see("end")
+        if follow:
+            text.see("end")
 
     def _sorted_room_ids(self) -> List[int]:
         mode = next(k for k, v in SORT_MODE_TEXTS.items() if v == self.sort_mode_var.get())
@@ -1277,10 +1306,12 @@ class ScMonitorApp:
         text.configure(state="disabled")
 
     def _append_info(self, text: str) -> None:
+        follow = text_scrolled_to_bottom(self.sc_text.yview())
         self.sc_text.configure(state="normal")
         self.sc_text.insert("end", text + "\n", "info")
         self.sc_text.configure(state="disabled")
-        self.sc_text.see("end")
+        if follow:
+            self.sc_text.see("end")
 
     def _on_sc_click(self, event) -> None:
         """点击 SC 中的用户名 → 打开其个人空间。"""
@@ -1299,6 +1330,8 @@ class ScMonitorApp:
 
     def _append_sc(self, time_str: str, sc: dict, deleted: bool = False,
                    pending: bool = False) -> None:
+        """实时追加一条 SC；用户已在向上翻阅历史时保持视口不跳动。"""
+        follow = text_scrolled_to_bottom(self.sc_text.yview())
         self.sc_text.configure(state="normal")
         segments = build_sc_segments(time_str, sc, deleted, pending)
         mark = f"sc:{sc.get('id')}"  # 打标记便于删除事件实时定位该条
@@ -1309,7 +1342,8 @@ class ScMonitorApp:
                 tags = f"{tags} {mark}".strip()
             self.sc_text.insert("end", chunk, tags or ())
         self.sc_text.configure(state="disabled")
-        self.sc_text.see("end")
+        if follow:
+            self.sc_text.see("end")
 
     def _notify_live(self, room_id: int, title: str) -> None:
         """开播提醒：提示音 + 任务栏图标闪烁（悬浮窗由主开关另控）。"""

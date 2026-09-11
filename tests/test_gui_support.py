@@ -9,7 +9,11 @@ from pathlib import Path
 
 from blive_sc_get.api import ApiError, BilibiliLiveAPI
 from blive_sc_get.client import RoomClient
-from blive_sc_get.gui_app import build_sc_segments, parse_add_input
+from blive_sc_get.gui_app import (
+    build_sc_segments,
+    parse_add_input,
+    text_scrolled_to_bottom,
+)
 from blive_sc_get.gui_config import (
     RoomEntry,
     load_room_entries,
@@ -385,6 +389,29 @@ class BuildScSegmentsTests(unittest.TestCase):
                            (60, "price_50"), (10, "price_0")):
             segments = build_sc_segments("t", dict(self.SC, price=price))
             self.assertIn(tag, [s[1] for s in segments], f"price={price}")
+
+
+class TextScrolledToBottomTests(unittest.TestCase):
+    """根据 yview() 判断是否位于底部：决定追加新内容后是否跟随滚动。"""
+
+    def test_at_bottom(self):
+        self.assertTrue(text_scrolled_to_bottom((0.5, 1.0)))
+
+    def test_scrolled_up(self):
+        self.assertFalse(text_scrolled_to_bottom((0.0, 0.4)))
+        self.assertFalse(text_scrolled_to_bottom((0.9, 0.99)))
+
+    def test_short_content_without_scrollbar(self):
+        # 内容不足一屏时 yview() 为 (0.0, 1.0)，应视为在底部
+        self.assertTrue(text_scrolled_to_bottom((0.0, 1.0)))
+
+    def test_within_tolerance(self):
+        # 浮点误差内（距底 0.05%）仍视为在底部
+        self.assertTrue(text_scrolled_to_bottom((0.9, 0.9995)))
+
+    def test_malformed_input_defaults_to_follow(self):
+        self.assertTrue(text_scrolled_to_bottom(None))
+        self.assertTrue(text_scrolled_to_bottom(()))
 
 
 if __name__ == "__main__":
