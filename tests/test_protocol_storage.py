@@ -248,6 +248,28 @@ class DanmakuTests(unittest.TestCase):
         self.client._handle_business_message(json.dumps(self._dm()).encode("utf-8"))
         self.assertEqual(self.events, [])
 
+    def test_dmid_extracted_from_candidates(self):
+        # dmid 取候选下标中最长的纯数字串；占位/空值取不到时返回 ""
+        self.assertEqual(RoomClient._extract_dmid([[]]), "")
+        self.assertEqual(RoomClient._extract_dmid([[0, 0, 0, 0, 0, 0, 0, 0]]), "")
+        self.assertEqual(
+            RoomClient._extract_dmid([[0, 0, 0, 0, 0, 0, "627348750013235456", 0]]),
+            "627348750013235456")
+        # 下标 6 为短数字时，取更长的下标 7（雪花号）
+        self.assertEqual(
+            RoomClient._extract_dmid([[0, 0, 0, 0, 0, 0, 12, "123456789012345678"]]),
+            "123456789012345678")
+
+    def test_dmid_in_dm_event(self):
+        self.client.set_danmaku_enabled(True)
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 1, 25, 16777215, 0, 0, "627348750013235456", 0],
+                        "你好", [0, "弹幕哥", 1, 0]]}
+        self.client._handle_business_message(
+            json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0][1]["dmid"], "627348750013235456")
+
 
 RECEIVED_AT = datetime(2026, 9, 6, 20, 0, 0)
 

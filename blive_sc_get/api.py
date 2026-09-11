@@ -27,6 +27,8 @@ ROOM_INFO_OLD_URL = "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld"
 ROOM_H5_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v1/index/getH5InfoByRoom"
 ANCHOR_INFO_URL = "https://api.live.bilibili.com/live_user/v1/Master/info"
 DANMU_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo"
+SEND_DANMAKU_URL = "https://api.live.bilibili.com/msg/send"
+DM_CONFIG_URL = "https://api.live.bilibili.com/xlive/web-room/v1/dM/GetDMConfigByGroup"
 GUARD_TOP_LIST_URL = "https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 HOMEPAGE_URL = "https://www.bilibili.com/"
@@ -53,7 +55,35 @@ class ApiError(RuntimeError):
     def __init__(self, action: str, code: Any, message: str = ""):
         self.action = action
         self.code = code
+        self.message = message  # 保留原始 message，供上层按需展示/映射
         super().__init__(f"{action}失败: code={code} message={message}")
+
+
+# 发送弹幕接口返回码 -> 中文提示（供 GUI 与日志复用）
+SEND_ERROR_HINTS = {
+    -101: "账号未登录：请在浏览器登录 B 站后用「获取Cookie」重新获取已登录的 Cookie",
+    -111: "csrf 校验失败：Cookie 中的 bili_jct 与请求不一致，请重新获取 Cookie",
+    -400: "请求参数错误",
+    1003212: "弹幕内容超出长度限制",
+    10031: "发送频率过快，请稍后再试",
+    -352: "触发风控，请稍后再试或检查 Cookie",
+    -403: "触发风控（无权操作）",
+    -412: "触发风控（请求被拦截）",
+}
+
+
+def describe_send_error(code: Any, message: str = "") -> str:
+    """把发送弹幕接口的返回码映射为中文可读提示（纯函数，供 API 与 GUI 复用）。"""
+    try:
+        key = int(code)
+    except (TypeError, ValueError):
+        key = None
+    hint = SEND_ERROR_HINTS.get(key)
+    if hint:
+        return f"{hint}（code={code}）"
+    if message:
+        return f"发送失败：{message}（code={code}）"
+    return f"发送失败（code={code}）"
 
 
 class BilibiliLiveAPI:
@@ -73,6 +103,17 @@ class BilibiliLiveAPI:
     @property
     def has_cookie(self) -> bool:
         return bool(self._cookie)
+
+    @property
+    def csrf(self) -> str:
+        """Cookie 中的 bili_jct（发弹幕等写操作鉴权用）；缺失返回空串。"""
+        match = re.search(r"bili_jct=([^;]+)", self._cookie)
+        return match.group(1).strip() if match else ""
+
+    @property
+    def logged_in(self) -> bool:
+        """是否已登录（据 nav 接口拿到的 uid 判断）。"""
+        return self.uid > 0
 
     async def refresh_login(self) -> None:
         """登录状态变化后（如 GUI 获取到新 cookie）刷新登录 uid。"""
@@ -113,6 +154,18 @@ class BilibiliLiveAPI:
         if not isinstance(data, dict):
             raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(data)[:120]}")
         return data
+
+    async def _post_form_json(self, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """表单（application/x-www-form-urlencoded）POST，返回 JSON 对象。
+
+        aiohttp 在 data 传 dict 时会自动设置表单 Content-Type。
+        """
+        async with self.session.post(url, data=data, headers=self._headers()) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
+        if not isinstance(payload, dict):
+            raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(payload)[:120]}")
+        return payload
 
     async def init_session_info(self) -> None:
         """尽量拿到 buvid3（弹幕接口风控需要）和登录 uid；失败不致命，只打日志。"""
@@ -277,3 +330,61 @@ class BilibiliLiveAPI:
         if not info.get("token") or not info.get("host_list"):
             raise ApiError("获取弹幕服务器信息", code, "响应缺少 token 或 host_list")
         return info
+
+    async def get_dm_config(self, room_id: int) -> Dict[str, Any]:
+        """查询当前用户在指定直播间可用的弹幕颜色/模式（尽力而为，失败返回 {}）。
+
+        未登录也可查询，但仅「白色 + 滚动」可用，故 GUI 需在登录后再刷新。
+        """
+        try:
+            data = await self._get_json(DM_CONFIG_URL, {"room_id": int(room_id)})
+        except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
+            logger.debug("获取弹幕配置失败 room=%s: %s", room_id, exc)
+            return {}
+        if data.get("code") != 0:
+            logger.debug("获取弹幕配置失败 room=%s: code=%s", room_id, data.get("code"))
+            return {}
+        info = data.get("data")
+        return info if isinstance(info, dict) else {}
+
+    async def send_danmaku(self, room_id: int, msg: str, *, mode: int = 1,
+                           color: int = 16777215, fontsize: int = 25,
+                           reply_mid: int = 0, reply_uname: str = "",
+                           replay_dmid: str = "") -> Dict[str, Any]:
+        """发送直播弹幕（写操作，需已登录且 Cookie 含 bili_jct）。
+
+        未登录 / 缺少 csrf / 接口返回非 0 均抛 ApiError（code 为接口返回码，
+        本地前置校验用 -101 未登录、-111 缺 csrf 表示）。
+        """
+        if not self._cookie:
+            raise ApiError("发送弹幕", -101, "未提供 cookie，无法发送弹幕")
+        csrf = self.csrf
+        if not csrf:
+            raise ApiError("发送弹幕", -111,
+                           "Cookie 中缺少 bili_jct，请用「获取Cookie」重新获取已登录的 Cookie")
+        data: Dict[str, Any] = {
+            "csrf": csrf,
+            "csrf_token": csrf,
+            "roomid": int(room_id),
+            "msg": msg,
+            "rnd": int(time.time()),
+            "fontsize": int(fontsize),
+            "color": int(color),
+            "mode": int(mode),
+            "bubble": 0,
+            "room_type": 0,
+            "jumpfrom": 0,
+            "statistics": '{"appId":100,"platform":5}',
+        }
+        if reply_mid:
+            data["reply_mid"] = int(reply_mid)
+        if reply_uname:
+            data["reply_uname"] = reply_uname
+        if replay_dmid:
+            data["replay_dmid"] = str(replay_dmid)
+        payload = await self._post_form_json(SEND_DANMAKU_URL, data)
+        code = payload.get("code")
+        if code != 0:
+            raw = payload.get("message") or payload.get("msg") or ""
+            raise ApiError("发送弹幕", code, raw)
+        return payload

@@ -342,6 +342,7 @@ class RoomClient:
             "uname": uname,
             "uid": uid,
             "text": text,
+            "dmid": self._extract_dmid(info),
         })
 
     def _on_online_rank_count(self, command: dict) -> None:
@@ -468,6 +469,25 @@ class RoomClient:
             if isinstance(inner, dict):
                 return inner
         return extra if isinstance(extra, dict) else {}
+
+    @staticmethod
+    def _extract_dmid(info: list) -> str:
+        """从 DANMU_MSG 的 info[0] 中取弹幕 dmid（供「回复该弹幕」使用）。
+
+        现行协议中 dmid 通常位于 info[0][6]（部分实现为 info[0][7]）；仓库
+        内样本为占位数据无法确定，故按候选下标取「最长的纯数字串」容错：
+        dmid 是较长的数字 id，行号等短数字不会被误选。取不到返回 ""（此时
+        GUI 的「回复该弹幕」不可用，仍可 @ 用户）。
+        """
+        meta = info[0] if isinstance(info, list) and info and isinstance(info[0], list) else []
+        best = ""
+        for index in (6, 7, 5):
+            if index >= len(meta):
+                continue
+            value = str(meta[index]).strip()
+            if value.isdigit() and int(value) > 0 and len(value) > len(best):
+                best = value
+        return best
 
     @staticmethod
     def _is_emote_danmu(info: list) -> bool:

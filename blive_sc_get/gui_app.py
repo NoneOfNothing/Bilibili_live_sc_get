@@ -13,6 +13,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime
@@ -27,7 +28,8 @@ try:  # 播放系统提示音用（仅 Windows）
 except ImportError:
     winsound = None
 
-from .api import BilibiliLiveAPI
+from .api import ApiError, BilibiliLiveAPI, describe_send_error
+from .app_config import load_app_config
 from .browser_cookie import get_bilibili_cookie
 from .browser_rooms import is_room_being_recorded
 from .cli import COOKIE_FILE_NAME, _pending_flush_loop, parse_room_id, resolve_cookie
@@ -79,6 +81,26 @@ PanedWindow 的初始布局由各窗格请求高度决定、weight 只影响多�
 PANE_WEIGHTS = (4, 7, 9)
 """与 PANE_RATIO 等比的整数 weight（2:3.5:4.5 = 4:7:9）；窗口尺寸变化时
 PanedWindow 按 weight 分配增减空间，从而保持该占比。"""
+
+DANMAKU_SEND_COOLDOWN_S = 2.0
+"""同一房间两次发送弹幕的最小间隔（秒）。"""
+
+DANMAKU_DUP_WINDOW_S = 30.0
+"""相同内容在该时间窗口内（秒）禁止重复发送。"""
+
+DANMAKU_MAX_LEN = 20
+"""客户端弹幕长度上限（普通用户约 20 字；超长时服务端返回 1003212）。"""
+
+DM_COLOR_PRESETS = (("白色", 16777215), ("红色", 16711680), ("橙色", 16744192),
+                    ("黄色", 16776960), ("绿色", 65280), ("蓝色", 255),
+                    ("紫色", 8388736))
+"""内置弹幕颜色候选（名称 -> 十进制值）；登录后可用 get_dm_config 覆盖为服务端可用项。"""
+
+DM_MODE_TEXTS = {"滚动": 1, "顶部": 5, "底部": 4}
+"""弹幕展示模式（名称 -> mode 值）。"""
+
+DM_META_MAX = 2000
+"""dmid -> (uid, uname, text) 缓存的条目上限，超出后丢弃最早的一半。"""
 
 SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)")
 
@@ -146,6 +168,45 @@ def text_scrolled_to_bottom(yview: tuple, tolerance: float = 0.001) -> bool:
     except (TypeError, ValueError, IndexError):
         return True
     return bottom >= 1.0 - tolerance
+
+
+def danmaku_send_guard(text: str, *, last_text: str = "", last_time: float = 0.0,
+                       now: float = 0.0, cooldown: float = DANMAKU_SEND_COOLDOWN_S,
+                       dup_window: float = DANMAKU_DUP_WINDOW_S,
+                       max_len: int = DANMAKU_MAX_LEN) -> Optional[str]:
+    """发送弹幕前的客户端校验（纯函数）。
+
+    返回拦截原因（不可发送时的中文提示），可发送时返回 None。
+    """
+    text = (text or "").strip()
+    if not text:
+        return "弹幕内容不能为空"
+    if len(text) > max_len:
+        return f"弹幕过长：最多 {max_len} 字（当前 {len(text)} 字）"
+    if last_time and now - last_time < cooldown:
+        return f"发送过于频繁，请 {cooldown - (now - last_time):.1f} 秒后再试"
+    if last_text and text == last_text and now - last_time < dup_window:
+        return "内容与上一条相同，请勿重复发送"
+    return None
+
+
+def select_dm_options(presets, offered):
+    """选择弹幕颜色/模式下拉展示的可选项。
+
+    以服务端实际可用项为准（按名称去重），**即使只有 1 项也不回退预设**：
+    账号不支持的颜色/模式即使发出去也会失败，列出它们只会误导用户。仅当
+    查询失败/无数据（offered 为空）时才回退内置预设，避免下拉为空。
+
+    返回 ``[(名称, 值), ...]``。
+    """
+    deduped: List[Tuple[str, int]] = []
+    seen = set()
+    for name, value in offered:
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append((name, value))
+    return deduped or list(presets)
 
 
 class _QueueLogHandler(logging.Handler):
@@ -233,6 +294,7 @@ class ScMonitorApp:
             e.room_id: e for e in load_room_entries(self.config_path)
         }
         self.ui_prefs = load_ui_prefs(self.config_path)  # 排序方式、直播中置顶开关
+        self.app_config = load_app_config()  # 应用级配置（写操作默认关闭）
         self._drag_iid: Optional[str] = None   # 行拖动排序的当前行
         self._drag_moved = False
         self._loaded_count = 0    # 当前选中房间已读取的历史 SC 条数
@@ -247,6 +309,14 @@ class ScMonitorApp:
         self._dm_grew_delta = 0  # 弹幕区向下扩展的像素数
         self._pane_ratio_done = False  # 三板块默认占比是否已应用（仅首次布局）
         self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
+        # 发送弹幕相关状态（仅主线程读写）
+        self._last_dm_send: Dict[int, float] = {}   # 房间号 -> 上次发送时间(monotonic)
+        self._last_dm_text: Dict[int, str] = {}     # 房间号 -> 上次发送内容
+        self._room_id_map: Dict[int, int] = {}      # 输入房间号 -> 真实房间号
+        self._dm_sending = False                    # 是否正在发送（防连点）
+        self._dm_reply_target: Optional[dict] = None  # 回复/@ 目标 {kind,uid,uname,dmid,text}
+        self._dm_send_reason = ""                   # 上次门控原因（避免重复提示）
+        self._dm_meta: Dict[str, Tuple[int, str, str]] = {}  # dmid -> (uid, uname, text)
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -260,7 +330,10 @@ class ScMonitorApp:
         self._wrap_restore_id: Optional[str] = None
 
         self._setup_logging()
+        logger.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
+                    "启用" if self.app_config.allow_write_operations else "禁用")
         self._build_ui()
+        self._refresh_dm_send_state()  # 初始化发送控件的可用状态
         # 拖动窗口大小时暂停 SC 文本 word 换行，停止后恢复（见 _on_root_configure）
         self.root.bind("<Configure>", self._on_root_configure)
         self._populate_rows()
@@ -348,13 +421,21 @@ class ScMonitorApp:
         # 初始高度按 PANE_RATIO（2:3.5:4.5）分配，窗口变化时按 PANE_WEIGHTS 等比伸缩，
         # 拖动分隔条即可调整各板块占用空间
         self.paned = ttk.Panedwindow(tab, orient="vertical")
-        self.paned.pack(side="top", fill="both", expand=True)
+        # 只创建、不在此处 pack：pack 按调用顺序分配空间，带 expand 的 paned 若先
+        # pack，会在窗口缩小时把「后 pack」的底部固定条（底部操作条/弹幕开关条）
+        # 挤成 0 高而整条消失（取消勾选弹幕后窗口回缩即触发）。故等底部固定条都
+        # pack 完、且所有窗格 add 完之后，再在本方法末尾 pack paned。
         # 首次完成布局后按默认占比设置分隔条位置（此后不再干预用户手动拖动）
         self.paned.bind("<Configure>", self._on_paned_configure, add=True)
         # 横向滚动条：用户拖宽 room/anchor 等固定列后，总宽可能超过窗口宽度，
         # 通过滚动条保证内容仍可完整查看
         tree_wrap = ttk.Frame(self.paned)
         self.tree_wrap = tree_wrap
+        # 房间操作行（备注 / 启停监听 / 删除）紧贴房间列表下方。
+        # 同一侧先 pack 者贴边：本行最先 pack，故位于窗格最底部，
+        # 其上依次是横向滚动条与房间列表。
+        self.room_actions = ttk.Frame(tree_wrap)
+        self.room_actions.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
         xscroll = ttk.Scrollbar(tree_wrap, orient="horizontal")
         self.xscroll = xscroll
         xscroll.pack(side="bottom", fill="x")
@@ -394,7 +475,19 @@ class ScMonitorApp:
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release, add=True)
         self.tree.bind("<<TreeviewColumnResize>>", self._clamp_columns_soon, add=True)
 
-        # 弹幕开关条（窗口最下方）；弹幕区开启时插在备注行之上、SC 区之下
+        # 房间操作行控件：备注 / 启停监听 / 删除（启用状态由 _refresh_buttons 统一控制）
+        ttk.Label(self.room_actions, text="备注:").pack(side="left")
+        self.note_var = tk.StringVar()
+        self.note_entry = ttk.Entry(self.room_actions, textvariable=self.note_var)
+        self.note_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        self.note_entry.bind("<Return>", lambda _e: self._flush_note())
+        self.note_entry.bind("<FocusOut>", lambda _e: self._flush_note())
+        self.toggle_btn = ttk.Button(self.room_actions, text="停用监听", command=self._on_toggle)
+        self.toggle_btn.pack(side="left", padx=(0, 4))
+        self.delete_btn = ttk.Button(self.room_actions, text="删除", command=self._on_delete)
+        self.delete_btn.pack(side="left")
+
+        # 弹幕开关条（窗口最下方，位于底部操作条之下）
         dm_bar = ttk.Frame(tab)
         self.dm_bar = dm_bar
         dm_bar.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
@@ -404,19 +497,10 @@ class ScMonitorApp:
         ttk.Label(dm_bar, text="（开启后显示并保存当前选中房间的弹幕）",
                   foreground="#888888").pack(side="left", padx=(6, 0))
 
+        # 底部全局操作条：仅保留与房间列表无关的操作（房间相关的备注/启停/删除
+        # 已移到直播间列表下方的 room_actions 行）
         bottom = ttk.Frame(tab)
         bottom.pack(side="bottom", fill="x", padx=6, pady=(4, 6))
-        self.bottom_bar = bottom  # 弹幕区 pack(before=) 的定位参照
-        ttk.Label(bottom, text="备注:").pack(side="left")
-        self.note_var = tk.StringVar()
-        self.note_entry = ttk.Entry(bottom, textvariable=self.note_var)
-        self.note_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
-        self.note_entry.bind("<Return>", lambda _e: self._flush_note())
-        self.note_entry.bind("<FocusOut>", lambda _e: self._flush_note())
-        self.toggle_btn = ttk.Button(bottom, text="停用监听", command=self._on_toggle)
-        self.toggle_btn.pack(side="left", padx=(0, 4))
-        self.delete_btn = ttk.Button(bottom, text="删除", command=self._on_delete)
-        self.delete_btn.pack(side="left", padx=(0, 4))
         self.refresh_btn = ttk.Button(bottom, text="刷新历史", command=self._on_refresh_history)
         self.refresh_btn.pack(side="left")
         self.cookie_btn = ttk.Button(bottom, text="获取Cookie", command=self._on_fetch_cookie)
@@ -449,6 +533,10 @@ class ScMonitorApp:
 
         # 弹幕区（默认隐藏；开启时加入 PanedWindow 挤占其他板块空间）
         self.dm_frame = ttk.LabelFrame(self.paned, text="弹幕")
+        # 发送区固定在面板最下方，先 pack 以让弹幕列表只占用其余空间
+        self.dm_send_area = ttk.Frame(self.dm_frame)
+        self.dm_send_area.pack(side="bottom", fill="x", padx=4, pady=(2, 2))
+        self._build_dm_send_area()
         self.dm_text = tk.Text(self.dm_frame, wrap="word", state="disabled",
                                font=("Microsoft YaHei UI", 9), padx=6, pady=4,
                                height=6)
@@ -459,10 +547,61 @@ class ScMonitorApp:
         for tag, color in (("dm_time", "#888888"), ("dm_user", "#0055cc")):
             self.dm_text.tag_configure(tag, foreground=color)
         self.dm_text.bind("<Button-1>", self._on_dm_click)
+        self.dm_text.bind("<Button-3>", self._on_dm_right_click)
         if self.dm_var.get():
             self.paned.add(self.dm_frame, weight=PANE_WEIGHTS[2])
             self._dm_grew = True
             self._dm_adjust_window(True)
+
+        # paned 最后 pack：上（添加/排序栏）下（底部操作条/弹幕开关条）两侧固定条
+        # 先占位，剩余空间才归 Panedwindow；窗口缩小时底部控件不会被挤到 0 高
+        self.paned.pack(side="top", fill="both", expand=True)
+
+    def _build_dm_send_area(self) -> None:
+        """构建弹幕发送区：发送行（颜色/模式/输入/计数/发送）+ 提示行 + 目标提示行。
+
+        仅在 config.json 开启写操作、已登录且选中房间时可用（见
+        _refresh_dm_send_state）；创建后由该处统一置为初始状态。
+        """
+        area = self.dm_send_area
+        # 发送行：颜色 / 模式 / 输入框 / 字数 / 发送
+        row = ttk.Frame(area)
+        row.pack(side="top", fill="x")
+        self.dm_send_row = row
+        self.dm_colors: List[Tuple[str, int]] = list(DM_COLOR_PRESETS)
+        self.dm_modes: List[Tuple[str, int]] = list(DM_MODE_TEXTS.items())
+        self.dm_color_var = tk.StringVar(value=self.dm_colors[0][0])
+        self.dm_color_box = ttk.Combobox(
+            row, textvariable=self.dm_color_var, width=5, state="readonly",
+            values=[name for name, _color in self.dm_colors])
+        self.dm_color_box.pack(side="left")
+        self.dm_mode_var = tk.StringVar(value=self.dm_modes[0][0])
+        self.dm_mode_box = ttk.Combobox(
+            row, textvariable=self.dm_mode_var, width=5, state="readonly",
+            values=[name for name, _mode in self.dm_modes])
+        self.dm_mode_box.pack(side="left", padx=(4, 0))
+        self.dm_send_var = tk.StringVar()
+        self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
+        self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self.dm_send_entry.bind("<Return>", lambda _e: self._on_send_danmaku())
+        self.dm_send_entry.bind("<KeyRelease>", self._update_dm_len_hint)
+        self.dm_len_var = tk.StringVar(value=f"0/{DANMAKU_MAX_LEN}")
+        self.dm_len_label = ttk.Label(row, textvariable=self.dm_len_var,
+                                      foreground="#888888")
+        self.dm_len_label.pack(side="left")
+        self.dm_send_btn = ttk.Button(row, text="发送", command=self._on_send_danmaku)
+        self.dm_send_btn.pack(side="left", padx=(4, 0))
+        # 提示行：显示门控原因或发送结果
+        self.dm_send_hint_var = tk.StringVar(value="")
+        ttk.Label(area, textvariable=self.dm_send_hint_var,
+                  foreground="#888888").pack(side="top", fill="x")
+        # 回复/@ 目标提示行：默认隐藏，显示时插入到发送行上方
+        self.dm_reply_var = tk.StringVar(value="")
+        self.dm_reply_bar = ttk.Frame(area)
+        ttk.Label(self.dm_reply_bar, textvariable=self.dm_reply_var,
+                  foreground="#0055cc").pack(side="left")
+        ttk.Button(self.dm_reply_bar, text="取消", width=6,
+                   command=self._clear_dm_reply_target).pack(side="left", padx=(4, 0))
 
     def _on_paned_configure(self, _event=None) -> None:
         """首次布局完成后应用一次默认占比；之后不再干预用户手动拖动。"""
@@ -767,6 +906,8 @@ class ScMonitorApp:
         # 板块增减会打乱占比，布局完成后按默认占比重新分配
         self.root.after_idle(self._apply_default_pane_ratio)
         self._apply_dm_gate()
+        self._refresh_dm_send_state()
+        self._load_dm_options_for_selected()
 
     def _dm_adjust_window(self, visible: bool) -> None:
         """弹幕区显隐的窗口尺寸策略：最大化时挤占现有空间；窗口化时向下扩展。
@@ -831,6 +972,269 @@ class ScMonitorApp:
                     webbrowser.open(f"https://space.bilibili.com/{uid}")
                 return
 
+    # ---------- 发送弹幕 ----------
+
+    def _dm_send_block_reason(self) -> str:
+        """返回发送弹幕当前不可用的原因；可用时返回空串。"""
+        if not self.app_config.allow_write_operations:
+            return "已在 config.json 关闭写操作（allow_write_operations=false）"
+        if self.hub.api is None:
+            return "后台初始化中，请稍候…"
+        if not self.hub.api.logged_in:
+            return "未登录：请用「获取Cookie」获取已登录的 B 站 Cookie"
+        if not self.hub.api.csrf:
+            return "Cookie 缺少 bili_jct，请重新「获取Cookie」"
+        if not self.dm_var.get():
+            return "请先开启「弹幕」开关"
+        if self._selected_room_id is None:
+            return "请先选择一个直播间"
+        return ""
+
+    def _refresh_dm_send_state(self) -> None:
+        """按 写操作开关/后台就绪/登录/csrf/选房 刷新发送控件状态与原因提示。"""
+        reason = self._dm_send_block_reason()
+        enabled = not reason and not self._dm_sending
+        self.dm_send_entry.configure(state="normal" if enabled else "disabled")
+        self.dm_send_btn.configure(state="normal" if enabled else "disabled")
+        self.dm_color_box.configure(state="readonly" if enabled else "disabled")
+        self.dm_mode_box.configure(state="readonly" if enabled else "disabled")
+        if reason != self._dm_send_reason:
+            previous = self._dm_send_reason
+            self._dm_send_reason = reason
+            if reason:
+                self.dm_send_hint_var.set(reason)
+                logger.info("发送弹幕不可用：%s", reason)
+            elif previous:
+                self.dm_send_hint_var.set("")
+
+    def _update_dm_len_hint(self, _event=None) -> None:
+        length = len(self.dm_send_var.get())
+        self.dm_len_var.set(f"{length}/{DANMAKU_MAX_LEN}")
+        self.dm_len_label.configure(
+            foreground="#c62828" if length > DANMAKU_MAX_LEN else "#888888")
+
+    def _set_dm_reply_target(self, target: Optional[dict]) -> None:
+        """设置（或清除）回复/@ 目标；设置后聚焦输入框。"""
+        self._dm_reply_target = target
+        if not target:
+            self.dm_reply_var.set("")
+            self.dm_reply_bar.pack_forget()
+            return
+        prefix = "回复" if target.get("kind") == "reply" else "@"
+        label = f"{prefix} {target.get('uname') or '未知用户'}"
+        if target.get("kind") == "reply" and target.get("text"):
+            snippet = str(target["text"])
+            if len(snippet) > 20:
+                snippet = snippet[:20] + "…"
+            label += f"：{snippet}"
+        self.dm_reply_var.set(label)
+        self.dm_reply_bar.pack(side="top", fill="x", before=self.dm_send_row)
+        self.root.after_idle(self.dm_send_entry.focus_set)
+
+    def _clear_dm_reply_target(self) -> None:
+        self._set_dm_reply_target(None)
+
+    def _on_send_danmaku(self) -> None:
+        """主线程发送入口：门控 → 本地校验 → 二次确认 → 提交后台协程。"""
+        if self._dm_sending:
+            return
+        reason = self._dm_send_block_reason()
+        if reason:
+            self.dm_send_hint_var.set(reason)
+            return
+        room_id = self._selected_room_id
+        text = self.dm_send_var.get().strip()
+        guard = danmaku_send_guard(
+            text,
+            last_text=self._last_dm_text.get(room_id, ""),
+            last_time=self._last_dm_send.get(room_id, 0.0),
+            now=time.monotonic(),
+        )
+        if guard:
+            self.dm_send_hint_var.set(guard)
+            return
+        target = self._dm_reply_target or {}
+        anchor = self.anchor_names.get(room_id) or str(room_id)
+        preview = text if len(text) <= 40 else text[:40] + "…"
+        if target:
+            who = "回复" if target.get("kind") == "reply" else "@"
+            preview += f"（{who} {target.get('uname') or '未知用户'}）"
+        if not messagebox.askyesno(
+                "确认发送弹幕",
+                f"直播间：{anchor}\n内容：{preview}\n\n发送后不可撤回，确定发送？"):
+            return
+        color = dict(self.dm_colors).get(self.dm_color_var.get(), self.dm_colors[0][1])
+        mode = dict(self.dm_modes).get(self.dm_mode_var.get(), self.dm_modes[0][1])
+        real_room = self._room_id_map.get(room_id, room_id)
+        self._dm_sending = True
+        self._refresh_dm_send_state()
+        self.dm_send_hint_var.set("发送中…")
+        self.hub.submit(self._async_send_danmaku(
+            real_room, text, color=color, mode=mode,
+            reply_mid=int(target.get("uid") or 0),
+            reply_uname=str(target.get("uname") or ""),
+            replay_dmid=str(target.get("dmid") or ""),
+        ))
+
+    async def _async_send_danmaku(self, room_id: int, text: str, *, color: int,
+                                  mode: int, reply_mid: int, reply_uname: str,
+                                  replay_dmid: str) -> None:
+        """在 asyncio 线程内发送弹幕，结果经 ui_queue 回主线程。"""
+        api = self.hub.api
+        if api is None:
+            self.ui_queue.put(("dm_send_result",
+                               {"ok": False, "error": "后台未就绪，发送取消"}))
+            return
+        try:
+            await api.send_danmaku(room_id, text, color=color, mode=mode,
+                                   reply_mid=reply_mid, reply_uname=reply_uname,
+                                   replay_dmid=replay_dmid)
+        except ApiError as exc:
+            self.ui_queue.put(("dm_send_result", {
+                "ok": False, "room_id": room_id, "text": text,
+                "error": describe_send_error(exc.code, exc.message),
+            }))
+        except Exception as exc:  # 兜底：避免后台任务静默失败
+            self.ui_queue.put(("dm_send_result", {
+                "ok": False, "room_id": room_id, "text": text,
+                "error": f"发送异常：{exc}",
+            }))
+        else:
+            self.ui_queue.put(("dm_send_result", {
+                "ok": True, "room_id": room_id, "text": text}))
+
+    def _on_dm_send_result(self, payload: dict) -> None:
+        """发送结果回主线程：成功清空输入与目标并记录冷却，失败给出内联提示。"""
+        self._dm_sending = False
+        if payload.get("ok"):
+            room_id = payload.get("room_id")
+            text = str(payload.get("text") or "")
+            if room_id is not None:
+                self._last_dm_send[int(room_id)] = time.monotonic()
+                self._last_dm_text[int(room_id)] = text
+            self.dm_send_var.set("")
+            self._update_dm_len_hint()
+            self._set_dm_reply_target(None)
+            self.dm_send_hint_var.set("已发送")
+            logger.info("已发送弹幕：%s", text)
+        else:
+            error = payload.get("error") or "发送失败"
+            self.dm_send_hint_var.set(error)
+            logger.warning("发送弹幕失败：%s", error)
+        self._refresh_dm_send_state()
+
+    def _remember_dm_meta(self, dmid: str, uid: int, uname: str, content: str) -> None:
+        """缓存 dmid -> (uid, uname, text)，供右键「回复该弹幕 / @该用户」使用。"""
+        meta = self._dm_meta
+        meta[dmid] = (uid, uname, content)
+        if len(meta) > DM_META_MAX:  # 简单上限，避免长时间运行时无限增长
+            for key in list(meta)[:DM_META_MAX // 2]:
+                meta.pop(key, None)
+
+    def _on_dm_right_click(self, event) -> None:
+        """右键弹幕：回复该弹幕（带 dmid）/ @该用户。"""
+        index = self.dm_text.index(f"@{event.x},{event.y}")
+        dmid = ""
+        uid = 0
+        for tag in self.dm_text.tag_names(index):
+            tag = str(tag)
+            if tag.startswith("dm:"):
+                dmid = tag.split(":", 1)[1]
+            elif tag.startswith("dmuid:"):
+                try:
+                    uid = int(tag.split(":", 1)[1])
+                except ValueError:
+                    uid = 0
+        meta = self._dm_meta.get(dmid, (0, "", ""))
+        if not uid:
+            uid = int(meta[0] or 0)
+        uname = str(meta[1] or "")
+        content = str(meta[2] or "")
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(
+            label="回复该弹幕", state="normal" if dmid else "disabled",
+            command=lambda: self._set_dm_reply_target(
+                {"kind": "reply", "uid": uid, "uname": uname,
+                 "dmid": dmid, "text": content}))
+        menu.add_command(
+            label="@ 该用户", state="normal" if uid else "disabled",
+            command=lambda: self._set_dm_reply_target(
+                {"kind": "at", "uid": uid, "uname": uname, "dmid": "", "text": ""}))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _load_dm_options_for_selected(self) -> None:
+        """已登录且弹幕区可见时，拉取当前房间可用的弹幕颜色/模式（尽力而为）。"""
+        room_id = self._selected_room_id
+        if room_id is None or self.hub.api is None or not self.hub.api.logged_in:
+            return
+        if not self.dm_var.get():
+            return
+        self.hub.submit(self._async_load_dm_config(room_id))
+
+    async def _async_load_dm_config(self, room_id: int) -> None:
+        api = self.hub.api
+        if api is None:
+            return
+        config = await api.get_dm_config(self._room_id_map.get(room_id, room_id))
+        self.ui_queue.put(("dm_config", {"room_id": room_id, "config": config}))
+
+    def _on_dm_config(self, payload: dict) -> None:
+        """把服务端返回的颜色/模式可用项刷新到下拉框；无效时保留内置预设。"""
+        if payload.get("room_id") != self._selected_room_id:
+            return  # 已切换房间，丢弃过期结果
+        config = payload.get("config") or {}
+        colors: List[Tuple[str, int]] = []
+        for group in config.get("group") or []:
+            if not isinstance(group, dict):
+                continue
+            for item in group.get("color") or []:
+                if not isinstance(item, dict) or item.get("status") != 1:
+                    continue
+                value = item.get("color")
+                if value is None:
+                    continue
+                try:
+                    colors.append((str(item.get("name") or item.get("color_hex") or value),
+                                   int(value)))
+                except (TypeError, ValueError):
+                    continue
+        mode_names = {value: name for name, value in DM_MODE_TEXTS.items()}
+        modes: List[Tuple[str, int]] = []
+        for item in config.get("mode") or []:
+            if not isinstance(item, dict) or item.get("status") != 1:
+                continue
+            value = item.get("mode")
+            if value is None:
+                continue
+            try:
+                mode_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            name = item.get("name") or mode_names.get(mode_value, f"模式{mode_value}")
+            modes.append((str(name), mode_value))
+        self._set_dm_options(colors, modes)
+
+    def _set_dm_options(self, colors: List[Tuple[str, int]],
+                        modes: List[Tuple[str, int]]) -> None:
+        """用服务端可用项刷新颜色/模式下拉（保留原选择，失效则回退首项）。
+
+        候选完全以服务端可用项为准（可能只有 1 项）；仅查询失败时才用内置
+        预设兜底（详见 select_dm_options）。
+        """
+        new_colors = select_dm_options(DM_COLOR_PRESETS, colors)
+        self.dm_colors = list(new_colors)
+        self.dm_color_box.configure(values=[name for name, _v in new_colors])
+        if self.dm_color_var.get() not in {name for name, _v in new_colors}:
+            self.dm_color_var.set(new_colors[0][0])
+        new_modes = select_dm_options(tuple(DM_MODE_TEXTS.items()), modes)
+        self.dm_modes = list(new_modes)
+        self.dm_mode_box.configure(values=[name for name, _v in new_modes])
+        if self.dm_mode_var.get() not in {name for name, _v in new_modes}:
+            self.dm_mode_var.set(new_modes[0][0])
+
     def _append_dm_batch(self, batch: List[dict]) -> None:
         """批量插入当前房间的弹幕（本轮 poll 聚合一次插入，降低重排开销）。
 
@@ -845,10 +1249,18 @@ class ScMonitorApp:
         for dm in batch:
             time_str = str(dm.get("time", ""))
             uid = int(dm.get("uid") or 0)
-            text.insert("end", f"[{time_str[11:19] or time_str}] ", "dm_time")
+            dmid = str(dm.get("dmid") or "")
+            uname = str(dm.get("uname", ""))
+            content = str(dm.get("text", ""))
+            # dm:<dmid> 标记整条弹幕，供右键「回复该弹幕」定位；无 dmid 时退化为仅能 @
+            dm_tag = f"dm:{dmid}" if dmid else ""
+            if dmid:
+                self._remember_dm_meta(dmid, uid, uname, content)
+            text.insert("end", f"[{time_str[11:19] or time_str}] ",
+                        f"dm_time {dm_tag}".strip())
             user_tag = f"dm_user dmuid:{uid}" if uid else "dm_user"
-            text.insert("end", f"{dm.get('uname', '')}：", user_tag)
-            text.insert("end", f"{dm.get('text', '')}\n")
+            text.insert("end", f"{uname}：", f"{user_tag} {dm_tag}".strip())
+            text.insert("end", f"{content}\n", dm_tag or ())
         text.configure(state="disabled")
         if follow:
             text.see("end")
@@ -1086,6 +1498,8 @@ class ScMonitorApp:
             await self.hub.api.refresh_login()
         except Exception as exc:
             logger.debug("刷新登录 uid 失败: %s", exc)
+        # 登录态变化后刷新发送弹幕控件可用状态
+        self.ui_queue.put(("dm_state", None))
 
     # ---------- 选中房间与 SC 显示 ----------
 
@@ -1101,7 +1515,9 @@ class ScMonitorApp:
         except Exception:
             row_h = 28
         scroll_h = self.xscroll.winfo_height() if self.xscroll.winfo_manager() else 0
-        rows = max(1, int((wrap_h - row_h - scroll_h - 8) // row_h))  # 扣除表头与滚动条
+        actions_h = self.room_actions.winfo_reqheight()  # 房间操作行占用的高度
+        # 扣除表头、横向滚动条与房间操作行后得到可见行数
+        rows = max(1, int((wrap_h - row_h - scroll_h - actions_h - 8) // row_h))
         if rows != int(self.tree["height"]):
             self.tree.configure(height=rows)
 
@@ -1127,6 +1543,10 @@ class ScMonitorApp:
         self._clear_sc_view()
         self._clear_dm_view()
         self._apply_dm_gate()
+        self._set_dm_reply_target(None)   # 回复/@ 目标属于具体房间，切房即清除
+        self._refresh_dm_send_state()
+        # 可用颜色/样式随直播间变化（接口按 room_id 查询），切房即重新拉取
+        self._load_dm_options_for_selected()
         if room_id is None:
             self.sc_frame.configure(text="醒目留言")
             return
@@ -1529,6 +1949,8 @@ class ScMonitorApp:
         elif self._selected_room_id is not None:
             self._load_history(self._selected_room_id)
         self._apply_dm_gate()
+        self._refresh_dm_send_state()
+        self._load_dm_options_for_selected()
 
     def _on_hub_failed(self, error: str) -> None:
         logger.error("后台初始化失败：%s", error)
@@ -1543,6 +1965,10 @@ class ScMonitorApp:
         if room_id is None:
             return
         if event_type == "status":
+            input_room_id = payload.get("input_room_id")
+            if input_room_id is not None and int(input_room_id) != int(room_id):
+                # 短号场景：记录 输入房间号 -> 真实房间号，发弹幕时用真实号
+                self._room_id_map[int(input_room_id)] = int(room_id)
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             prev_text = self.live_state.get(room_id)
             self.live_state[room_id] = status_text
@@ -1703,6 +2129,14 @@ class ScMonitorApp:
                     self._on_uid_result(item[1])
                 elif kind == "cookie_result":
                     self._on_cookie_result(item[1])
+                elif kind == "dm_send_result":
+                    self._on_dm_send_result(item[1])
+                elif kind == "dm_state":
+                    # 登录态变化（如刚获取 Cookie）后刷新门控并补拉可用颜色/样式
+                    self._refresh_dm_send_state()
+                    self._load_dm_options_for_selected()
+                elif kind == "dm_config":
+                    self._on_dm_config(item[1])
         except queue.Empty:
             pass
         # 本轮所有日志行合并为一次插入，缓解拖动窗口时的卡顿

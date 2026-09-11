@@ -7,11 +7,14 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from blive_sc_get.api import ApiError, BilibiliLiveAPI
+from blive_sc_get.api import ApiError, BilibiliLiveAPI, describe_send_error
+from blive_sc_get.app_config import AppConfig, load_app_config
 from blive_sc_get.client import RoomClient
 from blive_sc_get.gui_app import (
     build_sc_segments,
+    danmaku_send_guard,
     parse_add_input,
+    select_dm_options,
     text_scrolled_to_bottom,
 )
 from blive_sc_get.gui_config import (
@@ -42,15 +45,21 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    """仅实现 get() 的鸭子类型会话，用于离线测试 api 解析。"""
+    """实现 get()/post() 的鸭子类型会话，用于离线测试 api 解析。"""
 
-    def __init__(self, payload):
+    def __init__(self, payload, post_payload=None):
         self._payload = payload
+        self._post_payload = payload if post_payload is None else post_payload
         self.calls = []
+        self.post_calls = []
 
     def get(self, url, params=None, headers=None):
         self.calls.append((url, params))
         return _FakeResponse(self._payload)
+
+    def post(self, url, data=None, headers=None):
+        self.post_calls.append((url, data, headers))
+        return _FakeResponse(self._post_payload)
 
 
 class AnchorNameTests(unittest.TestCase):
@@ -190,6 +199,43 @@ class GuiConfigTests(unittest.TestCase):
         prefs = load_ui_prefs(self.path)
         self.assertEqual(prefs["sort_mode"], "manual")
         self.assertEqual(prefs["notify_sound"], "上行双音")
+
+
+class AppConfigTests(unittest.TestCase):
+    """应用级配置：写操作默认关闭，非法/损坏输入一律 fail-safe 为关闭。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / "config.json"
+
+    def test_default_is_write_disabled(self):
+        self.assertFalse(AppConfig().allow_write_operations)
+        self.assertFalse(load_app_config(self.tmp / "nope.json").allow_write_operations)
+
+    def test_explicit_true_enables_write(self):
+        self.path.write_text('{"allow_write_operations": true}', encoding="utf-8")
+        self.assertTrue(load_app_config(self.path).allow_write_operations)
+
+    def test_explicit_false_disables_write(self):
+        self.path.write_text('{"allow_write_operations": false}', encoding="utf-8")
+        self.assertFalse(load_app_config(self.path).allow_write_operations)
+
+    def test_non_bool_and_corrupt_fall_back_to_disabled(self):
+        # 字符串 "true"/"false"、数字、损坏 JSON 等一律按关闭处理，避免误开启
+        for raw in ('{"allow_write_operations": "true"}',
+                    '{"allow_write_operations": "false"}',
+                    '{"allow_write_operations": 1}',
+                    '["not an object"]',
+                    "{not json"):
+            self.path.write_text(raw, encoding="utf-8")
+            self.assertFalse(load_app_config(self.path).allow_write_operations, raw)
+
+    def test_extra_keys_ignored(self):
+        self.path.write_text('{"_说明": "x", "other": 1}', encoding="utf-8")
+        self.assertFalse(load_app_config(self.path).allow_write_operations)
+    # 注：不断言仓库里的 config.json 本体——它是供用户编辑的开关文件，
+    # 用户开启写操作后该断言会误报。代码层默认值由 test_default_is_write_disabled 保证。
 
 
 class StorageHistoryTests(unittest.TestCase):
@@ -413,6 +459,131 @@ class TextScrolledToBottomTests(unittest.TestCase):
     def test_malformed_input_defaults_to_follow(self):
         self.assertTrue(text_scrolled_to_bottom(None))
         self.assertTrue(text_scrolled_to_bottom(()))
+
+
+class SendDanmakuApiTests(unittest.TestCase):
+    """发送弹幕接口：csrf 提取、表单参数、前置拦截与错误映射（离线）。"""
+
+    COOKIE = "SESSDATA=abc; bili_jct=csrf123; DedeUserID=1"
+
+    def _api(self, payload=None, cookie=COOKIE):
+        session = _FakeSession({"code": 0} if payload is None else payload)
+        return BilibiliLiveAPI(session, cookie=cookie), session
+
+    def test_csrf_extracted_from_cookie(self):
+        api, _ = self._api()
+        self.assertEqual(api.csrf, "csrf123")
+        self.assertEqual(BilibiliLiveAPI(_FakeSession({}), cookie="SESSDATA=x").csrf, "")
+        self.assertEqual(BilibiliLiveAPI(_FakeSession({})).csrf, "")
+
+    def test_form_params_include_required_and_reply(self):
+        api, session = self._api()
+        asyncio.run(api.send_danmaku(22625025, "加油", mode=5, color=16711680,
+                                     fontsize=30, reply_mid=888, reply_uname="张三",
+                                     replay_dmid="627348750013235456"))
+        url, data, _headers = session.post_calls[0]
+        self.assertIn("/msg/send", url)
+        self.assertEqual(data["roomid"], 22625025)
+        self.assertEqual(data["msg"], "加油")
+        self.assertEqual(data["csrf"], "csrf123")
+        self.assertEqual(data["csrf_token"], "csrf123")
+        self.assertEqual(data["fontsize"], 30)
+        self.assertEqual(data["color"], 16711680)
+        self.assertEqual(data["mode"], 5)
+        self.assertIsInstance(data["rnd"], int)
+        self.assertEqual(data["reply_mid"], 888)
+        self.assertEqual(data["reply_uname"], "张三")
+        self.assertEqual(data["replay_dmid"], "627348750013235456")
+
+    def test_reply_fields_omitted_by_default(self):
+        api, session = self._api()
+        asyncio.run(api.send_danmaku(1, "hi"))
+        _url, data, _headers = session.post_calls[0]
+        for key in ("reply_mid", "reply_uname", "replay_dmid"):
+            self.assertNotIn(key, data)
+
+    def test_local_precheck_without_cookie(self):
+        api = BilibiliLiveAPI(_FakeSession({}), cookie="")
+        with self.assertRaises(ApiError) as ctx:
+            asyncio.run(api.send_danmaku(1, "hi"))
+        self.assertEqual(ctx.exception.code, -101)
+        self.assertEqual(len(api.session.post_calls), 0)  # 前置拦截，不发请求
+
+    def test_local_precheck_without_csrf(self):
+        api = BilibiliLiveAPI(_FakeSession({}), cookie="SESSDATA=x")
+        with self.assertRaises(ApiError) as ctx:
+            asyncio.run(api.send_danmaku(1, "hi"))
+        self.assertEqual(ctx.exception.code, -111)
+
+    def test_server_error_code_raises_with_hint(self):
+        api, _ = self._api(payload={"code": 10031, "message": "太快了"})
+        with self.assertRaises(ApiError) as ctx:
+            asyncio.run(api.send_danmaku(1, "hi"))
+        self.assertEqual(ctx.exception.code, 10031)
+        self.assertIn("频率", describe_send_error(ctx.exception.code, ctx.exception.message))
+
+    def test_describe_send_error_mapping_and_fallback(self):
+        self.assertIn("未登录", describe_send_error(-101))
+        self.assertIn("csrf", describe_send_error(-111))
+        self.assertIn("长度", describe_send_error(1003212))
+        self.assertIn("风控", describe_send_error(-352))
+        self.assertIn("boom", describe_send_error(9999, "boom"))
+        self.assertEqual(describe_send_error("weird"), "发送失败（code=weird）")
+
+    def test_get_dm_config_failure_returns_empty(self):
+        api, _ = self._api(payload={"code": -101, "message": "未登录"})
+        self.assertEqual(asyncio.run(api.get_dm_config(1)), {})
+
+
+class DanmakuSendGuardTests(unittest.TestCase):
+    """发送弹幕的客户端校验（纯函数）：长度 / 冷却 / 重复内容。"""
+
+    def test_allows_normal_text(self):
+        self.assertIsNone(danmaku_send_guard("你好", last_text="", last_time=0.0,
+                                             now=10.0))
+
+    def test_blocks_empty(self):
+        self.assertIn("不能为空", danmaku_send_guard("   "))
+
+    def test_blocks_too_long(self):
+        self.assertIn("过长", danmaku_send_guard("啊" * 21))
+
+    def test_blocks_within_cooldown(self):
+        msg = danmaku_send_guard("新内容", last_text="旧内容", last_time=10.0, now=11.0)
+        self.assertIn("频繁", msg)
+        self.assertIsNone(danmaku_send_guard("新内容", last_text="旧内容",
+                                             last_time=10.0, now=12.5))
+
+    def test_blocks_duplicate_within_window(self):
+        msg = danmaku_send_guard("一样", last_text="一样", last_time=10.0, now=20.0)
+        self.assertIn("相同", msg)
+        # 超过重复窗口后可再次发送
+        self.assertIsNone(danmaku_send_guard("一样", last_text="一样",
+                                             last_time=10.0, now=45.0))
+
+
+class SelectDmOptionsTests(unittest.TestCase):
+    """弹幕颜色/模式候选：以服务端可用项为准，仅查询失败时回退内置预设。"""
+
+    PRESETS = (("白色", 16777215), ("红色", 16711680), ("蓝色", 255))
+
+    def test_uses_offered_as_is(self):
+        offered = [("白色", 16777215), ("蓝色", 255)]
+        self.assertEqual(select_dm_options(self.PRESETS, offered), offered)
+
+    def test_single_offered_item_is_kept(self):
+        # 账号只支持 1 项时必须如实展示：给出不支持的颜色只会发送失败
+        self.assertEqual(select_dm_options(self.PRESETS, [("白色", 16777215)]),
+                         [("白色", 16777215)])
+
+    def test_falls_back_to_presets_when_empty(self):
+        # 查询失败/无数据时回退预设，避免下拉为空
+        self.assertEqual(select_dm_options(self.PRESETS, []), list(self.PRESETS))
+
+    def test_dedups_offered_by_name(self):
+        offered = [("白色", 16777215), ("白色", 16777215), ("蓝色", 255)]
+        self.assertEqual(select_dm_options(self.PRESETS, offered),
+                         [("白色", 16777215), ("蓝色", 255)])
 
 
 if __name__ == "__main__":
