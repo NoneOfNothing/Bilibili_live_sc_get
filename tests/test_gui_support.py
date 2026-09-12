@@ -21,11 +21,13 @@ from blive_sc_get.app_config import (
 )
 from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
 from blive_sc_get.gui_app import (
+    DM_TEXT_MAX_LINES,
     EMOTICON_ICON_MAX_HEIGHT,
     EMOTICON_ICON_MAX_WIDTH,
     build_sc_segments,
     danmaku_content_from_line,
     danmaku_send_guard,
+    dm_trim_index,
     emoticon_display_size,
     emoticon_id_by_unique,
     emoticon_packages_signature,
@@ -989,6 +991,32 @@ class TooltipPositionTests(unittest.TestCase):
         # 下限兜到 0，绝不出屏
         self.assertEqual(tooltip_position(-1800, 100, 120, 24, -1920, 0, 3640, 1080),
                          "+0+120")
+
+
+class DmTrimIndexTests(unittest.TestCase):
+    """弹幕区行数上限：超限后保留最近一半（避免 Text 无限增长把界面卡死）。"""
+
+    def test_under_limit_not_trimmed(self):
+        self.assertIsNone(dm_trim_index(1))
+        self.assertIsNone(dm_trim_index(DM_TEXT_MAX_LINES))
+        self.assertIsNone(dm_trim_index(DM_TEXT_MAX_LINES - 1))
+
+    def test_over_limit_trims_to_half(self):
+        cut = dm_trim_index(DM_TEXT_MAX_LINES + 1)
+        self.assertEqual(cut, f"{DM_TEXT_MAX_LINES // 2 + 1}.0")
+        # 裁剪后剩余行数 = total - (total - max//2) = max//2
+        self.assertEqual(DM_TEXT_MAX_LINES + 1 - int(cut.split(".")[0]),
+                         DM_TEXT_MAX_LINES // 2)
+
+    def test_trim_index_never_below_first_line(self):
+        # max_lines=1 时保留 1 行，删除索引不会越过第一行
+        cut = dm_trim_index(3, max_lines=1)
+        self.assertEqual(cut, "3.0")
+        self.assertIsNone(dm_trim_index(1, max_lines=1))
+
+    def test_bad_input(self):
+        self.assertIsNone(dm_trim_index(None))
+        self.assertIsNone(dm_trim_index("abc"))
 
 
 class EmoticonMemoryTests(unittest.TestCase):

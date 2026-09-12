@@ -105,6 +105,14 @@ DM_MODE_TEXTS = {"滚动": 1, "顶部": 5, "底部": 4}
 DM_META_MAX = 2000
 """dmid -> (uid, uname, text) 缓存的条目上限，超出后丢弃最早的一半。"""
 
+DM_TEXT_MAX_LINES = 4000
+"""弹幕区保留的最大行数。
+
+Text 行数随直播时长无限增长（热门直播间数小时可达十几万行）会让 Tk 越来越卡，
+最终把整个界面卡死。超过该行数后一次性裁掉最旧的一半（保留最近 2000 行）；
+完整弹幕仍按日落在 `dm_YYYYMMDD.jsonl`，裁剪不丢数据。
+"""
+
 EMOTICON_ICON_MAX_HEIGHT = 64
 """表情图标的显示高度**安全上限**（像素）。
 
@@ -248,6 +256,21 @@ def danmaku_send_guard(text: str, *, last_text: str = "", last_time: float = 0.0
     if last_text and text == last_text and now - last_time < dup_window:
         return "内容与上一条相同，请勿重复发送"
     return None
+
+
+def dm_trim_index(total_lines: int, max_lines: int = DM_TEXT_MAX_LINES) -> Optional[str]:
+    """弹幕区超限时应删除到的行号（如 ``"2000.0"``）；未超限返回 None（纯函数）。
+
+    超限后保留最近 ``max_lines // 2`` 行：摊销后每新增 max_lines/2 行才裁一次，
+    避免每次插入都触发整块删除。
+    """
+    try:
+        lines = int(total_lines)
+    except (TypeError, ValueError):
+        return None
+    if lines <= max_lines:
+        return None
+    return f"{max(1, lines - max_lines // 2)}.0"
 
 
 def unseen_badge_text(count: int, label: str) -> str:
@@ -2444,6 +2467,7 @@ class ScMonitorApp:
             image = self._dm_emoticon_images.get(url)
             if image is not None:
                 self._replace_dm_emoticon_ranges(unique, image=image, manage_state=False)
+        self._trim_dm_text()
         text.configure(state="disabled")
         if follow:
             text.see("end")
@@ -2451,6 +2475,23 @@ class ScMonitorApp:
             # 用户正在向上翻阅：累加未读计数并显示「N 条新弹幕 ↓」徽标
             self._dm_unseen += len(batch)
             self._refresh_unseen_badges()
+
+    def _trim_dm_text(self) -> None:
+        """把弹幕区行数压回上限内：无限增长会让 Tk 卡死（见 DM_TEXT_MAX_LINES）。"""
+        text = self.dm_text
+        try:
+            total = int(text.index("end-1c").split(".")[0])
+        except (tk.TclError, ValueError, AttributeError):
+            return
+        cut = dm_trim_index(total)
+        if not cut:
+            return
+        try:
+            text.delete("1.0", cut)
+        except tk.TclError:
+            return
+        logger.debug("弹幕区超过 %d 行，已裁剪最旧的一半（完整内容仍在落盘文件）",
+                     DM_TEXT_MAX_LINES)
 
     def _sorted_room_ids(self) -> List[int]:
         mode = next(k for k, v in SORT_MODE_TEXTS.items() if v == self.sort_mode_var.get())
