@@ -624,5 +624,88 @@ class HeartbeatTimeoutTests(unittest.TestCase):
         self.assertGreaterEqual(len(sent), 1)  # 超时前已按节拍发出心跳
 
 
+class ExtractedEmoticonTests(unittest.TestCase):
+    """DANMU_MSG 的表情对象提取（info[0][13]）：供弹幕表情图片化使用。"""
+
+    def test_extracts_unique_url_and_size(self):
+        meta = [0] * 13 + [{"emoticon_unique": "room_9527_109824",
+                            "url": "https://i0.hdslb.com/x.jpg",
+                            "width": 162, "height": 60, "bulge_display": 1}]
+        self.assertEqual(
+            RoomClient._extract_emoticon([meta, "百岁山", [0, "u"]]),
+            {"unique": "room_9527_109824", "url": "https://i0.hdslb.com/x.jpg",
+             "width": 162, "height": 60, "bulge_display": 1})
+
+    def test_missing_or_partial_returns_empty(self):
+        for info in ([], [[]], [[0] * 13, "x", [0, "u"]],
+                     [[0] * 13 + ["not-a-dict"], "x", [0, "u"]],
+                     [[0] * 13 + [{"url": "u"}], "x", [0, "u"]],
+                     [[0] * 13 + [{"emoticon_unique": "room_1"}], "x", [0, "u"]]):
+            self.assertEqual(RoomClient._extract_emoticon(info), {}, info)
+
+    def test_bad_size_values_fall_back_to_zero(self):
+        meta = [0] * 13 + [{"emoticon_unique": "room_1_2", "url": "u", "width": "x"}]
+        emoticon = RoomClient._extract_emoticon([meta, "x", [0, "u"]])
+        self.assertEqual((emoticon["width"], emoticon["height"]), (0, 0))
+
+
+class EmoticonDanmakuPayloadTests(unittest.TestCase):
+    """表情包弹幕：payload 带上表情对象（图片化用），落盘仍是 [触发词] 文本。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.storage = SCStorage(self.tmp)
+        self.events = []
+        self.client = RoomClient(api=None, room_id=9527, storage=self.storage,
+                                 event_callback=lambda et, p: self.events.append((et, p)))
+        self.client.set_danmaku_enabled(True)
+        self.room_dir = self.tmp / "room_9527"
+
+    def _send(self, msg):
+        self.client._handle_business_message(
+            json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+
+    def test_payload_carries_emoticon(self):
+        extra = json.dumps({"dm_type": 1, "content": "打call",
+                            "emoticon_unique": "room_9527_109824"}, ensure_ascii=False)
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 4, 25, 14893055, 0, 0, 0, "h", 0, 0, 43, "", 1,
+                         {"bulge_display": 1, "emoticon_unique": "room_9527_109824",
+                          "url": "https://i0.hdslb.com/bfs/garb/x.jpg",
+                          "width": 162, "height": 60},
+                         "{}", {"extra": extra}],
+                        "", [0, "弹幕哥", 1, 0]]}
+        self._send(msg)
+        payload = self.events[0][1]
+        self.assertEqual(payload["text"], "[打call]")
+        self.assertEqual(payload["emoticon"]["unique"], "room_9527_109824")
+        self.assertEqual(payload["emoticon"]["url"],
+                         "https://i0.hdslb.com/bfs/garb/x.jpg")
+        self.assertEqual(payload["emoticon"]["width"], 162)
+        self.assertEqual(payload["emoticon"]["height"], 60)
+        # 落盘仍是 [触发词] 文本，不落图片信息
+        self.storage.flush_danmaku_buffers()
+        record = json.loads(next(self.room_dir.glob("dm_*.jsonl"))
+                            .read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["text"], "[打call]")
+        self.assertNotIn("emoticon", record)
+
+    def test_emote_without_image_info_has_no_field(self):
+        # dm_type=1 但 info[0][13] 不是表情对象（脏数据）→ 不附 emoticon 字段
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 1, 25, 16777215, 0, 0, 0, "h", 0, 0, 0, "", 0, 1, 0,
+                         '{"dm_type": 1}'], "百岁山", [0, "弹幕哥", 1, 0]]}
+        self._send(msg)
+        self.assertEqual(self.events[0][1]["text"], "[百岁山]")
+        self.assertNotIn("emoticon", self.events[0][1])
+
+    def test_plain_danmaku_has_no_emoticon_field(self):
+        msg = {"cmd": "DANMU_MSG",
+               "info": [[0, 1, 25, 16777271], "你好", [0, "弹幕哥", 1, 0]]}
+        self._send(msg)
+        self.assertNotIn("emoticon", self.events[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

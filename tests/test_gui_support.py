@@ -14,7 +14,11 @@ from blive_sc_get.api import (
     describe_send_error,
     parse_room_emoticon_packages,
 )
-from blive_sc_get.app_config import AppConfig, load_app_config
+from blive_sc_get.app_config import (
+    DEFAULT_EMOTICON_TOOLTIP,
+    AppConfig,
+    load_app_config,
+)
 from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
 from blive_sc_get.gui_app import (
     EMOTICON_ICON_MAX_HEIGHT,
@@ -23,11 +27,14 @@ from blive_sc_get.gui_app import (
     danmaku_content_from_line,
     danmaku_send_guard,
     emoticon_display_size,
+    emoticon_id_by_unique,
     emoticon_packages_signature,
+    emoticon_tooltip_text,
     fit_emoticon_scale,
     parse_add_input,
     select_dm_options,
     text_scrolled_to_bottom,
+    tooltip_position,
     unseen_badge_text,
 )
 from blive_sc_get.gui_config import (
@@ -176,12 +183,14 @@ class GuiConfigTests(unittest.TestCase):
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "status", "pin_live": True,
                               "notify_overlay": False, "notify_persist": True,
-                              "notify_sound": "三连音", "dm_visible": True})
+                              "notify_sound": "三连音", "dm_visible": True,
+                              "dm_emoticon_image": False})
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "status", "pin_live": True,
                           "notify_overlay": False, "notify_persist": True,
-                          "notify_sound": "三连音", "dm_visible": True})
-        # 旧配置没有 notify_overlay / notify_persist 字段时的缺省值
+                          "notify_sound": "三连音", "dm_visible": True,
+                          "dm_emoticon_image": False})
+        # 旧配置缺字段时的缺省值（弹幕表情图默认开启）
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "manual", "pin_live": False})
         prefs = load_ui_prefs(self.path)
@@ -189,6 +198,7 @@ class GuiConfigTests(unittest.TestCase):
         self.assertFalse(prefs["notify_persist"])
         self.assertEqual(prefs["notify_sound"], "上行双音")
         self.assertFalse(prefs["dm_visible"])
+        self.assertTrue(prefs["dm_emoticon_image"])
 
     def test_ui_prefs_legacy_key_migrates(self):
         # 旧键名 notify_system 迁移到 notify_overlay
@@ -197,15 +207,13 @@ class GuiConfigTests(unittest.TestCase):
         self.assertFalse(load_ui_prefs(self.path)["notify_overlay"])
 
     def test_ui_prefs_defaults(self):
-        self.assertEqual(load_ui_prefs(self.tmp / "nope.json"),
-                         {"sort_mode": "manual", "pin_live": False,
-                          "notify_overlay": True, "notify_persist": False,
-                          "notify_sound": "上行双音", "dm_visible": False})
+        expected = {"sort_mode": "manual", "pin_live": False,
+                    "notify_overlay": True, "notify_persist": False,
+                    "notify_sound": "上行双音", "dm_visible": False,
+                    "dm_emoticon_image": True}
+        self.assertEqual(load_ui_prefs(self.tmp / "nope.json"), expected)
         self.path.write_text("{not json", encoding="utf-8")
-        self.assertEqual(load_ui_prefs(self.path),
-                         {"sort_mode": "manual", "pin_live": False,
-                          "notify_overlay": True, "notify_persist": False,
-                          "notify_sound": "上行双音", "dm_visible": False})
+        self.assertEqual(load_ui_prefs(self.path), expected)
         # 非法排序方式/音效回退默认
         self.path.write_text(
             '{"rooms": [], "ui": {"sort_mode": "bogus", "notify_sound": "bogus"}}',
@@ -248,6 +256,41 @@ class AppConfigTests(unittest.TestCase):
     def test_extra_keys_ignored(self):
         self.path.write_text('{"_说明": "x", "other": 1}', encoding="utf-8")
         self.assertFalse(load_app_config(self.path).allow_write_operations)
+
+    # ---- 表情悬浮提示显示哪些字段（默认仅触发词） ----
+
+    def test_tooltip_default_is_trigger_text_only(self):
+        self.assertEqual(AppConfig().emoticon_tooltip, ("text",))
+        self.assertEqual(load_app_config(self.tmp / "nope.json").emoticon_tooltip,
+                         DEFAULT_EMOTICON_TOOLTIP)
+        self.path.write_text('{"allow_write_operations": true}', encoding="utf-8")
+        self.assertEqual(load_app_config(self.path).emoticon_tooltip, ("text",))
+
+    def test_tooltip_list_form_sorted_canonically(self):
+        self.path.write_text('{"emoticon_tooltip": ["id", "text"]}', encoding="utf-8")
+        self.assertEqual(load_app_config(self.path).emoticon_tooltip, ("text", "id"))
+
+    def test_tooltip_object_form(self):
+        self.path.write_text(
+            '{"emoticon_tooltip": {"text": true, "id": true, "unique": false}}',
+            encoding="utf-8")
+        self.assertEqual(load_app_config(self.path).emoticon_tooltip, ("text", "id"))
+
+    def test_tooltip_can_be_explicitly_disabled(self):
+        for raw in ('{"emoticon_tooltip": []}', '{"emoticon_tooltip": {}}',
+                    '{"emoticon_tooltip": {"text": false}}'):
+            self.path.write_text(raw, encoding="utf-8")
+            self.assertEqual(load_app_config(self.path).emoticon_tooltip, (), raw)
+
+    def test_tooltip_invalid_falls_back_to_default(self):
+        for raw in ('{"emoticon_tooltip": "text"}',
+                    '{"emoticon_tooltip": 5}',
+                    '{"emoticon_tooltip": ["typo"]}',
+                    '{"emoticon_tooltip": {"text": "true"}}',
+                    '{"emoticon_tooltip": {"id": 1}}'):
+            self.path.write_text(raw, encoding="utf-8")
+            self.assertEqual(load_app_config(self.path).emoticon_tooltip,
+                             DEFAULT_EMOTICON_TOOLTIP, raw)
     # 注：不断言仓库里的 config.json 本体——它是供用户编辑的开关文件，
     # 用户开启写操作后该断言会误报。代码层默认值由 test_default_is_write_disabled 保证。
 
@@ -854,6 +897,80 @@ class FitEmoticonScaleTests(unittest.TestCase):
         for bad in ((0, 0), (None, None), ("x", "y"), (-10, 60)):
             self.assertEqual(fit_emoticon_scale(*bad), (1, 1))
         self.assertEqual(emoticon_display_size(0, 60), (0, 0))
+
+
+class EmoticonTooltipTextTests(unittest.TestCase):
+    """悬浮提示文案：按 config.json 的字段开关拼接，默认仅触发词。"""
+
+    INFO = {"text": "[百岁山]", "trigger": "百岁山",
+            "unique": "room_9527_109824", "id": 109824}
+
+    def test_default_only_trigger_text(self):
+        self.assertEqual(emoticon_tooltip_text(self.INFO, DEFAULT_EMOTICON_TOOLTIP),
+                         "[百岁山]")
+
+    def test_all_fields_joined_in_order(self):
+        self.assertEqual(
+            emoticon_tooltip_text(self.INFO, ("text", "unique", "id")),
+            "[百岁山] · unique=room_9527_109824 · id=109824")
+
+    def test_subset_respects_given_order(self):
+        # 顺序由 fields 决定；config.json 里写乱顺序会在解析阶段归正（见 AppConfigTests）
+        self.assertEqual(emoticon_tooltip_text(self.INFO, ("unique", "id")),
+                         "unique=room_9527_109824 · id=109824")
+        self.assertEqual(emoticon_tooltip_text(self.INFO, ("id",)),
+                         "id=109824")
+
+    def test_missing_values_are_skipped(self):
+        self.assertEqual(emoticon_tooltip_text({"text": "[x]"}, ("text", "unique", "id")),
+                         "[x]")
+        self.assertEqual(emoticon_tooltip_text({"unique": "room_1"}, ("text", "unique")),
+                         "unique=room_1")
+
+    def test_trigger_fallback_and_zero_id(self):
+        self.assertEqual(emoticon_tooltip_text({"trigger": "打call"}, ("text",)), "打call")
+        self.assertEqual(emoticon_tooltip_text({"id": 0}, ("id",)), "")
+
+    def test_empty_fields_or_info_yields_empty(self):
+        self.assertEqual(emoticon_tooltip_text(self.INFO, ()), "")
+        self.assertEqual(emoticon_tooltip_text(self.INFO, None), "")
+        self.assertEqual(emoticon_tooltip_text({}, DEFAULT_EMOTICON_TOOLTIP), "")
+
+
+class EmoticonIdByUniqueTests(unittest.TestCase):
+    """按 unique 从已加载的表情包里补数字 id（弹幕报文只有 unique）。"""
+
+    PACKAGES = [{"name": "官方", "id": 1, "emoticons": [
+        {"unique": "official_331", "id": 331},
+        {"unique": "room_9527_1", "id": 109824}]}]
+
+    def test_found(self):
+        self.assertEqual(emoticon_id_by_unique(self.PACKAGES, "room_9527_1"), 109824)
+        self.assertEqual(emoticon_id_by_unique(self.PACKAGES, "official_331"), 331)
+
+    def test_not_found_or_bad_input(self):
+        self.assertEqual(emoticon_id_by_unique(self.PACKAGES, "nope"), 0)
+        self.assertEqual(emoticon_id_by_unique(self.PACKAGES, ""), 0)
+        self.assertEqual(emoticon_id_by_unique(None, "room_9527_1"), 0)
+        self.assertEqual(emoticon_id_by_unique([{"emoticons": "bad"}, 5], "x"), 0)
+
+    def test_bad_id_value(self):
+        self.assertEqual(emoticon_id_by_unique(
+            [{"emoticons": [{"unique": "u", "id": "x"}]}], "u"), 0)
+
+
+class TooltipPositionTests(unittest.TestCase):
+    """悬浮提示定位（纯函数）：光标右下方，越界回缩且不出屏。"""
+
+    def test_offset_from_cursor(self):
+        self.assertEqual(tooltip_position(100, 200, 80, 20, 1920, 1080), "+116+220")
+
+    def test_clamped_to_screen(self):
+        self.assertEqual(tooltip_position(1900, 1070, 200, 40, 1920, 1080),
+                         "+1712+1032")
+
+    def test_never_negative(self):
+        self.assertEqual(tooltip_position(-50, -50, 100, 20, 1920, 1080), "+0+0")
 
 
 class EmoticonMemoryTests(unittest.TestCase):

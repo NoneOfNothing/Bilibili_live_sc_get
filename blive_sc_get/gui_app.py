@@ -45,7 +45,7 @@ from .gui_config import (
     save_room_entries,
 )
 from .storage import SCStorage
-from .overlay import ToastOverlayManager
+from .overlay import ToastOverlayManager, apply_noactivate
 
 logger = logging.getLogger("gui")
 
@@ -136,6 +136,24 @@ EMOTICON_REFRESH_COOLDOWN_S = 30.0
 
 EMOTICON_IMAGE_CACHE_MAX = 300
 """表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
+
+EMOTICON_TOOLTIP_DELAY_MS = 500
+"""鼠标悬浮多久后显示表情提示（毫秒）——「短时间悬浮」才弹出，避免扫过时乱闪。"""
+
+DM_EMOTICON_MAX_HEIGHT = 26
+"""弹幕区表情图的显示高度上限（像素）：约一行半文字高，避免撑高行距。"""
+
+DM_EMOTICON_MAX_WIDTH = 96
+"""弹幕区表情图的显示宽度上限（像素），与高度上限配套以保持比例。"""
+
+DM_EMOTICON_TAG_PREFIX = "dme:"
+"""弹幕区表情的标签前缀（后接 emoticon_unique）。
+
+占位文字与替换后的图片都带该标签，供「悬浮提示」与「图片就绪后替换」定位。
+"""
+
+DM_EMOTICON_INFO_MAX = 400
+"""弹幕区表情记录（unique -> 文本/ID/图片）的条目上限，超出后丢弃最早的。"""
 
 DM_COPY_HINT_MS = 1500
 """点击弹幕正文复制后「已复制」提示的保留时长（毫秒）。"""
@@ -252,6 +270,138 @@ def danmaku_content_from_line(line: str) -> str:
     text = DM_LINE_PREFIX_RE.sub("", str(line or "").strip())
     _uname, sep, rest = text.partition("：")
     return (rest if sep else text).strip()
+
+
+def emoticon_tooltip_text(info: dict, fields) -> str:
+    """按配置拼接表情悬浮提示文案（纯函数）。
+
+    ``fields`` 为 ``app_config.EMOTICON_TOOLTIP_FIELDS`` 的子集（顺序即拼接顺序）：
+    ``text`` → 触发词原文、``unique`` → emoticon_unique、``id`` → 数字 emoticon_id。
+    取不到值的字段跳过；全部取不到或 fields 为空时返回空串（不显示提示）。
+    """
+    parts: List[str] = []
+    for field in fields or ():
+        if field == "text":
+            value = str(info.get("text") or info.get("trigger") or "").strip()
+            if value:
+                parts.append(value)
+        elif field == "unique":
+            value = str(info.get("unique") or "").strip()
+            if value:
+                parts.append(f"unique={value}")
+        elif field == "id":
+            value = str(info.get("id") or "").strip()
+            if value and value != "0":
+                parts.append(f"id={value}")
+    return " · ".join(parts)
+
+
+def emoticon_id_by_unique(packages, unique: str) -> int:
+    """在已加载的表情包里按 unique 取数字 emoticon_id（纯函数，找不到返回 0）。
+
+    弹幕报文里的表情对象只有 ``emoticon_unique``、没有数字 id；若用户此前打开过
+    表情面板（已缓存表情包），这里就能补上数字 id 供悬浮提示显示。
+    """
+    unique = str(unique or "").strip()
+    if not unique:
+        return 0
+    for package in packages or []:
+        if not isinstance(package, dict):
+            continue
+        for emoticon in package.get("emoticons") or []:
+            if not isinstance(emoticon, dict):
+                continue
+            if str(emoticon.get("unique") or "") == unique:
+                try:
+                    return int(emoticon.get("id") or 0)
+                except (TypeError, ValueError):
+                    return 0
+    return 0
+
+
+def tooltip_position(cursor_x: int, cursor_y: int, width: int, height: int,
+                     screen_w: int, screen_h: int, *, offset_x: int = 16,
+                     offset_y: int = 20, margin: int = 8) -> str:
+    """悬浮提示窗的 geometry 字符串（纯函数）：光标右下方，越界时向内回缩。
+
+    ``screen_w``/``screen_h`` 由调用方用 ``winfo_screenwidth/height`` 提供；
+    尺寸不足时按 0 兜底，保证窗口始终留在屏幕内。
+    """
+    left = min(max(0, int(cursor_x) + offset_x), max(0, int(screen_w) - width - margin))
+    top = min(max(0, int(cursor_y) + offset_y), max(0, int(screen_h) - height - margin))
+    return f"+{left}+{top}"
+
+
+class _EmoticonTooltip:
+    """表情悬浮提示用的小窗（整个程序共用一个实例）。
+
+    无边框（overrideredirect）+ 置顶 + ``WS_EX_NOACTIVATE``：显示与点击都**不抢焦点**，
+    不进入任务栏；内容变化时复用同一窗口，只移动位置。
+    """
+
+    def __init__(self, root: tk.Misc) -> None:
+        self._root = root
+        self._window: Optional[tk.Toplevel] = None
+        self._label: Optional[tk.Label] = None
+        self._noactivate_applied = False
+
+    def show(self, text: str, cursor_x: int, cursor_y: int) -> None:
+        """在光标附近显示提示；``text`` 为空表示不显示。"""
+        if not text:
+            self.hide()
+            return
+        try:
+            if self._window is None or not self._window.winfo_exists():
+                window = tk.Toplevel(self._root)
+                window.overrideredirect(True)
+                window.attributes("-topmost", True)
+                window.withdraw()
+                self._label = tk.Label(window, text=text, background="#ffffe0",
+                                       foreground="#333333", relief="solid",
+                                       borderwidth=1, padx=6, pady=2, justify="left")
+                self._label.pack()
+                self._window = window
+                self._noactivate_applied = False
+            else:
+                window = self._window
+                if self._label is not None:
+                    self._label.configure(text=text)
+            window.update_idletasks()
+            if not self._noactivate_applied:
+                # 必须在窗口真正映射后设置扩展风格，否则会被覆盖
+                apply_noactivate(window)
+                self._noactivate_applied = True
+            self._window.geometry(tooltip_position(
+                cursor_x, cursor_y, self._window.winfo_reqwidth(),
+                self._window.winfo_reqheight(),
+                self._root.winfo_screenwidth(), self._root.winfo_screenheight()))
+            self._window.deiconify()
+            self._window.lift()
+        except tk.TclError:
+            self.hide()
+
+    def hide(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        try:
+            window.withdraw()
+        except tk.TclError:
+            self._window = None
+            self._label = None
+
+    def destroy(self) -> None:
+        """关闭并销毁窗口（退出程序时调用，避免残留）。"""
+        window = self._window
+        self._window = None
+        self._label = None
+        self._noactivate_applied = False
+        if window is None:
+            return
+        try:
+            window.destroy()
+        except tk.TclError:
+            pass
 
 
 def fit_emoticon_scale(width: int, height: int, *,
@@ -476,8 +626,18 @@ class ScMonitorApp:
         self._emoticon_fetched_at: Dict[int, float] = {}  # 房间号 -> 上次拉取表情包的时间(monotonic)
         self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
-        self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
-        self._emoticon_pending: set = set()  # 正在下载的图片 url
+        self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 面板用图片
+        self._emoticon_pending: set = set()  # 正在下载的图片 url（面板与弹幕区共用）
+        # 弹幕区表情图（ROADMAP 41）：与面板共用下载管线，但用更小的显示尺寸
+        self._dm_emoticon_images: Dict[str, tk.PhotoImage] = {}  # url -> 弹幕用小图
+        self._dm_emoticon_urls: Dict[str, str] = {}   # unique -> 图片 url
+        self._dm_emoticon_by_url: Dict[str, str] = {}  # 图片 url -> unique（下载完成时回查）
+        self._dm_emoticon_info: Dict[str, dict] = {}  # unique -> {"text","unique","id"}
+        # 表情悬浮提示（ROADMAP 40）：整程序共用一个小窗，双击提示字段由 config.json 控制
+        self.emoticon_tooltip = _EmoticonTooltip(root)
+        self._emoticon_tip_id: Optional[str] = None   # 延时弹出的 after id
+        self._emoticon_tip_key = ""                   # 当前正在提示的表情（去抖/去重）
+        self._emoticon_tip_pos: Tuple[int, int] = (0, 0)  # 触发时的光标位置
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -655,8 +815,16 @@ class ScMonitorApp:
         self.dm_var = tk.BooleanVar(value=bool(self.ui_prefs.get("dm_visible", False)))
         ttk.Checkbutton(dm_bar, text="弹幕", variable=self.dm_var,
                         command=self._on_dm_toggled).pack(side="left")
+        # 弹幕里的表情包是否显示为图片（ROADMAP 41）；关闭则显示 [触发词] 文本
+        self.dm_emoticon_image_var = tk.BooleanVar(
+            value=bool(self.ui_prefs.get("dm_emoticon_image", True)))
+        self.dm_emoticon_check = ttk.Checkbutton(
+            dm_bar, text="表情图", variable=self.dm_emoticon_image_var,
+            command=self._on_dm_emoticon_image_toggled)
+        self.dm_emoticon_check.pack(side="left", padx=(6, 0))
         ttk.Label(dm_bar, text="（开启后显示并保存当前选中房间的弹幕）",
                   foreground="#888888").pack(side="left", padx=(6, 0))
+        self._refresh_dm_emoticon_check_state()
 
         # 底部全局操作条：仅保留与房间列表无关的操作（房间相关的备注/启停/删除
         # 已移到直播间列表下方的 room_actions 行）
@@ -709,6 +877,9 @@ class ScMonitorApp:
             self.dm_text.tag_configure(tag, foreground=color)
         self.dm_text.bind("<Button-1>", self._on_dm_click)
         self.dm_text.bind("<Button-3>", self._on_dm_right_click)
+        # 悬浮在弹幕表情图上时给出提示（提示字段由 config.json 的 emoticon_tooltip 控制）
+        self.dm_text.bind("<Motion>", self._on_dm_motion)
+        self.dm_text.bind("<Leave>", lambda _e: self._hide_emoticon_tooltip())
         self.dm_text.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
         # 新消息浮动徽标：滚动条不在底部时显示未读条数，点击回到底部并恢复跟随。
         # 以 place(in_=<Text>) 叠在文本区右下角，不改变既有 pack 布局。
@@ -1072,13 +1243,32 @@ class ScMonitorApp:
 
     # ---------- 弹幕区 ----------
 
+    def _refresh_dm_emoticon_check_state(self) -> None:
+        """弹幕区整体关闭时「表情图」选项无意义 → 置灰（保留取值）。"""
+        try:
+            self.dm_emoticon_check.configure(
+                state="normal" if self.dm_var.get() else "disabled")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _on_dm_emoticon_image_toggled(self) -> None:
+        """切换弹幕表情图：持久化偏好，并把已显示的表情在 文本 ↔ 图片 之间互转。"""
+        enabled = bool(self.dm_emoticon_image_var.get())
+        self.ui_prefs["dm_emoticon_image"] = enabled
+        self._save_config()
+        self._hide_emoticon_tooltip()
+        self._apply_dm_emoticon_mode()
+        logger.debug("弹幕表情图已%s", "开启" if enabled else "关闭")
+
     def _on_dm_toggled(self) -> None:
         visible = bool(self.dm_var.get())
         self.ui_prefs["dm_visible"] = visible
         self._save_config()
+        self._refresh_dm_emoticon_check_state()
         if not visible:
             # 弹幕区整体隐藏时表情面板也随之不可见，顺手收起并记录
             self._hide_emoticon_panel()
+            self._hide_emoticon_tooltip()
         try:
             if visible:
                 self.paned.add(self.dm_frame, weight=PANE_WEIGHTS[2])
@@ -1188,6 +1378,7 @@ class ScMonitorApp:
 
     def _on_dm_click(self, event) -> None:
         """点击弹幕：命中用户名 → 跳转其个人空间；命中正文 → 复制该条弹幕内容。"""
+        self._hide_emoticon_tooltip()  # 点击即收起悬浮提示
         text = self.dm_text
         index = text.index(f"@{event.x},{event.y}")
         tags = [str(t) for t in text.tag_names(index)]
@@ -1400,6 +1591,7 @@ class ScMonitorApp:
 
     def _on_dm_right_click(self, event) -> None:
         """右键弹幕：回复该弹幕（带 dmid）/ @该用户。"""
+        self._hide_emoticon_tooltip()
         index = self.dm_text.index(f"@{event.x},{event.y}")
         dmid = ""
         uid = 0
@@ -1626,6 +1818,8 @@ class ScMonitorApp:
         记住收起时正在浏览的表情包（按直播间分别记录），并保留已载入的表情包与
         图片缓存——再次展开同一直播间时直接回到该包，且无需重新请求。
         """
+        # 先收提示：即使面板本就未展开（如关闭弹幕区时顺带调用），也要清掉悬挂的提示
+        self._hide_emoticon_tooltip()
         if not self._emoticon_visible:
             return
         self._emoticon_visible = False
@@ -1763,6 +1957,7 @@ class ScMonitorApp:
         packages = self._emoticon_packages
         if not self._emoticon_visible or not packages:
             return
+        self._hide_emoticon_tooltip()  # 换页会重建按钮，先收起针对旧按钮的提示
         index = max(0, min(index, len(packages) - 1))
         self._emoticon_page = index
         package = packages[index]
@@ -1800,6 +1995,9 @@ class ScMonitorApp:
                 btn.configure(image=image, text="", width=0, height=0)
             btn.grid(row=0, column=0, padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD)
             btn.bind("<MouseWheel>", self._on_emoticon_wheel)
+            # 悬浮提示：短暂停留才弹出（见 EMOTICON_TOOLTIP_DELAY_MS）
+            btn.bind("<Enter>", lambda e, it=item: self._on_emoticon_hover(it, e))
+            btn.bind("<Leave>", lambda _e: self._hide_emoticon_tooltip())
             self._emoticon_button_list.append((url, btn))
             if url:
                 self._emoticon_buttons[url] = btn
@@ -1880,6 +2078,7 @@ class ScMonitorApp:
         image = self._scale_photo(raw)
         if len(self._emoticon_images) >= EMOTICON_IMAGE_CACHE_MAX:
             self._emoticon_images.clear()
+            self._dm_emoticon_images.clear()
         self._emoticon_images[url] = image
         btn = self._emoticon_buttons.get(url)
         try:
@@ -1889,21 +2088,183 @@ class ScMonitorApp:
                 self._schedule_emoticon_regrid()
         except tk.TclError:
             pass  # 按钮不可用（如已切页/切房）：仅保留图片缓存供后续复用
+        # 弹幕区若正用这个表情（也许正等着它替换占位文本），补上小尺寸图片
+        unique = self._dm_emoticon_by_url.get(url)
+        if unique:
+            dm_image = self._scale_photo(
+                raw, max_w=DM_EMOTICON_MAX_WIDTH, max_h=DM_EMOTICON_MAX_HEIGHT)
+            self._dm_emoticon_images[url] = dm_image
+            if self.dm_emoticon_image_var.get():
+                self._replace_dm_emoticon_ranges(unique, image=dm_image)
 
     @staticmethod
-    def _scale_photo(image: tk.PhotoImage) -> tk.PhotoImage:
+    def _scale_photo(image: tk.PhotoImage, *,
+                     max_w: int = EMOTICON_ICON_MAX_WIDTH,
+                     max_h: int = EMOTICON_ICON_MAX_HEIGHT) -> tk.PhotoImage:
         """把表情图片缩放到显示尺寸上限内（保持比例，尽量少损失细节）。
 
         用 zoom(a)+subsample(b) 近似 a/b 的小数比例；单用 subsample 会把
         162×60 的直播「大表情」按最长边压成 54×20，细节全丢、糊成一团。
         """
-        zoom, sub = fit_emoticon_scale(image.width(), image.height())
+        zoom, sub = fit_emoticon_scale(image.width(), image.height(),
+                                       max_w=max_w, max_h=max_h)
         if (zoom, sub) == (1, 1):
             return image
         try:
             return image.zoom(zoom, zoom).subsample(sub, sub)
         except tk.TclError:
             return image
+
+    # ---------- 弹幕区表情图（ROADMAP 41） ----------
+
+    def _remember_dm_emoticon(self, unique: str, dm: dict, shown_text: str) -> None:
+        """记录弹幕里出现过的表情（供悬浮提示与「文本 ↔ 图片」互转）。"""
+        emoticon = dm.get("emoticon") or {}
+        self._dm_emoticon_info[unique] = {
+            "text": shown_text,
+            "unique": unique,
+            # 弹幕报文只有 unique，没有数字 id：能从已加载的表情包里补上就补
+            "id": emoticon_id_by_unique(self._emoticons.get(dm.get("room_id")), unique),
+        }
+        url = str(emoticon.get("url") or "")
+        if url:
+            self._dm_emoticon_urls[unique] = url
+            self._dm_emoticon_by_url[url] = unique
+            self._request_dm_emoticon_image(url)
+        # 上限保护：超出后丢弃最早的记录（最旧的那几条已滚出视野）
+        while len(self._dm_emoticon_info) > DM_EMOTICON_INFO_MAX:
+            oldest = next(iter(self._dm_emoticon_info))
+            self._dm_emoticon_info.pop(oldest, None)
+            stale_url = self._dm_emoticon_urls.pop(oldest, "")
+            if stale_url:
+                self._dm_emoticon_images.pop(stale_url, None)
+                self._dm_emoticon_by_url.pop(stale_url, None)
+
+    def _request_dm_emoticon_image(self, url: str) -> None:
+        """按需下载弹幕用小图（复用面板的下载管线与 4 并发限流）。"""
+        if not url or url in self._dm_emoticon_images or url in self._emoticon_pending:
+            return
+        self._emoticon_pending.add(url)
+        self.hub.submit(self._async_load_emoticon_images([url]))
+
+    def _replace_dm_emoticon_ranges(self, unique: str, *,
+                                    image: Optional[tk.PhotoImage],
+                                    manage_state: bool = True) -> None:
+        """把弹幕区某个表情的所有出现位置在「[触发词] 文本」与「图片」之间互转。
+
+        ``image`` 为 None 表示还原成文本。替换时保留原有的点击/右键标签
+        （``dmbody`` / ``dm:<dmid>`` / ``dme:<unique>``），因此嵌图后依然可以
+        点击复制、右键回复。
+        """
+        text = self.dm_text
+        tag = f"{DM_EMOTICON_TAG_PREFIX}{unique}"
+        try:
+            ranges = text.tag_ranges(tag)
+        except tk.TclError:
+            return
+        if not ranges:
+            return
+        info = self._dm_emoticon_info.get(unique) or {}
+        fallback = str(info.get("text") or f"[{unique}]")
+        if manage_state:
+            try:
+                text.configure(state="normal")
+            except tk.TclError:
+                return
+        try:
+            # 倒序替换：从后往前改，前面的下标才不会失效
+            for start, end in reversed(list(zip(ranges[::2], ranges[1::2]))):
+                keep = [str(name) for name in text.tag_names(start)
+                        if str(name).startswith("dm")]
+                text.delete(start, end)
+                if image is None:
+                    text.insert(start, fallback, tuple(keep))
+                else:
+                    text.image_create(start, image=image, padx=1, pady=0)
+                    for name in set(keep) | {tag}:
+                        text.tag_add(name, start, f"{start}+1c")
+        except tk.TclError:
+            return
+        finally:
+            if manage_state:
+                try:
+                    text.configure(state="disabled")
+                except tk.TclError:
+                    pass
+
+    def _apply_dm_emoticon_mode(self) -> None:
+        """按「表情图」开关，把弹幕区已显示的弹幕表情在 文本 ↔ 图片 之间切换。"""
+        enabled = bool(self.dm_emoticon_image_var.get())
+        for unique in list(self._dm_emoticon_info):
+            image = None
+            if enabled:
+                url = self._dm_emoticon_urls.get(unique, "")
+                image = self._dm_emoticon_images.get(url)
+                if image is None:
+                    # 图片还没下载好：先保持文本，就绪后由 _on_emoticon_image 替换
+                    self._request_dm_emoticon_image(url)
+                    continue
+            self._replace_dm_emoticon_ranges(unique, image=image)
+
+    # ---------- 表情悬浮提示（ROADMAP 40） ----------
+
+    def _on_emoticon_hover(self, info: dict, event) -> None:
+        """鼠标进入表情按钮：安排一次延时提示。"""
+        self._cancel_emoticon_tooltip()
+        self._schedule_emoticon_tooltip(info, event)
+
+    def _schedule_emoticon_tooltip(self, info: dict, event) -> None:
+        """短暂停留后才弹出提示：扫过表情时不弹，避免乱闪。"""
+        text = emoticon_tooltip_text(info, self.app_config.emoticon_tooltip)
+        if not text:
+            return
+        self._cancel_emoticon_tooltip()
+        self._emoticon_tip_pos = (event.x_root, event.y_root)
+        self._emoticon_tip_id = self.root.after(
+            EMOTICON_TOOLTIP_DELAY_MS, lambda: self._show_emoticon_tooltip(text))
+
+    def _show_emoticon_tooltip(self, text: str) -> None:
+        self._emoticon_tip_id = None
+        self.emoticon_tooltip.show(text, *self._emoticon_tip_pos)
+
+    def _cancel_emoticon_tooltip(self) -> None:
+        if self._emoticon_tip_id is None:
+            return
+        try:
+            self.root.after_cancel(self._emoticon_tip_id)
+        except Exception:
+            pass
+        self._emoticon_tip_id = None
+
+    def _hide_emoticon_tooltip(self) -> None:
+        """隐藏悬浮提示（收起面板、切换表情、切房、点击、退出时都要调用）。"""
+        self._cancel_emoticon_tooltip()
+        self._emoticon_tip_key = ""
+        self.emoticon_tooltip.hide()
+
+    def _on_dm_motion(self, event) -> None:
+        """鼠标在弹幕区移动：停在表情图上时给出提示（按表情去抖）。"""
+        info = self._dm_emoticon_under(event)
+        key = str(info.get("unique") or "") if info else ""
+        if key == self._emoticon_tip_key:
+            return  # 仍在同一个表情上：不重排也不闪
+        self._emoticon_tip_key = key
+        self._cancel_emoticon_tooltip()
+        self.emoticon_tooltip.hide()
+        if info:
+            self._schedule_emoticon_tooltip(info, event)
+
+    def _dm_emoticon_under(self, event) -> Optional[dict]:
+        """取光标下的弹幕表情信息（不在表情上时返回 None）。"""
+        try:
+            index = self.dm_text.index(f"@{event.x},{event.y}")
+            names = [str(name) for name in self.dm_text.tag_names(index)]
+        except tk.TclError:
+            return None
+        for name in names:
+            if name.startswith(DM_EMOTICON_TAG_PREFIX):
+                return self._dm_emoticon_info.get(name[len(DM_EMOTICON_TAG_PREFIX):])
+        return None
 
     def _send_emoticon(self, emoticon: dict) -> None:
         """点击表情即发送（与网页端一致）：沿用写操作总开关、登录态与冷却/重复拦截。"""
@@ -2017,6 +2378,7 @@ class ScMonitorApp:
             return
         text = self.dm_text
         follow = text_scrolled_to_bottom(text.yview())
+        emoticon_tags: List[str] = []
         text.configure(state="normal")
         for dm in batch:
             time_str = str(dm.get("time", ""))
@@ -2036,8 +2398,24 @@ class ScMonitorApp:
                         f"dm_time {dm_tag}".strip())
             user_tag = f"dm_user dmuid:{uid}" if uid else "dm_user"
             text.insert("end", f"{uname}：", f"{user_tag} {dm_tag}".strip())
-            text.insert("end", content, f"{dm_tag} {body_tag}".strip())
+            tags = f"{dm_tag} {body_tag}".strip()
+            unique = str((dm.get("emoticon") or {}).get("unique") or "")
+            if unique and self.dm_emoticon_image_var.get():
+                # 表情包弹幕：先插 [触发词] 文本占位并打 dme:<unique> 标记，
+                # 图片就绪后由 _replace_dm_emoticon_ranges 就地换成图片
+                self._remember_dm_emoticon(unique, dm, content)
+                text.insert("end", content,
+                            f"{tags} {DM_EMOTICON_TAG_PREFIX}{unique}".strip())
+                emoticon_tags.append(unique)
+            else:
+                text.insert("end", content, tags)
             text.insert("end", "\n", dm_tag or ())
+        # 图片已在缓存里的就地替换为图片（此刻 Text 仍可写）
+        for unique in emoticon_tags:
+            url = self._dm_emoticon_urls.get(unique, "")
+            image = self._dm_emoticon_images.get(url)
+            if image is not None:
+                self._replace_dm_emoticon_ranges(unique, image=image, manage_state=False)
         text.configure(state="disabled")
         if follow:
             text.see("end")
@@ -2961,6 +3339,7 @@ class ScMonitorApp:
         if not messagebox.askokcancel("退出", "确定退出？将停止所有房间的监听。"):
             return
         self._remember_emoticon_page()  # 面板还开着时直接退出也要记住当前表情包
+        self._hide_emoticon_tooltip()
         self.hub.submit(self._async_shutdown())
         self.root.after(1500, self._destroy)
 
@@ -2979,6 +3358,8 @@ class ScMonitorApp:
             self._remember_emoticon_page()
         except Exception:
             logger.debug("退出前记录表情包失败", exc_info=True)
+        self._hide_emoticon_tooltip()
+        self.emoticon_tooltip.destroy()
         try:
             self.root.destroy()
         except tk.TclError:

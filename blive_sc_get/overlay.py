@@ -46,7 +46,7 @@ def toast_geometry(index: int, screen_w: int, screen_h: int, height: int,
     return f"{width}x{height}+{x}+{y}"
 
 
-def _apply_noactivate(win: tk.Toplevel) -> None:
+def apply_noactivate(win: tk.Toplevel) -> None:
     """给悬浮窗设置 WS_EX_NOACTIVATE | WS_EX_TOPMOST，显示/点击不抢焦点。"""
     try:
         user32 = ctypes.windll.user32
@@ -99,7 +99,7 @@ class ToastWindow:
     def reveal(self) -> None:
         """完成布局、应用不抢焦点风格；非常驻时启动超时自动关闭。"""
         self._win.update_idletasks()
-        _apply_noactivate(self._win)
+        apply_noactivate(self._win)
         if not self._persist:
             self._after_id = self._win.after(SHOW_DURATION_MS, self.close)
 

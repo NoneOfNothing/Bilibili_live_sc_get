@@ -63,6 +63,14 @@ OFFLINE_CONFIRM_RETRY_DELAY = 5.0
 LIVE_STATUS_TEXT = {0: "未开播", 1: "直播中", 2: "轮播中"}
 
 
+def _as_int(value) -> int:
+    """宽松取整：非法/缺失一律回退 0（用于表情宽高等可选字段）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def compute_reconnect_delay(attempt: int, *, base: float = RECONNECT_BASE_DELAY,
                             cap: float = RECONNECT_MAX_DELAY,
                             jitter: float = RECONNECT_JITTER,
@@ -382,26 +390,33 @@ class RoomClient:
             uid = int(user[0]) if user and isinstance(user[0], (int, str)) else 0
         except (TypeError, ValueError):
             uid = 0
+        emoticon: dict = {}
         if self._is_emote_danmu(info):
             word = text.strip() or str(self._parse_dm_extra(info).get("content", "")).strip()
             text = word if (word.startswith("[") and word.endswith("]") and len(word) > 2) \
                 else f"[{word or '表情包'}]"
+            # 整条都是表情的弹幕：报文自带图片地址，供 GUI 显示为图片
+            emoticon = self._extract_emoticon(info)
         if not text:
             return
         received_at = datetime.now()
         try:
+            # 落盘始终用 [触发词] 文本，不落图片（保持落盘格式稳定）
             self._storage.save_danmaku(self._room_id, uname, text, received_at)
         except OSError as exc:
             # 弹幕非关键数据：落盘失败（如文件被占用）直接丢弃，不影响显示
             self._log.debug("弹幕落盘失败: %s", exc)
-        self._emit("dm", {
+        payload = {
             "room_id": self._room_id,
             "time": received_at.isoformat(timespec="seconds"),
             "uname": uname,
             "uid": uid,
             "text": text,
             "dmid": self._extract_dmid(info),
-        })
+        }
+        if emoticon:
+            payload["emoticon"] = emoticon
+        self._emit("dm", payload)
 
     def _on_online_rank_count(self, command: dict) -> None:
         """直播间实时在线人数（同接），弹幕服务器随流推送。"""
@@ -546,6 +561,29 @@ class RoomClient:
             if value.isdigit() and int(value) > 0 and len(value) > len(best):
                 best = value
         return best
+
+    @staticmethod
+    def _extract_emoticon(info: list) -> dict:
+        """取 DANMU_MSG 里的表情对象（``info[0][13]``），拿不到返回空字典。
+
+        实测字段为 ``emoticon_unique`` / ``url`` / ``width`` / ``height`` /
+        ``bulge_display``；只有 unique 与 url 是必需的（尺寸由 GUI 侧兜底）。
+        """
+        meta = info[0] if isinstance(info, list) and info and isinstance(info[0], list) else []
+        raw = meta[13] if len(meta) > 13 else None
+        if not isinstance(raw, dict):
+            return {}
+        unique = str(raw.get("emoticon_unique") or "").strip()
+        url = str(raw.get("url") or "").strip()
+        if not unique or not url:
+            return {}
+        return {
+            "unique": unique,
+            "url": url,
+            "width": _as_int(raw.get("width")),
+            "height": _as_int(raw.get("height")),
+            "bulge_display": _as_int(raw.get("bulge_display")),
+        }
 
     @staticmethod
     def _is_emote_danmu(info: list) -> bool:
