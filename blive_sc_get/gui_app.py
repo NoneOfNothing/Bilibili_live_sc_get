@@ -107,11 +107,18 @@ DM_META_MAX = 2000
 EMOTICON_COLUMNS = 6
 """表情面板的**兜底/初始**列数；实际列数按面板可用宽度自适应（面板未完成布局时用它）。"""
 
-EMOTICON_ICON_MAX_PX = 72
-"""表情图片按钮的显示边长（像素），超过时按整数倍缩小。"""
+EMOTICON_ICON_MAX_HEIGHT = 44
+"""表情图标的显示高度上限（像素）。"""
 
-EMOTICON_GRID_PAD = 6
-"""表情按钮的内边距（像素），决定图标之间的间距。"""
+EMOTICON_ICON_MAX_WIDTH = 132
+"""表情图标的显示宽度上限（像素）。
+
+直播间「大表情」是 162×60 / 231×60 这类**宽图**，若按高度上限等比缩放会被
+压得很小；给宽度更大的余量才能看清细节（见 fit_emoticon_scale）。
+"""
+
+EMOTICON_GRID_PAD = 4
+"""表情按钮的内边距与网格间距（像素）。"""
 
 EMOTICON_GRID_ROWS = 3
 """表情网格最多显示的行数；实际高度按内容行数收缩，超出部分在该包内滚动查看。"""
@@ -234,6 +241,60 @@ def danmaku_content_from_line(line: str) -> str:
     text = DM_LINE_PREFIX_RE.sub("", str(line or "").strip())
     _uname, sep, rest = text.partition("：")
     return (rest if sep else text).strip()
+
+
+def fit_emoticon_scale(width: int, height: int, *,
+                       max_w: int = EMOTICON_ICON_MAX_WIDTH,
+                       max_h: int = EMOTICON_ICON_MAX_HEIGHT) -> Tuple[int, int]:
+    """算出把 width×height 缩到不超过 max_w×max_h 的近似整数比例（纯函数）。
+
+    返回 ``(zoom, subsample)``：``(1, 1)`` 表示无需缩放。
+
+    Tk 的 PhotoImage 只支持整数倍 ``zoom`` / ``subsample``，单用 ``subsample``
+    会把 162×60 的直播「大表情」按最长边压成 54×20（细节全丢、糊成一团）；
+    这里用 ``zoom(a)`` 再 ``subsample(b)`` 近似 a/b 这类小数比例，尽量贴近
+    目标尺寸；找不到合适的小整数比时退回整数倍 ``subsample``。
+    """
+    try:
+        width = int(width or 0)
+        height = int(height or 0)
+    except (TypeError, ValueError):
+        return 1, 1
+    if width <= 0 or height <= 0 or max_w <= 0 or max_h <= 0:
+        return 1, 1
+    target = min(max_w / width, max_h / height)
+    if target >= 1.0:
+        return 1, 1
+    best: Optional[Tuple[int, int]] = None
+    best_error = None
+    for zoom in range(1, 6):
+        for sub in range(zoom + 1, 9):
+            ratio = zoom / sub
+            if ratio > target * 1.02:
+                continue
+            error = abs(target - ratio)
+            if best_error is None or error < best_error - 1e-9:
+                best, best_error = (zoom, sub), error
+    if best is not None:
+        return best
+    return 1, max(2, int(math.ceil(1.0 / target)))
+
+
+def emoticon_display_size(width: int, height: int, *,
+                          max_w: int = EMOTICON_ICON_MAX_WIDTH,
+                          max_h: int = EMOTICON_ICON_MAX_HEIGHT) -> Tuple[int, int]:
+    """按 fit_emoticon_scale 的比例算出缩放后的显示尺寸（纯函数）。"""
+    try:
+        width = int(width or 0)
+        height = int(height or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    if width <= 0 or height <= 0:
+        return 0, 0
+    zoom, sub = fit_emoticon_scale(width, height, max_w=max_w, max_h=max_h)
+    if (zoom, sub) == (1, 1):
+        return width, height
+    return max(1, math.ceil(width * zoom / sub)), max(1, math.ceil(height * zoom / sub))
 
 
 def select_dm_options(presets, offered):
@@ -375,6 +436,8 @@ class ScMonitorApp:
         self._emoticon_page = 0                       # 当前显示的表情包序号（一页 = 一包）
         self._emoticon_button_list: List[Tuple[str, tk.Button]] = []  # 当前页按钮（按顺序）
         self._emoticon_columns = 0                    # 当前每行列数（0 = 待重排）
+        self._emoticon_cell_h = 0                     # 当前每行高度（0 = 待重排）
+        self._emoticon_weight_columns = 0             # 已设置过 weight 的列数（收缩时需清零）
         self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
@@ -676,7 +739,7 @@ class ScMonitorApp:
                   foreground="#1a7f37").pack(side="top", fill="x")
         # 表情面板：内嵌在发送行上方（点「表情」展开/收起），默认隐藏。
         # 用 pack_forget 收起，不另开窗口；内容在首次展开时才向后端请求
-        self.emoticon_panel = ttk.LabelFrame(area, text="发送表情包")
+        self.emoticon_panel = ttk.LabelFrame(area, text="发送表情包（点击即发送）")
         self._build_emoticon_panel(self.emoticon_panel)
         # 回复/@ 目标提示行：默认隐藏，显示时插入到发送行上方
         self.dm_reply_var = tk.StringVar(value="")
@@ -1360,8 +1423,6 @@ class ScMonitorApp:
         网格区拖动滚动条（或滚轮）查看。面板挂在发送区内部，点击「表情」键
         用 pack/pack_forget 展开或收起，不使用独立窗口。
         """
-        cell = EMOTICON_ICON_MAX_PX + 2 * EMOTICON_GRID_PAD
-
         # 分页栏：上一包 / 包名下拉（可直接跳页） / 下一包 / 页码说明 / 收起
         bar = ttk.Frame(parent)
         bar.pack(side="top", fill="x", padx=4, pady=(4, 2))
@@ -1382,19 +1443,21 @@ class ScMonitorApp:
         ttk.Button(bar, text="收起", width=6,
                    command=self._hide_emoticon_panel).pack(side="right")
 
-        # 提示行先占位（底部固定条），避免后 pack 被网格区挤成 0 高
+        # 提示行：仅在「加载中 / 无可用表情」等需要说明时占位，正常浏览时整行收起，
+        # 不再白占高度（正常态的操作提示写在面板标题里）
         self._emoticon_hint_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self._emoticon_hint_var, foreground="#888888",
-                  wraplength=EMOTICON_COLUMNS * cell, justify="left").pack(
-            side="bottom", fill="x", padx=4, pady=(0, 4))
+        self._emoticon_hint_label = ttk.Label(
+            parent, textvariable=self._emoticon_hint_var, foreground="#888888",
+            wraplength=EMOTICON_COLUMNS * (EMOTICON_ICON_MAX_WIDTH // 2), justify="left")
 
         # 网格区：画布 + 垂直滚动条。画布宽度撑满面板（每行列数按宽度自适应），
         # 高度按实际内容行数收缩（最多 EMOTICON_GRID_ROWS 行），避免留下大片空白
         body = ttk.Frame(parent)
+        self._emoticon_body = body
         body.pack(side="top", fill="x", padx=4, pady=(0, 4))
-        self._emoticon_canvas = tk.Canvas(body, highlightthickness=0,
-                                         width=EMOTICON_COLUMNS * cell,
-                                         height=cell)
+        self._emoticon_canvas = tk.Canvas(
+            body, highlightthickness=0, width=EMOTICON_COLUMNS * EMOTICON_ICON_MAX_WIDTH,
+            height=EMOTICON_ICON_MAX_HEIGHT + 4 * EMOTICON_GRID_PAD)
         vbar = ttk.Scrollbar(body, orient="vertical",
                              command=self._emoticon_canvas.yview)
         self._emoticon_canvas.configure(yscrollcommand=vbar.set)
@@ -1412,10 +1475,18 @@ class ScMonitorApp:
             widget.bind("<MouseWheel>", self._on_emoticon_wheel)
             widget.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
 
-    @staticmethod
-    def _emoticon_cell() -> int:
-        """一个表情格子（图标 + 两侧间距）的边长（像素）。"""
-        return EMOTICON_ICON_MAX_PX + 2 * EMOTICON_GRID_PAD
+    def _set_emoticon_hint(self, message: str) -> None:
+        """设置面板底部提示；为空时把整行收起，避免白占面板高度。"""
+        self._emoticon_hint_var.set(message)
+        label = self._emoticon_hint_label
+        try:
+            if message and not label.winfo_manager():
+                label.pack(side="bottom", fill="x", padx=4, pady=(0, 4),
+                           before=self._emoticon_body)
+            elif not message and label.winfo_manager():
+                label.pack_forget()
+        except tk.TclError:
+            pass
 
     def _on_emoticon_canvas_configure(self, event) -> None:
         """画布尺寸变化：让内层网格跟随宽度，并在列数变化时重排列数。"""
@@ -1456,16 +1527,24 @@ class ScMonitorApp:
         buttons = self._emoticon_button_list
         if not buttons:
             return
-        cell = self._emoticon_cell()
+        cell_w, cell_h = self._emoticon_cell_size()
         width = self._emoticon_canvas.winfo_width()
         if width <= 1:  # 尚未完成布局（如面板刚创建）：退回请求宽度
             width = self._emoticon_canvas.winfo_reqwidth()
-        columns = int(width // cell)
-        if columns < 1:
-            columns = EMOTICON_COLUMNS
-        if columns == self._emoticon_columns:
+        columns = max(1, int(width // cell_w))
+        if (columns, cell_h) == (self._emoticon_columns, self._emoticon_cell_h):
             return
         self._emoticon_columns = columns
+        self._emoticon_cell_h = cell_h
+        # 用满面板宽度：把不足一个格子的余量平摊到各列（列宽等分后图标居中），
+        # 这样最右一列不会在外侧留出一条空白；列数变少时把多余的 weight 清掉
+        for index in range(max(columns, self._emoticon_weight_columns)):
+            try:
+                self._emoticon_grid.columnconfigure(
+                    index, weight=1 if index < columns else 0)
+            except (tk.TclError, AttributeError):
+                return
+        self._emoticon_weight_columns = columns
         for position, (_url, button) in enumerate(buttons):
             try:
                 button.grid_configure(row=position // columns, column=position % columns)
@@ -1473,10 +1552,24 @@ class ScMonitorApp:
                 return
         rows = max(1, math.ceil(len(buttons) / columns))
         try:
-            self._emoticon_canvas.configure(height=min(rows, EMOTICON_GRID_ROWS) * cell)
+            self._emoticon_canvas.configure(height=min(rows, EMOTICON_GRID_ROWS) * cell_h)
             self._emoticon_canvas.yview_moveto(0)
         except tk.TclError:
             return
+
+    def _emoticon_cell_size(self) -> Tuple[int, int]:
+        """按本页按钮的实际尺寸推出网格单元大小（按钮尺寸 + 两侧网格间距）。
+
+        用实测尺寸而非按图标上限推算：文字占位按钮、图片按钮、宽窄不一的大表情
+        都能得到刚好合适的列数；图片下载完成后按钮变大，会触发一次延迟重排。
+        """
+        pad = 2 * EMOTICON_GRID_PAD
+        try:
+            cell_w = max(btn.winfo_reqwidth() for _url, btn in self._emoticon_button_list)
+            cell_h = max(btn.winfo_reqheight() for _url, btn in self._emoticon_button_list)
+        except (tk.TclError, ValueError):
+            return (EMOTICON_ICON_MAX_WIDTH + pad, EMOTICON_ICON_MAX_HEIGHT + pad)
+        return cell_w + pad, cell_h + pad
 
     def _show_emoticon_panel(self) -> None:
         """把表情面板展开到发送行上方。"""
@@ -1522,6 +1615,7 @@ class ScMonitorApp:
         self._emoticon_buttons = {}
         self._emoticon_button_list = []
         self._emoticon_columns = 0
+        self._emoticon_cell_h = 0
         self._emoticon_packages = list(packages or [])
         if not self._emoticon_packages:
             self._emoticon_pkg_box.configure(values=[])
@@ -1529,10 +1623,10 @@ class ScMonitorApp:
             self._emoticon_page_var.set("")
             self._emoticon_prev_btn.configure(state="disabled")
             self._emoticon_next_btn.configure(state="disabled")
-            self._emoticon_hint_var.set(
+            self._set_emoticon_hint(
                 hint or "该直播间暂无可用专属表情（需已登录，且账号在该房间有可用表情）")
             return
-        self._emoticon_hint_var.set("点击表情即发送（与网页端一致）；表情较多时可滚轮/拖动滚动条查看")
+        self._set_emoticon_hint("")
         self._emoticon_pkg_box.configure(
             values=[self._emoticon_pkg_label(i, p)
                     for i, p in enumerate(self._emoticon_packages)])
@@ -1574,7 +1668,7 @@ class ScMonitorApp:
             btn = tk.Button(
                 self._emoticon_grid, text=str(item.get("text") or url),
                 width=8, height=3, relief="groove",
-                wraplength=EMOTICON_ICON_MAX_PX * 2,
+                wraplength=EMOTICON_ICON_MAX_WIDTH,
                 padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD,
                 command=lambda it=item: self._send_emoticon(it))
             if image is not None:
@@ -1589,6 +1683,7 @@ class ScMonitorApp:
                     missing.append(url)
         # 行列数按面板宽度自适应（换页时强制重排一次）
         self._emoticon_columns = 0
+        self._emoticon_cell_h = 0
         self._apply_emoticon_grid_layout()
         if missing:
             self._emoticon_pending.update(missing)
@@ -1657,7 +1752,7 @@ class ScMonitorApp:
         except tk.TclError:
             logger.debug("表情图片格式不受 Tk 支持（如 WebP），保留文字按钮: %s", url)
             return
-        image = self._shrink_photo(raw)
+        image = self._scale_photo(raw)
         if len(self._emoticon_images) >= EMOTICON_IMAGE_CACHE_MAX:
             self._emoticon_images.clear()
         self._emoticon_images[url] = image
@@ -1665,18 +1760,23 @@ class ScMonitorApp:
         try:
             if btn is not None and btn.winfo_exists():
                 btn.configure(image=image, text="", width=0, height=0)
+                # 按钮尺寸变了：重算列数与面板高度（延迟合并，避免逐张重排）
+                self._schedule_emoticon_regrid()
         except tk.TclError:
             pass  # 按钮不可用（如已切页/切房）：仅保留图片缓存供后续复用
 
     @staticmethod
-    def _shrink_photo(image: tk.PhotoImage) -> tk.PhotoImage:
-        """按整数倍缩小过大的表情图片（Tk 只支持 subsample，不支持任意缩放）。"""
-        longest = max(image.width(), image.height())
-        if longest <= EMOTICON_ICON_MAX_PX:
+    def _scale_photo(image: tk.PhotoImage) -> tk.PhotoImage:
+        """把表情图片缩放到显示尺寸上限内（保持比例，尽量少损失细节）。
+
+        用 zoom(a)+subsample(b) 近似 a/b 的小数比例；单用 subsample 会把
+        162×60 的直播「大表情」按最长边压成 54×20，细节全丢、糊成一团。
+        """
+        zoom, sub = fit_emoticon_scale(image.width(), image.height())
+        if (zoom, sub) == (1, 1):
             return image
-        factor = int(math.ceil(longest / EMOTICON_ICON_MAX_PX))
         try:
-            return image.subsample(factor, factor)
+            return image.zoom(zoom, zoom).subsample(sub, sub)
         except tk.TclError:
             return image
 

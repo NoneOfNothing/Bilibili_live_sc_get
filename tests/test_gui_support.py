@@ -16,9 +16,13 @@ from blive_sc_get.api import (
 from blive_sc_get.app_config import AppConfig, load_app_config
 from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
 from blive_sc_get.gui_app import (
+    EMOTICON_ICON_MAX_HEIGHT,
+    EMOTICON_ICON_MAX_WIDTH,
     build_sc_segments,
     danmaku_content_from_line,
     danmaku_send_guard,
+    emoticon_display_size,
+    fit_emoticon_scale,
     parse_add_input,
     select_dm_options,
     text_scrolled_to_bottom,
@@ -804,6 +808,46 @@ class SendEmoticonTests(unittest.TestCase):
 
     def test_error_code_10203_has_hint(self):
         self.assertIn("表情包", describe_send_error(10203))
+
+
+class FitEmoticonScaleTests(unittest.TestCase):
+    """表情缩放：Tk 只支持整数倍 zoom/subsample，必须用小数比例近似。
+
+    回归：162×60 的直播「大表情」若只按最长边 subsample(3) 会被压成 54×20，
+    细节全丢；现在应保持 100+ 宽、40+ 高。
+    """
+
+    def test_small_icon_needs_no_scaling(self):
+        self.assertEqual(fit_emoticon_scale(40, 40), (1, 1))
+        self.assertEqual(emoticon_display_size(40, 40), (40, 40))
+
+    def test_wide_emoji_132x60(self):
+        self.assertEqual(fit_emoticon_scale(132, 60), (5, 7))
+        self.assertEqual(emoticon_display_size(132, 60), (95, 43))
+
+    def test_room_emoticon_162x60_stays_readable(self):
+        self.assertEqual(fit_emoticon_scale(162, 60), (5, 7))
+        width, height = emoticon_display_size(162, 60)
+        self.assertEqual((width, height), (116, 43))
+        self.assertGreater(width, 100)
+        self.assertGreater(height, 40)
+
+    def test_very_wide_emoticon_limited_by_width(self):
+        self.assertEqual(emoticon_display_size(231, 60), (132, 35))
+
+    def test_result_never_exceeds_limits_or_upscales(self):
+        for width, height in ((132, 60), (162, 60), (231, 60), (300, 300),
+                              (1000, 1000), (600, 100), (50, 400)):
+            out_w, out_h = emoticon_display_size(width, height)
+            self.assertLessEqual(out_w, EMOTICON_ICON_MAX_WIDTH * 1.05, (width, height))
+            self.assertLessEqual(out_h, EMOTICON_ICON_MAX_HEIGHT * 1.05, (width, height))
+            self.assertLessEqual(out_w, width, (width, height))
+            self.assertLessEqual(out_h, height, (width, height))
+
+    def test_invalid_metadata(self):
+        for bad in ((0, 0), (None, None), ("x", "y"), (-10, 60)):
+            self.assertEqual(fit_emoticon_scale(*bad), (1, 1))
+        self.assertEqual(emoticon_display_size(0, 60), (0, 0))
 
 
 if __name__ == "__main__":
