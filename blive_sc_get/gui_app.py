@@ -113,8 +113,8 @@ EMOTICON_ICON_MAX_PX = 72
 EMOTICON_GRID_PAD = 6
 """表情按钮的内边距（像素），决定图标之间的间距。"""
 
-EMOTICON_GRID_ROWS = 5
-"""表情网格的可视行数；超出的表情在该包内滚动查看。"""
+EMOTICON_GRID_ROWS = 3
+"""内嵌表情面板网格的可视行数；超出的表情在该包内滚动查看。"""
 
 EMOTICON_IMAGE_CACHE_MAX = 300
 """表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
@@ -369,9 +369,9 @@ class ScMonitorApp:
         self._dm_copy_hint_id: Optional[str] = None  # 「已复制」提示的 after id
         # 表情包（写操作）相关状态
         self._emoticons: Dict[int, List[dict]] = {}   # 房间号 -> 可用表情包（含各自表情）
-        self._emoticon_popup: Optional[tk.Toplevel] = None
-        self._emoticon_popup_room: Optional[int] = None
-        self._emoticon_packages: List[dict] = []      # 当前弹窗载入的表情包
+        self._emoticon_visible = False                # 内嵌表情面板是否已展开
+        self._emoticon_panel_room: Optional[int] = None  # 面板当前展示的房间号
+        self._emoticon_packages: List[dict] = []      # 当前面板载入的表情包
         self._emoticon_page = 0                       # 当前显示的表情包序号（一页 = 一包）
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
@@ -607,6 +607,7 @@ class ScMonitorApp:
             self.dm_text.tag_configure(tag, foreground=color)
         self.dm_text.bind("<Button-1>", self._on_dm_click)
         self.dm_text.bind("<Button-3>", self._on_dm_right_click)
+        self.dm_text.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
         # 新消息浮动徽标：滚动条不在底部时显示未读条数，点击回到底部并恢复跟随。
         # 以 place(in_=<Text>) 叠在文本区右下角，不改变既有 pack 布局。
         self.sc_badge = ttk.Button(self.sc_frame, text="", width=16,
@@ -645,7 +646,8 @@ class ScMonitorApp:
             row, textvariable=self.dm_mode_var, width=5, state="readonly",
             values=[name for name, _mode in self.dm_modes])
         self.dm_mode_box.pack(side="left", padx=(4, 0))
-        # 表情按钮：点击弹出该直播间专属表情网格，点选即发送（写操作，受总开关约束）
+        # 表情按钮：点击在发送行上方展开/收起该直播间的专属表情面板
+        # （点选即发送，写操作，受总开关约束）
         self.dm_emoji_btn = ttk.Button(row, text="表情", width=5,
                                        command=self._on_open_emoticons)
         self.dm_emoji_btn.pack(side="left", padx=(4, 0))
@@ -654,6 +656,7 @@ class ScMonitorApp:
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
         self.dm_send_entry.bind("<Return>", lambda _e: self._on_send_danmaku())
         self.dm_send_entry.bind("<KeyRelease>", self._update_dm_len_hint)
+        self.dm_send_entry.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
         self.dm_len_var = tk.StringVar(value=f"0/{DANMAKU_MAX_LEN}")
         self.dm_len_label = ttk.Label(row, textvariable=self.dm_len_var,
                                       foreground="#888888")
@@ -668,6 +671,10 @@ class ScMonitorApp:
         self.dm_copy_hint_var = tk.StringVar(value="")
         ttk.Label(area, textvariable=self.dm_copy_hint_var,
                   foreground="#1a7f37").pack(side="top", fill="x")
+        # 表情面板：内嵌在发送行上方（点「表情」展开/收起），默认隐藏。
+        # 用 pack_forget 收起，不另开窗口；内容在首次展开时才向后端请求
+        self.emoticon_panel = ttk.LabelFrame(area, text="发送表情包")
+        self._build_emoticon_panel(self.emoticon_panel)
         # 回复/@ 目标提示行：默认隐藏，显示时插入到发送行上方
         self.dm_reply_var = tk.StringVar(value="")
         self.dm_reply_bar = ttk.Frame(area)
@@ -1323,7 +1330,10 @@ class ScMonitorApp:
     # ---------- 发送表情包（写操作） ----------
 
     def _on_open_emoticons(self) -> None:
-        """打开当前直播间专属表情面板（懒加载：首次打开时才向后端请求）。"""
+        """展开/收起内嵌的表情面板（懒加载：首次展开时才向后端请求）。"""
+        if self._emoticon_visible:
+            self._hide_emoticon_panel()
+            return
         reason = self._dm_send_block_reason()
         if reason:
             self.dm_send_hint_var.set(reason)
@@ -1331,35 +1341,27 @@ class ScMonitorApp:
         room_id = self._selected_room_id
         if room_id is None:
             return
-        self._build_emoticon_popup()
-        self._emoticon_popup_room = room_id
+        self._show_emoticon_panel()
+        self._emoticon_panel_room = room_id
         packages = self._emoticons.get(room_id)
         if packages is None:
             self._render_emoticons(room_id, None, "正在获取该直播间的专属表情…")
             self.hub.submit(self._async_load_emoticons(room_id))
         else:
             self._render_emoticons(room_id, packages, "")
-        self._emoticon_popup.deiconify()
-        self._emoticon_popup.lift()
 
-    def _build_emoticon_popup(self) -> None:
-        """构建表情面板：顶部分页栏（按表情包分页）+ 可滚动的表情网格。
+    def _build_emoticon_panel(self, parent) -> None:
+        """构建内嵌表情面板：分页栏（按表情包分页）+ 可滚动的表情网格。
 
         与直播间内的表情面板一致——**一页 = 一个表情包**；包内表情较多时可在
-        网格区拖动滚动条（或滚轮）查看。
+        网格区拖动滚动条（或滚轮）查看。面板挂在发送区内部，点击「表情」键
+        用 pack/pack_forget 展开或收起，不使用独立窗口。
         """
-        if self._emoticon_popup is not None and self._emoticon_popup.winfo_exists():
-            return
-        win = tk.Toplevel(self.root)
-        win.title("发送表情包")
-        win.transient(self.root)
-        win.protocol("WM_DELETE_WINDOW", self._close_emoticon_popup)
-        win.bind("<Escape>", lambda _e: self._close_emoticon_popup())
         cell = EMOTICON_ICON_MAX_PX + 2 * EMOTICON_GRID_PAD
 
-        # 分页栏：上一包 / 包名下拉（可直接跳页） / 下一包 / 页码说明
-        bar = ttk.Frame(win)
-        bar.pack(side="top", fill="x", padx=8, pady=(8, 2))
+        # 分页栏：上一包 / 包名下拉（可直接跳页） / 下一包 / 页码说明 / 收起
+        bar = ttk.Frame(parent)
+        bar.pack(side="top", fill="x", padx=4, pady=(4, 2))
         self._emoticon_prev_btn = ttk.Button(bar, text="◀ 上一包", width=9,
                                             command=self._on_emoticon_prev_page)
         self._emoticon_prev_btn.pack(side="left")
@@ -1374,16 +1376,18 @@ class ScMonitorApp:
         self._emoticon_page_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self._emoticon_page_var,
                   foreground="#666666").pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="收起", width=6,
+                   command=self._hide_emoticon_panel).pack(side="right")
 
         # 提示行先占位（底部固定条），避免后 pack 被网格区挤成 0 高
         self._emoticon_hint_var = tk.StringVar(value="")
-        ttk.Label(win, textvariable=self._emoticon_hint_var, foreground="#888888",
+        ttk.Label(parent, textvariable=self._emoticon_hint_var, foreground="#888888",
                   wraplength=EMOTICON_COLUMNS * cell, justify="left").pack(
-            side="bottom", fill="x", padx=8, pady=(0, 8))
+            side="bottom", fill="x", padx=4, pady=(0, 4))
 
-        # 网格区：画布 + 垂直滚动条，表情包很大时可滚动查看
-        body = ttk.Frame(win)
-        body.pack(side="top", fill="both", expand=True, padx=8, pady=4)
+        # 网格区：固定高度的画布 + 垂直滚动条，表情包很大时可滚动查看
+        body = ttk.Frame(parent)
+        body.pack(side="top", fill="x", padx=4, pady=(0, 4))
         self._emoticon_canvas = tk.Canvas(body, highlightthickness=0,
                                          width=EMOTICON_COLUMNS * cell,
                                          height=EMOTICON_GRID_ROWS * cell)
@@ -1403,22 +1407,23 @@ class ScMonitorApp:
             "<Configure>",
             lambda e: self._emoticon_canvas.itemconfigure(self._emoticon_grid_id,
                                                           width=e.width))
-        self._emoticon_canvas.bind("<MouseWheel>", self._on_emoticon_wheel)
-        self._emoticon_grid.bind("<MouseWheel>", self._on_emoticon_wheel)
-        self._emoticon_popup = win
+        for widget in (self._emoticon_canvas, self._emoticon_grid):
+            widget.bind("<MouseWheel>", self._on_emoticon_wheel)
+            widget.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
 
-    def _close_emoticon_popup(self) -> None:
-        win = self._emoticon_popup
-        self._emoticon_popup = None
-        self._emoticon_popup_room = None
-        self._emoticon_buttons = {}
-        self._emoticon_packages = []
-        self._emoticon_page = 0
-        if win is not None:
-            try:
-                win.destroy()
-            except tk.TclError:
-                pass
+    def _show_emoticon_panel(self) -> None:
+        """把表情面板展开到发送行上方。"""
+        if self._emoticon_visible:
+            return
+        self._emoticon_visible = True
+        self.emoticon_panel.pack(side="top", fill="x", before=self.dm_send_row)
+
+    def _hide_emoticon_panel(self) -> None:
+        """收起表情面板（保留已载入的表情包与图片缓存，再次展开无需重新请求）。"""
+        if not self._emoticon_visible:
+            return
+        self._emoticon_visible = False
+        self.emoticon_panel.pack_forget()
 
     async def _async_load_emoticons(self, room_id: int) -> None:
         api = self.hub.api
@@ -1431,14 +1436,14 @@ class ScMonitorApp:
         room_id = int(payload.get("room_id") or 0)
         packages = payload.get("packages") or []
         self._emoticons[room_id] = packages
-        if self._emoticon_popup is None or self._emoticon_popup_room != room_id:
-            return  # 弹窗已关闭或已切到其他房间，仅入缓存
+        if not self._emoticon_visible or self._emoticon_panel_room != room_id:
+            return  # 面板已收起或已切到其他房间，仅入缓存
         self._render_emoticons(room_id, packages, "")
 
     def _render_emoticons(self, room_id: int, packages: Optional[List[dict]],
                           hint: str) -> None:
         """载入某房间的表情包并显示第一页。"""
-        if self._emoticon_popup is None:
+        if not self._emoticon_visible:
             return
         for child in self._emoticon_grid.winfo_children():
             child.destroy()
@@ -1467,7 +1472,7 @@ class ScMonitorApp:
     def _show_emoticon_page(self, index: int) -> None:
         """显示第 index 个表情包（一页 = 一个包，与直播间内面板一致）。"""
         packages = self._emoticon_packages
-        if self._emoticon_popup is None or not packages:
+        if not self._emoticon_visible or not packages:
             return
         index = max(0, min(index, len(packages) - 1))
         self._emoticon_page = index
@@ -1583,7 +1588,7 @@ class ScMonitorApp:
             if btn is not None and btn.winfo_exists():
                 btn.configure(image=image, text="", width=0, height=0)
         except tk.TclError:
-            pass  # 弹窗已关闭，按钮已销毁：仅保留图片缓存供下次打开复用
+            pass  # 按钮不可用（如已切页/切房）：仅保留图片缓存供后续复用
 
     @staticmethod
     def _shrink_photo(image: tk.PhotoImage) -> tk.PhotoImage:
@@ -1627,7 +1632,7 @@ class ScMonitorApp:
             real_room, trigger, color=color, mode=mode,
             reply_mid=0, reply_uname="", replay_dmid="", emoticon=emoticon,
         ))
-        self._close_emoticon_popup()
+        # 面板保持展开：可连续挑选多个表情（同一房间 2 秒冷却仍生效）
 
     def _load_dm_options_for_selected(self) -> None:
         """已登录且弹幕区可见时，拉取当前房间可用的弹幕颜色/模式（尽力而为）。"""
@@ -2017,6 +2022,7 @@ class ScMonitorApp:
         self._clear_dm_view()
         self._apply_dm_gate()
         self._set_dm_reply_target(None)   # 回复/@ 目标属于具体房间，切房即清除
+        self._hide_emoticon_panel()       # 表情面板展示的是具体房间的表情，切房即收起
         self._refresh_dm_send_state()
         # 可用颜色/样式随直播间变化（接口按 room_id 查询），切房即重新拉取
         self._load_dm_options_for_selected()
