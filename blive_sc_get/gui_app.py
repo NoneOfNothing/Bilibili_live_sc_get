@@ -441,6 +441,7 @@ class ScMonitorApp:
         self._emoticon_button_list: List[Tuple[str, tk.Button]] = []  # 当前页按钮（按顺序）
         self._emoticon_weighted_columns = 0           # 已设置 weight 的列数（换包时清零多余的）
         self._emoticon_view_width = 0                 # 表情条视口宽度（用于铺满判断）
+        self._emoticon_last_page: Dict[int, int] = {}  # 房间号 -> 收起面板时停留的表情包序号
         self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
@@ -1584,10 +1585,16 @@ class ScMonitorApp:
             pass
 
     def _hide_emoticon_panel(self) -> None:
-        """收起表情面板（保留已载入的表情包与图片缓存，再次展开无需重新请求）。"""
+        """收起表情面板。
+
+        记住收起时正在浏览的表情包（按直播间分别记录），并保留已载入的表情包与
+        图片缓存——再次展开同一直播间时直接回到该包，且无需重新请求。
+        """
         if not self._emoticon_visible:
             return
         self._emoticon_visible = False
+        if self._emoticon_panel_room is not None and self._emoticon_packages:
+            self._emoticon_last_page[self._emoticon_panel_room] = self._emoticon_page
         self.emoticon_panel.pack_forget()
 
     async def _async_load_emoticons(self, room_id: int) -> None:
@@ -1628,7 +1635,8 @@ class ScMonitorApp:
         self._emoticon_pkg_box.configure(
             values=[self._emoticon_pkg_label(i, p)
                     for i, p in enumerate(self._emoticon_packages)])
-        self._show_emoticon_page(0)
+        # 回到上次收起时停留的表情包（越界时 _show_emoticon_page 会自动收敛）
+        self._show_emoticon_page(self._emoticon_last_page.get(room_id, 0))
 
     @staticmethod
     def _emoticon_pkg_label(index: int, package: dict) -> str:
