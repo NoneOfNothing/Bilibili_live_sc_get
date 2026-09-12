@@ -320,15 +320,23 @@ def emoticon_id_by_unique(packages, unique: str) -> int:
 
 
 def tooltip_position(cursor_x: int, cursor_y: int, width: int, height: int,
-                     screen_w: int, screen_h: int, *, offset_x: int = 16,
-                     offset_y: int = 20, margin: int = 8) -> str:
+                     screen_x: int, screen_y: int, screen_w: int, screen_h: int,
+                     *, offset_x: int = 16, offset_y: int = 20,
+                     margin: int = 8) -> str:
     """悬浮提示窗的 geometry 字符串（纯函数）：光标右下方，越界时向内回缩。
 
-    ``screen_w``/``screen_h`` 由调用方用 ``winfo_screenwidth/height`` 提供；
-    尺寸不足时按 0 兜底，保证窗口始终留在屏幕内。
+    ``screen_x``/``screen_y``/``screen_w``/``screen_h`` 必须是**整个虚拟桌面**
+    （多显示器合并区域，由 ``winfo_vroot*`` 提供）。不要传
+    ``winfo_screenwidth/height``——它只反映**主显示器**，程序放在副屏时会把
+    提示强行拽回主屏（旧实现即此问题）。
+
+    Windows 下 Tk 无法用绝对负坐标定位窗口，故左侧/顶部边界取 0：副屏在主屏
+    左侧（虚拟桌面原点为负）时，提示会落在主屏左缘而不是光标旁，但不会跑出屏幕。
     """
-    left = min(max(0, int(cursor_x) + offset_x), max(0, int(screen_w) - width - margin))
-    top = min(max(0, int(cursor_y) + offset_y), max(0, int(screen_h) - height - margin))
+    right = max(0, int(screen_x) + int(screen_w) - width - margin)
+    bottom = max(0, int(screen_y) + int(screen_h) - height - margin)
+    left = min(max(0, int(cursor_x) + offset_x), right)
+    top = min(max(0, int(cursor_y) + offset_y), bottom)
     return f"+{left}+{top}"
 
 
@@ -373,12 +381,32 @@ class _EmoticonTooltip:
                 self._noactivate_applied = True
             self._window.geometry(tooltip_position(
                 cursor_x, cursor_y, self._window.winfo_reqwidth(),
-                self._window.winfo_reqheight(),
-                self._root.winfo_screenwidth(), self._root.winfo_screenheight()))
+                self._window.winfo_reqheight(), *self._desktop_rect()))
             self._window.deiconify()
             self._window.lift()
         except tk.TclError:
             self.hide()
+
+    def _desktop_rect(self) -> Tuple[int, int, int, int]:
+        """整个虚拟桌面（多显示器合并）的 ``(x, y, w, h)``；取不到时退回主屏。
+
+        用 ``winfo_vroot*`` 而不是 ``winfo_screenwidth/height``：后者只反映主显示器，
+        程序放在副屏时会把提示拽回主屏（实测主屏 1707×960、双屏虚拟桌面 3640×1920）。
+        副屏在主屏左侧时 ``x`` 可为负。
+        """
+        try:
+            rect = (int(self._root.winfo_vrootx()), int(self._root.winfo_vrooty()),
+                    int(self._root.winfo_vrootwidth()),
+                    int(self._root.winfo_vrootheight()))
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            rect = (0, 0, 0, 0)
+        if rect[2] > 1 and rect[3] > 1:
+            return rect
+        try:  # 少数平台 vroot 不可用（返回 0）：退回主屏尺寸
+            return (0, 0, int(self._root.winfo_screenwidth()),
+                    int(self._root.winfo_screenheight()))
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            return (0, 0, 0, 0)
 
     def hide(self) -> None:
         window = self._window

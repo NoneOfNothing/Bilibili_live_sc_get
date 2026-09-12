@@ -960,17 +960,35 @@ class EmoticonIdByUniqueTests(unittest.TestCase):
 
 
 class TooltipPositionTests(unittest.TestCase):
-    """悬浮提示定位（纯函数）：光标右下方，越界回缩且不出屏。"""
+    """悬浮提示定位（纯函数）：光标右下方，限制在整个虚拟桌面内。"""
 
     def test_offset_from_cursor(self):
-        self.assertEqual(tooltip_position(100, 200, 80, 20, 1920, 1080), "+116+220")
+        self.assertEqual(tooltip_position(100, 200, 80, 20, 0, 0, 1920, 1080),
+                         "+116+220")
 
-    def test_clamped_to_screen(self):
-        self.assertEqual(tooltip_position(1900, 1070, 200, 40, 1920, 1080),
+    def test_clamped_to_desktop_right_bottom(self):
+        self.assertEqual(tooltip_position(1900, 1070, 200, 40, 0, 0, 1920, 1080),
                          "+1712+1032")
 
     def test_never_negative(self):
-        self.assertEqual(tooltip_position(-50, -50, 100, 20, 1920, 1080), "+0+0")
+        self.assertEqual(tooltip_position(-50, -50, 100, 20, 0, 0, 1920, 1080),
+                         "+0+0")
+
+    def test_second_monitor_keeps_tip_next_to_cursor(self):
+        # 回归：主屏 1707x960、双屏虚拟桌面 3640x1920（实测值）。
+        # 旧实现只按主屏宽度夹取，会把副屏上的提示拽回主屏（x=1507）。
+        self.assertEqual(tooltip_position(2500, 300, 120, 24, 0, 0, 3640, 1920),
+                         "+2516+320")
+
+    def test_second_monitor_near_desktop_edge_shifts_inward(self):
+        self.assertEqual(tooltip_position(3600, 1900, 120, 24, 0, 0, 3640, 1920),
+                         "+3512+1888")
+
+    def test_negative_origin_stays_on_screen(self):
+        # 副屏在主屏左侧（虚拟桌面原点是负的）：Tk 无法用绝对负坐标定位，
+        # 下限兜到 0，绝不出屏
+        self.assertEqual(tooltip_position(-1800, 100, 120, 24, -1920, 0, 3640, 1080),
+                         "+0+120")
 
 
 class EmoticonMemoryTests(unittest.TestCase):
