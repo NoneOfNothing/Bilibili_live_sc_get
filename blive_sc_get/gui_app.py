@@ -104,18 +104,18 @@ DM_MODE_TEXTS = {"滚动": 1, "顶部": 5, "底部": 4}
 DM_META_MAX = 2000
 """dmid -> (uid, uname, text) 缓存的条目上限，超出后丢弃最早的一半。"""
 
-EMOTICON_COLUMNS = 6
-"""表情面板的**兜底/初始**列数；实际列数按面板可用宽度自适应（面板未完成布局时用它）。"""
+EMOTICON_ICON_MAX_HEIGHT = 72
+"""表情图标的显示高度**安全上限**（像素）。
 
-EMOTICON_ICON_MAX_HEIGHT = 44
-"""表情图标的显示高度上限（像素）。"""
-
-EMOTICON_ICON_MAX_WIDTH = 132
-"""表情图标的显示宽度上限（像素）。
-
-直播间「大表情」是 162×60 / 231×60 这类**宽图**，若按高度上限等比缩放会被
-压得很小；给宽度更大的余量才能看清细节（见 fit_emoticon_scale）。
+正常表情（132×60、162×60、231×60 等）都按**原始大小** 1:1 显示，不做缩放；
+只有超过该上限的异常大图才等比缩小，避免撑爆面板。
 """
+
+EMOTICON_ICON_MAX_WIDTH = 260
+"""表情图标的显示宽度**安全上限**（像素），与 EMOTICON_ICON_MAX_HEIGHT 配套。"""
+
+EMOTICON_PANEL_WIDTH_HINT = 720
+"""面板画布的初始请求宽度（像素）；实际宽度由弹幕区决定，列数按实际宽度算。"""
 
 EMOTICON_GRID_PAD = 4
 """表情按钮的内边距与网格间距（像素）。"""
@@ -246,14 +246,15 @@ def danmaku_content_from_line(line: str) -> str:
 def fit_emoticon_scale(width: int, height: int, *,
                        max_w: int = EMOTICON_ICON_MAX_WIDTH,
                        max_h: int = EMOTICON_ICON_MAX_HEIGHT) -> Tuple[int, int]:
-    """算出把 width×height 缩到不超过 max_w×max_h 的近似整数比例（纯函数）。
+    """算出 width×height 该按什么比例缩放（纯函数）。
 
-    返回 ``(zoom, subsample)``：``(1, 1)`` 表示无需缩放。
+    返回 ``(zoom, subsample)``：``(1, 1)`` 表示**按原始大小显示、不做缩放**
+    （直播间表情都是 60px 高上下的小图，这是常态）。
 
-    Tk 的 PhotoImage 只支持整数倍 ``zoom`` / ``subsample``，单用 ``subsample``
-    会把 162×60 的直播「大表情」按最长边压成 54×20（细节全丢、糊成一团）；
-    这里用 ``zoom(a)`` 再 ``subsample(b)`` 近似 a/b 这类小数比例，尽量贴近
-    目标尺寸；找不到合适的小整数比时退回整数倍 ``subsample``。
+    只有超过 max_w×max_h 的异常大图才需要缩小。Tk 的 PhotoImage 只支持整数倍
+    ``zoom`` / ``subsample``，单用 ``subsample`` 会把宽图按最长边压得极小
+    （162×60 → 54×20，细节全丢），故用 ``zoom(a)`` 再 ``subsample(b)`` 近似
+    a/b 这类小数比例；找不到合适的小整数比时退回整数倍 ``subsample``。
     """
     try:
         width = int(width or 0)
@@ -1448,7 +1449,7 @@ class ScMonitorApp:
         self._emoticon_hint_var = tk.StringVar(value="")
         self._emoticon_hint_label = ttk.Label(
             parent, textvariable=self._emoticon_hint_var, foreground="#888888",
-            wraplength=EMOTICON_COLUMNS * (EMOTICON_ICON_MAX_WIDTH // 2), justify="left")
+            wraplength=EMOTICON_PANEL_WIDTH_HINT, justify="left")
 
         # 网格区：画布 + 垂直滚动条。画布宽度撑满面板（每行列数按宽度自适应），
         # 高度按实际内容行数收缩（最多 EMOTICON_GRID_ROWS 行），避免留下大片空白
@@ -1456,7 +1457,7 @@ class ScMonitorApp:
         self._emoticon_body = body
         body.pack(side="top", fill="x", padx=4, pady=(0, 4))
         self._emoticon_canvas = tk.Canvas(
-            body, highlightthickness=0, width=EMOTICON_COLUMNS * EMOTICON_ICON_MAX_WIDTH,
+            body, highlightthickness=0, width=EMOTICON_PANEL_WIDTH_HINT,
             height=EMOTICON_ICON_MAX_HEIGHT + 4 * EMOTICON_GRID_PAD)
         vbar = ttk.Scrollbar(body, orient="vertical",
                              command=self._emoticon_canvas.yview)
@@ -1512,11 +1513,6 @@ class ScMonitorApp:
             self._apply_emoticon_grid_layout()
         except tk.TclError:
             pass  # 窗口正在销毁
-
-    def _emoticon_grid_rows(self) -> int:
-        """当前页实际占用的行数（按已排好的列数计算，至少 1 行）。"""
-        columns = self._emoticon_columns or EMOTICON_COLUMNS
-        return max(1, math.ceil(len(self._emoticon_button_list) / columns))
 
     def _apply_emoticon_grid_layout(self) -> None:
         """按面板当前可用宽度决定每行列数，并把画布高度压缩到实际内容高度。
@@ -1668,7 +1664,7 @@ class ScMonitorApp:
             btn = tk.Button(
                 self._emoticon_grid, text=str(item.get("text") or url),
                 width=8, height=3, relief="groove",
-                wraplength=EMOTICON_ICON_MAX_WIDTH,
+                wraplength=96,
                 padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD,
                 command=lambda it=item: self._send_emoticon(it))
             if image is not None:

@@ -811,38 +811,34 @@ class SendEmoticonTests(unittest.TestCase):
 
 
 class FitEmoticonScaleTests(unittest.TestCase):
-    """表情缩放：Tk 只支持整数倍 zoom/subsample，必须用小数比例近似。
+    """表情缩放：正常表情按**原始大小 1:1** 显示，只有超大图才等比缩小。"""
 
-    回归：162×60 的直播「大表情」若只按最长边 subsample(3) 会被压成 54×20，
-    细节全丢；现在应保持 100+ 宽、40+ 高。
-    """
+    def test_real_emoticons_keep_natural_size(self):
+        # 直播间表情（含 132/162/231 宽的「大表情」）都是 60px 高上下的小图
+        for size in ((132, 60), (162, 60), (231, 60), (66, 66), (40, 40)):
+            self.assertEqual(fit_emoticon_scale(*size), (1, 1), size)
+            self.assertEqual(emoticon_display_size(*size), size, size)
 
-    def test_small_icon_needs_no_scaling(self):
-        self.assertEqual(fit_emoticon_scale(40, 40), (1, 1))
-        self.assertEqual(emoticon_display_size(40, 40), (40, 40))
+    def test_oversized_image_is_shrunk_not_crushed(self):
+        width, height = emoticon_display_size(300, 300)
+        self.assertLessEqual(width, EMOTICON_ICON_MAX_WIDTH * 1.05)
+        self.assertLessEqual(height, EMOTICON_ICON_MAX_HEIGHT * 1.05)
+        self.assertGreater(width, 40)  # 不能像旧实现那样压得过小
 
-    def test_wide_emoji_132x60(self):
-        self.assertEqual(fit_emoticon_scale(132, 60), (5, 7))
-        self.assertEqual(emoticon_display_size(132, 60), (95, 43))
-
-    def test_room_emoticon_162x60_stays_readable(self):
-        self.assertEqual(fit_emoticon_scale(162, 60), (5, 7))
-        width, height = emoticon_display_size(162, 60)
-        self.assertEqual((width, height), (116, 43))
-        self.assertGreater(width, 100)
-        self.assertGreater(height, 40)
-
-    def test_very_wide_emoticon_limited_by_width(self):
-        self.assertEqual(emoticon_display_size(231, 60), (132, 35))
+    def test_huge_image_falls_back_to_integer_subsample(self):
+        width, height = emoticon_display_size(1000, 1000)
+        self.assertLessEqual(width, EMOTICON_ICON_MAX_WIDTH * 1.05)
+        self.assertLessEqual(height, EMOTICON_ICON_MAX_HEIGHT * 1.05)
+        self.assertGreater(width, 40)
 
     def test_result_never_exceeds_limits_or_upscales(self):
-        for width, height in ((132, 60), (162, 60), (231, 60), (300, 300),
-                              (1000, 1000), (600, 100), (50, 400)):
-            out_w, out_h = emoticon_display_size(width, height)
-            self.assertLessEqual(out_w, EMOTICON_ICON_MAX_WIDTH * 1.05, (width, height))
-            self.assertLessEqual(out_h, EMOTICON_ICON_MAX_HEIGHT * 1.05, (width, height))
-            self.assertLessEqual(out_w, width, (width, height))
-            self.assertLessEqual(out_h, height, (width, height))
+        for size in ((132, 60), (162, 60), (231, 60), (300, 300), (1000, 1000),
+                     (600, 100), (50, 400)):
+            out_w, out_h = emoticon_display_size(*size)
+            self.assertLessEqual(out_w, EMOTICON_ICON_MAX_WIDTH * 1.05, size)
+            self.assertLessEqual(out_h, EMOTICON_ICON_MAX_HEIGHT * 1.05, size)
+            self.assertLessEqual(out_w, size[0], size)
+            self.assertLessEqual(out_h, size[1], size)
 
     def test_invalid_metadata(self):
         for bad in ((0, 0), (None, None), ("x", "y"), (-10, 60)):
