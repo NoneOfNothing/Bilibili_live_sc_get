@@ -70,6 +70,8 @@ SEND_ERROR_HINTS = {
     -400: "请求参数错误",
     1003212: "弹幕内容超出长度限制",
     10031: "发送频率过快，请稍后再试",
+    10203: "服务端未接受该内容/表情（10203）：表情包需按 emoticon_unique 发送，"
+           "若为普通弹幕请稍后重试或更换内容",
     -352: "触发风控，请稍后再试或检查 Cookie",
     -403: "触发风控（无权操作）",
     -412: "触发风控（请求被拦截）",
@@ -169,6 +171,7 @@ def _normalize_emoticons(raw_items: Any) -> List[Dict[str, Any]]:
             "url": url,
             "width": _as_int(item.get("width")),
             "height": _as_int(item.get("height")),
+            "bulge_display": _as_int(item.get("bulge_display")),
         })
     return result
 
@@ -483,8 +486,10 @@ class BilibiliLiveAPI:
         本地前置校验用 -101 未登录、-111 缺 csrf 表示）。
 
         传入 ``emoticon``（``get_room_emoticons`` 返回的条目）时按表情包弹幕
-        发送：``dm_type=1``，``msg`` 为表情触发词，另附 ``emoticonOptions``
-        （网页端弹幕面板同款字段，JSON 数组字符串）。不传时行为完全不变。
+        发送：``dm_type=1``，``msg`` 用表情唯一标识 ``emoticon_unique``
+        （即网页端 DOM 的 ``data-file-id``；传触发词会被服务端拒绝），并附
+        ``emoticonOptions``（``emoticon_unique`` / ``url`` / ``width`` /
+        ``height`` / ``in_player_area`` / ``bulge_display``）。不传时行为完全不变。
         """
         if not self._cookie:
             raise ApiError("发送弹幕", -101, "未提供 cookie，无法发送弹幕")
@@ -518,13 +523,19 @@ class BilibiliLiveAPI:
         if replay_dmid:
             data["replay_dmid"] = str(replay_dmid)
         if emoticon_unique:
-            # 表情包弹幕：dm_type=1 + 网页端同款 emoticonOptions（JSON 数组字符串）。
-            # 触发词用接口返回的 emoji 原文（收到时 DANMU_MSG 的 info[1] 即该值）。
-            trigger = str(emoticon.get("trigger") or emoticon.get("text") or "").strip()
+            # 表情包弹幕：dm_type=1 + emoticonOptions。
+            # 关键：msg 必须传 emoticon_unique（网页端 DOM 里的 data-file-id）；
+            # 传表情触发词会被服务端拒绝（实测返回 code=10203），故此处覆盖 msg。
+            data["msg"] = emoticon_unique
             data["dm_type"] = 1
-            data["emoticonOptions"] = json.dumps(
-                [{"emoticon_unique": emoticon_unique, "text": trigger}],
-                ensure_ascii=False, separators=(",", ":"))
+            data["emoticonOptions"] = json.dumps({
+                "bulge_display": _as_int(emoticon.get("bulge_display")),
+                "emoticon_unique": emoticon_unique,
+                "height": _as_int(emoticon.get("height")) or 40,
+                "width": _as_int(emoticon.get("width")) or 40,
+                "in_player_area": 1,
+                "url": str(emoticon.get("url") or ""),
+            }, ensure_ascii=False, separators=(",", ":"))
         payload = await self._post_form_json(SEND_DANMAKU_URL, data)
         code = payload.get("code")
         if code != 0:

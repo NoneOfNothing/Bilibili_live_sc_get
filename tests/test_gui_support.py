@@ -662,7 +662,8 @@ EMOTICON_PAYLOAD = {
         "data": [
             {"pkg_name": "官方表情", "pkg_id": 1, "pkg_type": 1, "emoticons": [
                 {"emoticon_unique": "official_331", "emoticon_id": 331, "emoji": "妙",
-                 "url": "https://i0.hdslb.com/a.png", "width": 132, "height": 60, "perm": 1},
+                 "url": "https://i0.hdslb.com/a.png", "width": 132, "height": 60,
+                 "bulge_display": 1, "perm": 1},
                 {"emoticon_unique": "official_332", "emoticon_id": 332, "emoji": "冲",
                  "url": "https://i0.hdslb.com/b.png", "perm": 0},
             ]},
@@ -694,6 +695,7 @@ class ParseRoomEmoticonPackagesTests(unittest.TestCase):
         self.assertEqual(first[0]["text"], "[妙]")
         self.assertEqual(first[0]["url"], "https://i0.hdslb.com/a.png")
         self.assertEqual(first[0]["width"], 132)
+        self.assertEqual(first[0]["bulge_display"], 1)
 
     def test_room_exclusive_emoticon_normalized(self):
         packages = parse_room_emoticon_packages(EMOTICON_PAYLOAD["data"])
@@ -751,28 +753,46 @@ class GetRoomEmoticonsApiTests(unittest.TestCase):
 
 
 class SendEmoticonTests(unittest.TestCase):
-    """发送表情包弹幕：dm_type=1 + emoticonOptions（网页端同款字段）。"""
+    """发送表情包弹幕：msg 必须传 emoticon_unique（传触发词会被服务端拒绝）。"""
 
     COOKIE = "SESSDATA=abc; bili_jct=csrf123"
     EMOTICON = {"unique": "room_9527_1", "id": 109824, "trigger": "百岁山",
-                "text": "[百岁山]", "url": "u", "width": 0, "height": 0}
+                "text": "[百岁山]", "url": "https://i0.hdslb.com/c.png",
+                "width": 162, "height": 60, "bulge_display": 1}
 
-    def test_emoticon_form_fields(self):
+    def test_emoticon_uses_unique_as_msg(self):
         session = _FakeSession({"code": 0})
         api = BilibiliLiveAPI(session, cookie=self.COOKIE)
         asyncio.run(api.send_danmaku(9527, "百岁山", emoticon=self.EMOTICON))
         _url, data, _headers = session.post_calls[0]
-        self.assertEqual(data["msg"], "百岁山")
+        # 关键回归：msg 传触发词会导致服务端返回 10203，必须传 emoticon_unique
+        self.assertEqual(data["msg"], "room_9527_1")
         self.assertEqual(data["dm_type"], 1)
         options = __import__("json").loads(data["emoticonOptions"])
-        self.assertEqual(options,
-                         [{"emoticon_unique": "room_9527_1", "text": "百岁山"}])
+        self.assertEqual(options["emoticon_unique"], "room_9527_1")
+        self.assertEqual(options["url"], "https://i0.hdslb.com/c.png")
+        self.assertEqual(options["width"], 162)
+        self.assertEqual(options["height"], 60)
+        self.assertEqual(options["in_player_area"], 1)
+        self.assertEqual(options["bulge_display"], 1)
 
-    def test_plain_danmaku_has_no_emoticon_fields(self):
+    def test_emoticon_options_fall_back_to_default_size(self):
+        emoticon = dict(self.EMOTICON, width=0, height=0, bulge_display=0)
+        session = _FakeSession({"code": 0})
+        api = BilibiliLiveAPI(session, cookie=self.COOKIE)
+        asyncio.run(api.send_danmaku(9527, "百岁山", emoticon=emoticon))
+        _url, data, _headers = session.post_calls[0]
+        options = __import__("json").loads(data["emoticonOptions"])
+        self.assertEqual(options["width"], 40)
+        self.assertEqual(options["height"], 40)
+        self.assertEqual(options["bulge_display"], 0)
+
+    def test_plain_danmaku_keeps_text_and_has_no_emoticon_fields(self):
         session = _FakeSession({"code": 0})
         api = BilibiliLiveAPI(session, cookie=self.COOKIE)
         asyncio.run(api.send_danmaku(9527, "普通弹幕"))
         _url, data, _headers = session.post_calls[0]
+        self.assertEqual(data["msg"], "普通弹幕")
         self.assertNotIn("dm_type", data)
         self.assertNotIn("emoticonOptions", data)
 
@@ -781,6 +801,9 @@ class SendEmoticonTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             asyncio.run(api.send_danmaku(1, "x", emoticon={"text": "[x]"}))
         self.assertEqual(len(api.session.post_calls), 0)
+
+    def test_error_code_10203_has_hint(self):
+        self.assertIn("表情包", describe_send_error(10203))
 
 
 if __name__ == "__main__":
