@@ -22,6 +22,7 @@ from blive_sc_get.gui_app import (
     danmaku_content_from_line,
     danmaku_send_guard,
     emoticon_display_size,
+    emoticon_packages_signature,
     fit_emoticon_scale,
     parse_add_input,
     select_dm_options,
@@ -851,6 +852,37 @@ class FitEmoticonScaleTests(unittest.TestCase):
         for bad in ((0, 0), (None, None), ("x", "y"), (-10, 60)):
             self.assertEqual(fit_emoticon_scale(*bad), (1, 1))
         self.assertEqual(emoticon_display_size(0, 60), (0, 0))
+
+
+class EmoticonPackagesSignatureTests(unittest.TestCase):
+    """表情包指纹：刷新结果与已有内容一致时不重绘（保住横向滚动位置与当前包）。"""
+
+    BASE = [{"id": 1, "name": "官方表情", "emoticons": [{"unique": "a"}, {"unique": "b"}]}]
+
+    def test_same_content_same_signature(self):
+        clone = [{"id": 1, "name": "官方表情",
+                  "emoticons": [{"unique": "a"}, {"unique": "b"}]}]
+        self.assertEqual(emoticon_packages_signature(self.BASE),
+                         emoticon_packages_signature(clone))
+
+    def test_detects_newly_unlocked_package(self):
+        # 粉丝灯牌升级解锁新表情包 → 包数量变化
+        grown = self.BASE + [{"id": 2, "name": "粉丝团", "emoticons": [{"unique": "c"}]}]
+        self.assertNotEqual(emoticon_packages_signature(self.BASE),
+                            emoticon_packages_signature(grown))
+
+    def test_detects_new_emoticon_inside_package(self):
+        grown = [{"id": 1, "name": "官方表情",
+                  "emoticons": [{"unique": "a"}, {"unique": "b"}, {"unique": "c"}]}]
+        self.assertNotEqual(emoticon_packages_signature(self.BASE),
+                            emoticon_packages_signature(grown))
+
+    def test_malformed_input(self):
+        empty = emoticon_packages_signature([])
+        self.assertEqual(emoticon_packages_signature(None), empty)
+        self.assertEqual(emoticon_packages_signature(["bad", 1]), empty)
+        self.assertEqual(emoticon_packages_signature([{"name": "x"}]),
+                         ((None, "x", ()),))
 
 
 if __name__ == "__main__":

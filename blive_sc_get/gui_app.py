@@ -126,6 +126,13 @@ EMOTICON_PANEL_WIDTH_HINT = 720
 EMOTICON_GRID_PAD = 4
 """表情按钮的内边距与网格间距（像素）。"""
 
+EMOTICON_REFRESH_COOLDOWN_S = 30.0
+"""展开面板时刷新可用表情包的最小间隔（秒/房间）。
+
+表情包会随粉丝灯牌升级等条件解锁，故每次展开都刷新；该冷却避免连点面板时
+反复请求接口（接口需登录态，频繁请求有风控风险）。
+"""
+
 EMOTICON_IMAGE_CACHE_MAX = 300
 """表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
 
@@ -284,6 +291,25 @@ def fit_emoticon_scale(width: int, height: int, *,
     return 1, max(2, int(math.ceil(1.0 / target)))
 
 
+def emoticon_packages_signature(packages) -> tuple:
+    """表情包列表的轻量指纹（纯函数）：包顺序 + 包 ID/名称 + 各表情 unique。
+
+    用于判断刷新结果与已有内容是否一致——一致时界面保持不动，避免每次展开
+    面板都无谓重绘（重绘会把表情条的横向滚动位置复位）。
+    """
+    signature = []
+    for package in packages or []:
+        if not isinstance(package, dict):
+            continue
+        emoticons = package.get("emoticons") or []
+        signature.append((
+            package.get("id"),
+            package.get("name"),
+            tuple(e.get("unique") for e in emoticons if isinstance(e, dict)),
+        ))
+    return tuple(signature)
+
+
 def emoticon_display_size(width: int, height: int, *,
                           max_w: int = EMOTICON_ICON_MAX_WIDTH,
                           max_h: int = EMOTICON_ICON_MAX_HEIGHT) -> Tuple[int, int]:
@@ -437,11 +463,13 @@ class ScMonitorApp:
         self._emoticon_visible = False                # 内嵌表情面板是否已展开
         self._emoticon_panel_room: Optional[int] = None  # 面板当前展示的房间号
         self._emoticon_packages: List[dict] = []      # 当前面板载入的表情包
+        self._emoticon_rendered_room: Optional[int] = None  # 表情条当前内容所属房间
         self._emoticon_page = 0                       # 当前显示的表情包序号（一页 = 一包）
         self._emoticon_button_list: List[Tuple[str, tk.Button]] = []  # 当前页按钮（按顺序）
         self._emoticon_weighted_columns = 0           # 已设置 weight 的列数（换包时清零多余的）
         self._emoticon_view_width = 0                 # 表情条视口宽度（用于铺满判断）
         self._emoticon_last_page: Dict[int, int] = {}  # 房间号 -> 收起面板时停留的表情包序号
+        self._emoticon_fetched_at: Dict[int, float] = {}  # 房间号 -> 上次拉取表情包的时间(monotonic)
         self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
@@ -1414,11 +1442,12 @@ class ScMonitorApp:
         self._show_emoticon_panel()
         self._emoticon_panel_room = room_id
         packages = self._emoticons.get(room_id)
-        if packages is None:
-            self._render_emoticons(room_id, None, "正在获取该直播间的专属表情…")
-            self.hub.submit(self._async_load_emoticons(room_id))
+        if packages:
+            self._render_emoticons(room_id, packages, "")   # 先用缓存即时呈现
         else:
-            self._render_emoticons(room_id, packages, "")
+            self._render_emoticons(room_id, None, "正在获取该直播间的专属表情…")
+        # 表情包会随粉丝灯牌升级等条件解锁，每次展开都后台刷新一次
+        self._refresh_emoticons(room_id)
 
     def _build_emoticon_panel(self, parent) -> None:
         """构建内嵌表情面板：分页栏（按表情包分页）+ 可滚动的表情网格。
@@ -1597,6 +1626,18 @@ class ScMonitorApp:
             self._emoticon_last_page[self._emoticon_panel_room] = self._emoticon_page
         self.emoticon_panel.pack_forget()
 
+    def _refresh_emoticons(self, room_id: int) -> None:
+        """后台刷新该房间的可用表情包。
+
+        表情包会随粉丝灯牌升级等条件解锁，因此每次展开面板都刷新一次；同一房间
+        在 EMOTICON_REFRESH_COOLDOWN_S 内只请求一次，避免连点触发风控。
+        """
+        now = time.monotonic()
+        if now - self._emoticon_fetched_at.get(room_id, 0.0) < EMOTICON_REFRESH_COOLDOWN_S:
+            return
+        self._emoticon_fetched_at[room_id] = now
+        self.hub.submit(self._async_load_emoticons(room_id))
+
     async def _async_load_emoticons(self, room_id: int) -> None:
         api = self.hub.api
         if api is None:
@@ -1607,21 +1648,47 @@ class ScMonitorApp:
     def _on_emoticons(self, payload: dict) -> None:
         room_id = int(payload.get("room_id") or 0)
         packages = payload.get("packages") or []
+        if not packages:
+            # 刷新失败（或确实为空）：保留上次结果，不把已有表情包清空
+            if room_id not in self._emoticons:
+                self._emoticons[room_id] = []
+                if self._emoticon_visible and self._emoticon_panel_room == room_id:
+                    self._render_emoticons(room_id, [], "")
+            return
+        previous = self._emoticons.get(room_id)
+        changed = (previous is None
+                   or emoticon_packages_signature(previous)
+                   != emoticon_packages_signature(packages))
+        if previous is not None and changed:
+            logger.info("房间 %s 的可用表情包已更新：%d → %d 个"
+                        "（粉丝灯牌升级等可能解锁新表情包）",
+                        room_id, len(previous), len(packages))
         self._emoticons[room_id] = packages
         if not self._emoticon_visible or self._emoticon_panel_room != room_id:
             return  # 面板已收起或已切到其他房间，仅入缓存
+        if not changed:
+            return  # 内容没变：保留当前表情包与横向滚动位置，不做无谓重绘
         self._render_emoticons(room_id, packages, "")
 
     def _render_emoticons(self, room_id: int, packages: Optional[List[dict]],
                           hint: str) -> None:
-        """载入某房间的表情包并显示第一页。"""
+        """载入某房间的表情包并显示合适的一页。
+
+        正在浏览同一直播间时优先停在**当前这个表情包**（刷新后包列表可能增删、
+        位置会变），否则回到上次收起时记住的序号。
+        """
         if not self._emoticon_visible:
             return
+        keep = None
+        if (self._emoticon_rendered_room == room_id
+                and 0 <= self._emoticon_page < len(self._emoticon_packages)):
+            keep = self._emoticon_packages[self._emoticon_page]
         for child in self._emoticon_grid.winfo_children():
             child.destroy()
         self._emoticon_buttons = {}
         self._emoticon_button_list = []
         self._emoticon_packages = list(packages or [])
+        self._emoticon_rendered_room = room_id
         if not self._emoticon_packages:
             self._emoticon_pkg_box.configure(values=[])
             self._emoticon_pkg_var.set("")
@@ -1635,8 +1702,28 @@ class ScMonitorApp:
         self._emoticon_pkg_box.configure(
             values=[self._emoticon_pkg_label(i, p)
                     for i, p in enumerate(self._emoticon_packages)])
-        # 回到上次收起时停留的表情包（越界时 _show_emoticon_page 会自动收敛）
-        self._show_emoticon_page(self._emoticon_last_page.get(room_id, 0))
+        # 停在当前/上次浏览的表情包（越界时 _show_emoticon_page 会自动收敛）
+        page = self._emoticon_last_page.get(room_id, 0)
+        if keep is not None:
+            matched = self._find_emoticon_package(self._emoticon_packages, keep)
+            if matched is not None:
+                page = matched
+        self._show_emoticon_page(page)
+
+    @staticmethod
+    def _find_emoticon_package(packages: List[dict], target: dict) -> Optional[int]:
+        """在新列表中定位原表情包（先按 id、再按包名），找不到返回 None。"""
+        target_id = target.get("id")
+        if target_id:
+            for index, package in enumerate(packages):
+                if package.get("id") == target_id:
+                    return index
+        name = target.get("name")
+        if name:
+            for index, package in enumerate(packages):
+                if package.get("name") == name:
+                    return index
+        return None
 
     @staticmethod
     def _emoticon_pkg_label(index: int, package: dict) -> str:
@@ -2812,8 +2899,9 @@ class ScMonitorApp:
                     self._on_dm_send_result(item[1])
                 elif kind == "dm_state":
                     # 登录态变化（如刚获取 Cookie）后刷新门控并补拉可用颜色/样式；
-                    # 可用表情随登录身份变化，缓存一并失效
+                    # 可用表情随登录身份变化，缓存与刷新冷却一并失效
                     self._emoticons.clear()
+                    self._emoticon_fetched_at.clear()
                     self._refresh_dm_send_state()
                     self._load_dm_options_for_selected()
                 elif kind == "dm_config":
