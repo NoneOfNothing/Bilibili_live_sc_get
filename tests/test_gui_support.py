@@ -814,10 +814,17 @@ class FitEmoticonScaleTests(unittest.TestCase):
     """表情缩放：正常表情按**原始大小 1:1** 显示，只有超大图才等比缩小。"""
 
     def test_real_emoticons_keep_natural_size(self):
-        # 直播间表情（含 132/162/231 宽的「大表情」）都是 60px 高上下的小图
-        for size in ((132, 60), (162, 60), (231, 60), (66, 66), (40, 40)):
+        # 直播间表情（含 132/162/231 宽的「大表情」）都是 60px 高的小图
+        for size in ((132, 60), (162, 60), (231, 60), (60, 60), (40, 40)):
             self.assertEqual(fit_emoticon_scale(*size), (1, 1), size)
             self.assertEqual(emoticon_display_size(*size), size, size)
+
+    def test_taller_than_row_is_shrunk(self):
+        # 高于行高上限的图片才缩小，保证能完整放进固定高度的表情条
+        width, height = emoticon_display_size(66, 66)
+        self.assertLessEqual(width, EMOTICON_ICON_MAX_WIDTH)
+        self.assertLessEqual(height, EMOTICON_ICON_MAX_HEIGHT)
+        self.assertGreater(height, 40)  # 不能压得过小
 
     def test_oversized_image_is_shrunk_not_crushed(self):
         width, height = emoticon_display_size(300, 300)
