@@ -39,6 +39,7 @@ from .client import LIVE_STATUS_TEXT, RoomClient
 from .gui_config import (
     NOTIFY_SOUNDS,
     RoomEntry,
+    load_emoticon_memory,
     load_room_entries,
     load_ui_prefs,
     save_room_entries,
@@ -468,7 +469,10 @@ class ScMonitorApp:
         self._emoticon_button_list: List[Tuple[str, tk.Button]] = []  # 当前页按钮（按顺序）
         self._emoticon_weighted_columns = 0           # 已设置 weight 的列数（换包时清零多余的）
         self._emoticon_view_width = 0                 # 表情条视口宽度（用于铺满判断）
-        self._emoticon_last_page: Dict[int, int] = {}  # 房间号 -> 收起面板时停留的表情包序号
+        # 房间号 -> {"index": 收起面板时停留的表情包序号, "name": 该表情包名}
+        # （持久化到 gui_rooms.json，重启后仍能回到上次浏览的表情包）
+        self._emoticon_memory: Dict[int, Dict[str, object]] = load_emoticon_memory(
+            self.config_path)
         self._emoticon_fetched_at: Dict[int, float] = {}  # 房间号 -> 上次拉取表情包的时间(monotonic)
         self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
@@ -1622,9 +1626,21 @@ class ScMonitorApp:
         if not self._emoticon_visible:
             return
         self._emoticon_visible = False
-        if self._emoticon_panel_room is not None and self._emoticon_packages:
-            self._emoticon_last_page[self._emoticon_panel_room] = self._emoticon_page
+        self._remember_emoticon_page()
         self.emoticon_panel.pack_forget()
+
+    def _remember_emoticon_page(self) -> None:
+        """记住当前直播间停留的表情包（序号 + 包名），有变化时写入 gui_rooms.json。"""
+        room_id = self._emoticon_panel_room
+        if room_id is None or not self._emoticon_packages:
+            return
+        page = max(0, min(self._emoticon_page, len(self._emoticon_packages) - 1))
+        name = str(self._emoticon_packages[page].get("name") or "")
+        memory = {"index": page, "name": name}
+        if self._emoticon_memory.get(room_id) == memory:
+            return
+        self._emoticon_memory[room_id] = memory
+        self._save_config()
 
     def _refresh_emoticons(self, room_id: int) -> None:
         """后台刷新该房间的可用表情包。
@@ -1702,12 +1718,21 @@ class ScMonitorApp:
         self._emoticon_pkg_box.configure(
             values=[self._emoticon_pkg_label(i, p)
                     for i, p in enumerate(self._emoticon_packages)])
-        # 停在当前/上次浏览的表情包（越界时 _show_emoticon_page 会自动收敛）
-        page = self._emoticon_last_page.get(room_id, 0)
+        # 停在当前/上次浏览的表情包（越界时 _show_emoticon_page 会自动收敛）：
+        # 优先保持「当前这个包」，否则按记忆的包名找（表情包顺序变化也不会跑偏），
+        # 最后才退回记忆的序号
+        memory = self._emoticon_memory.get(room_id) or {}
+        page = int(memory.get("index") or 0)  # type: ignore[arg-type]
         if keep is not None:
             matched = self._find_emoticon_package(self._emoticon_packages, keep)
             if matched is not None:
                 page = matched
+        else:
+            name = str(memory.get("name") or "")
+            if name:
+                matched = self._find_emoticon_package(self._emoticon_packages, {"name": name})
+                if matched is not None:
+                    page = matched
         self._show_emoticon_page(page)
 
     @staticmethod
@@ -2049,7 +2074,8 @@ class ScMonitorApp:
         return [int(iid) for iid in self.tree.selection()]
 
     def _save_config(self) -> None:
-        save_room_entries(self.config_path, self.entries.values(), ui=self.ui_prefs)
+        save_room_entries(self.config_path, self.entries.values(), ui=self.ui_prefs,
+                          emoticon=self._emoticon_memory)
 
     def _refresh_buttons(self) -> None:
         room_ids = self._get_selected_room_ids()
@@ -2171,6 +2197,7 @@ class ScMonitorApp:
             self.entries.pop(room_id, None)
             self.client_states.pop(room_id, None)
             self.live_state.pop(room_id, None)
+            self._emoticon_memory.pop(room_id, None)  # 表情包记忆随房间一并清理
         self._save_config()
         for room_id in valid:
             if self.tree.exists(str(room_id)):

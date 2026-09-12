@@ -1,6 +1,7 @@
 """GUI 支撑逻辑的单元测试（不启动 tkinter 界面）。"""
 
 import asyncio
+import json
 import shutil
 import tempfile
 import unittest
@@ -31,6 +32,7 @@ from blive_sc_get.gui_app import (
 )
 from blive_sc_get.gui_config import (
     RoomEntry,
+    load_emoticon_memory,
     load_room_entries,
     load_ui_prefs,
     save_room_entries,
@@ -852,6 +854,58 @@ class FitEmoticonScaleTests(unittest.TestCase):
         for bad in ((0, 0), (None, None), ("x", "y"), (-10, 60)):
             self.assertEqual(fit_emoticon_scale(*bad), (1, 1))
         self.assertEqual(emoticon_display_size(0, 60), (0, 0))
+
+
+class EmoticonMemoryTests(unittest.TestCase):
+    """表情包记忆持久化到 gui_rooms.json：重启后仍回到上次浏览的表情包。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / "gui_rooms.json"
+
+    def test_roundtrip_with_rooms_and_ui(self):
+        memory = {1: {"index": 2, "name": "房间专属"}, 2: {"index": 0, "name": ""}}
+        save_room_entries(self.path, [RoomEntry(1), RoomEntry(2)],
+                          ui={"sort_mode": "manual", "pin_live": True},
+                          emoticon=memory)
+        self.assertEqual(load_emoticon_memory(self.path), memory)
+        # 房间列表与界面偏好不受影响
+        self.assertEqual(load_room_entries(self.path), [RoomEntry(1), RoomEntry(2)])
+        prefs = load_ui_prefs(self.path)
+        self.assertEqual(prefs["sort_mode"], "manual")
+        self.assertTrue(prefs["pin_live"])
+
+    def test_other_saves_do_not_drop_memory(self):
+        memory = {7: {"index": 3, "name": "粉丝团"}}
+        save_room_entries(self.path, [RoomEntry(7)], ui={}, emoticon=memory)
+        # 不传 emoticon 的其他保存动作（改备注、排序等）不应抹掉记忆
+        save_room_entries(self.path, [RoomEntry(7, note="备注")],
+                          ui={"pin_live": True})
+        self.assertEqual(load_emoticon_memory(self.path), memory)
+        self.assertEqual(load_room_entries(self.path)[0].note, "备注")
+
+    def test_empty_memory_writes_no_key(self):
+        save_room_entries(self.path, [RoomEntry(1)], ui={}, emoticon={})
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotIn("emoticon", data)
+        self.assertEqual(load_emoticon_memory(self.path), {})
+
+    def test_missing_and_malformed_input(self):
+        self.assertEqual(load_emoticon_memory(self.tmp / "nope.json"), {})
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertEqual(load_emoticon_memory(self.path), {})
+        self.path.write_text('{"emoticon": "x"}', encoding="utf-8")
+        self.assertEqual(load_emoticon_memory(self.path), {})
+        self.path.write_text(
+            '{"emoticon": {"1": {"index": "2"}, "bad": {"index": 1},'
+            ' "3": 5, "4": {"index": -1}, "5": {"name": "只有名字"}}}',
+            encoding="utf-8")
+        self.assertEqual(load_emoticon_memory(self.path), {
+            1: {"index": 2, "name": ""},
+            4: {"index": 0, "name": ""},
+            5: {"index": 0, "name": "只有名字"},
+        })
 
 
 class EmoticonPackagesSignatureTests(unittest.TestCase):

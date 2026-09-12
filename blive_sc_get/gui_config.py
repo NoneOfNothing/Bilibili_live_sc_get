@@ -75,19 +75,53 @@ def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
 
 
 def save_room_entries(path: Union[str, Path], entries: Iterable[RoomEntry],
-                      ui: Optional[dict] = None) -> None:
+                      ui: Optional[dict] = None,
+                      emoticon: Optional[Dict[int, Dict[str, object]]] = None) -> None:
     """保存房间列表（先写临时文件再替换，避免写一半被读取）。
 
     ui 为界面偏好（排序方式、直播中置顶开关等）；传入 None 时不写 ui 键。
+    emoticon 为每个直播间上次浏览的表情包记忆；传入 None 时保留磁盘上已有的
+    （该记忆由表情面板收起时单独写入，其他保存动作不应把它抹掉）。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"rooms": [asdict(e) for e in entries]}
     if ui is not None:
         payload["ui"] = ui
+    memory = load_emoticon_memory(path) if emoticon is None else emoticon
+    if memory:
+        payload["emoticon"] = {str(room_id): dict(item)
+                               for room_id, item in memory.items()}
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def load_emoticon_memory(path: Union[str, Path]) -> Dict[int, Dict[str, object]]:
+    """读取每个直播间上次浏览的表情包记忆。
+
+    结构为 ``{"emoticon": {"<房间号>": {"index": 序号, "name": 包名}}}``，返回
+    ``{房间号: {"index": int, "name": str}}``（序号非负）；文件缺失、损坏或字段
+    非法时按空处理，不抛异常。
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    raw = data.get("emoticon") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    memory: Dict[int, Dict[str, object]] = {}
+    for key, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            room_id = int(key)
+            index = int(item.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        memory[room_id] = {"index": max(0, index), "name": str(item.get("name") or "")}
+    return memory
 
 
 def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
