@@ -1076,6 +1076,9 @@ class ScMonitorApp:
         visible = bool(self.dm_var.get())
         self.ui_prefs["dm_visible"] = visible
         self._save_config()
+        if not visible:
+            # 弹幕区整体隐藏时表情面板也随之不可见，顺手收起并记录
+            self._hide_emoticon_panel()
         try:
             if visible:
                 self.paned.add(self.dm_frame, weight=PANE_WEIGHTS[2])
@@ -1774,6 +1777,9 @@ class ScMonitorApp:
         self._emoticon_prev_btn.configure(state="normal" if index > 0 else "disabled")
         self._emoticon_next_btn.configure(
             state="normal" if index < len(packages) - 1 else "disabled")
+        # 翻到哪一页就持久化哪一页：这样「收起面板」和「直接退出程序」都能记住，
+        # 不必依赖退出/收起时机（面板一直开着就关掉窗口的场景最多）
+        self._remember_emoticon_page()
         try:
             self._emoticon_canvas.yview_moveto(0)
         except tk.TclError:
@@ -2954,6 +2960,7 @@ class ScMonitorApp:
     def _on_close(self) -> None:
         if not messagebox.askokcancel("退出", "确定退出？将停止所有房间的监听。"):
             return
+        self._remember_emoticon_page()  # 面板还开着时直接退出也要记住当前表情包
         self.hub.submit(self._async_shutdown())
         self.root.after(1500, self._destroy)
 
@@ -2967,6 +2974,11 @@ class ScMonitorApp:
         self.hub.request_shutdown()
 
     def _destroy(self) -> None:
+        try:
+            # 兜底：任何退出路径都把当前表情包落盘（无变化时内部会跳过写盘）
+            self._remember_emoticon_page()
+        except Exception:
+            logger.debug("退出前记录表情包失败", exc_info=True)
         try:
             self.root.destroy()
         except tk.TclError:
