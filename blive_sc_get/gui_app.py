@@ -312,15 +312,11 @@ def emoticon_tooltip_text(info: dict, fields) -> str:
     return " · ".join(parts)
 
 
-def emoticon_id_by_unique(packages, unique: str) -> int:
-    """在已加载的表情包里按 unique 取数字 emoticon_id（纯函数，找不到返回 0）。
-
-    弹幕报文里的表情对象只有 ``emoticon_unique``、没有数字 id；若用户此前打开过
-    表情面板（已缓存表情包），这里就能补上数字 id 供悬浮提示显示。
-    """
+def emoticon_from_packages(packages, unique: str) -> dict:
+    """在已加载的表情包里按 unique 找表情条目（纯函数，找不到返回空字典）。"""
     unique = str(unique or "").strip()
     if not unique:
-        return 0
+        return {}
     for package in packages or []:
         if not isinstance(package, dict):
             continue
@@ -328,11 +324,21 @@ def emoticon_id_by_unique(packages, unique: str) -> int:
             if not isinstance(emoticon, dict):
                 continue
             if str(emoticon.get("unique") or "") == unique:
-                try:
-                    return int(emoticon.get("id") or 0)
-                except (TypeError, ValueError):
-                    return 0
-    return 0
+                return emoticon
+    return {}
+
+
+def emoticon_id_by_unique(packages, unique: str) -> int:
+    """在已加载的表情包里按 unique 取数字 emoticon_id（纯函数，找不到返回 0）。
+
+    弹幕报文里的表情对象只有 ``emoticon_unique``、没有数字 id；若用户此前打开过
+    表情面板（已缓存表情包），这里就能补上数字 id 供悬浮提示显示。
+    """
+    emoticon = emoticon_from_packages(packages, unique)
+    try:
+        return int(emoticon.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def tooltip_position(cursor_x: int, cursor_y: int, width: int, height: int,
@@ -391,9 +397,12 @@ class _EmoticonTooltip:
                 window = self._window
                 if self._label is not None:
                     self._label.configure(text=text)
-            if self._label is not None and image is not None:
-                # 图文并排（compound 左）：原图 + 触发词/ID
-                self._label.configure(image=image, text=text, compound="left")
+            if self._label is not None:
+                # 无图时必须显式清掉上一次的 image，否则 Tk Label 会残留旧图
+                self._label.configure(
+                    text=text,
+                    image=image if image is not None else "",
+                    compound="left" if image is not None else "none")
             window.update_idletasks()
             if not self._noactivate_applied:
                 # 必须在窗口真正映射后设置扩展风格，否则会被覆盖
@@ -1937,6 +1946,19 @@ class ScMonitorApp:
                         "（粉丝灯牌升级等可能解锁新表情包）",
                         room_id, len(previous), len(packages))
         self._emoticons[room_id] = packages
+        # 弹幕表情此前缺图片地址的，用刚拉到的表情包补上；正在展示的提示立即刷新
+        resolved = ""
+        for unique, info in self._dm_emoticon_info.items():
+            if info.get("room_id") != room_id or self._dm_emoticon_urls.get(unique):
+                continue
+            url = str(emoticon_from_packages(packages, unique).get("url") or "")
+            if url:
+                info["url"] = url
+                self._dm_emoticon_urls[unique] = url
+                if unique == self._emoticon_tip_key:
+                    resolved = unique
+        if resolved and self.emoticon_tooltip.is_visible():
+            self._show_emoticon_tooltip(self._dm_emoticon_info[resolved])
         if not self._emoticon_visible or self._emoticon_panel_room != room_id:
             return  # 面板已收起或已切到其他房间，仅入缓存
         if not changed:
@@ -2174,15 +2196,26 @@ class ScMonitorApp:
     # ---------- 弹幕区表情（悬浮显示原图） ----------
 
     def _remember_dm_emoticon(self, unique: str, dm: dict, shown_text: str) -> None:
-        """记录弹幕里出现过的表情（供悬浮提示显示触发词/ID/原图）。"""
+        """记录弹幕里出现过的表情（供悬浮提示显示触发词/ID/原图）。
+
+        部分直播间的弹幕报文不带表情图片地址，此时先留空，悬浮时用已加载的
+        表情包兜底（见 _ensure_dm_emoticon_url）。
+        """
         emoticon = dm.get("emoticon") or {}
+        room_id = dm.get("room_id")
+        packages = self._emoticons.get(room_id)
+        pkg = emoticon_from_packages(packages, unique)
+        try:
+            pkg_id = int(pkg.get("id") or 0)
+        except (TypeError, ValueError):
+            pkg_id = 0
         self._dm_emoticon_info[unique] = {
             "text": shown_text,
             "unique": unique,
-            # 弹幕报文只有 unique，没有数字 id：能从已加载的表情包里补上就补
-            "id": emoticon_id_by_unique(self._emoticons.get(dm.get("room_id")), unique),
+            "room_id": room_id,
+            "id": pkg_id,
         }
-        url = str(emoticon.get("url") or "")
+        url = str(emoticon.get("url") or "") or str(pkg.get("url") or "")
         if url:
             self._dm_emoticon_urls[unique] = url
         # 上限保护：超出后丢弃最早的记录（最旧的那几条已滚出视野）
@@ -2190,6 +2223,33 @@ class ScMonitorApp:
             oldest = next(iter(self._dm_emoticon_info))
             self._dm_emoticon_info.pop(oldest, None)
             self._dm_emoticon_urls.pop(oldest, None)
+
+    def _ensure_dm_emoticon_url(self, info: dict) -> None:
+        """表情缺图片地址时兜底：从已加载的表情包补；包未加载则后台拉一次。"""
+        if info.get("url"):
+            return
+        unique = str(info.get("unique") or "")
+        room_id = info.get("room_id")
+        packages = self._emoticons.get(room_id)
+        if packages is None:
+            if room_id is not None:
+                self._request_room_packages(int(room_id))
+            return
+        url = str(emoticon_from_packages(packages, unique).get("url") or "")
+        if url:
+            info["url"] = url
+            self._dm_emoticon_urls[unique] = url
+            if (self._emoticon_tip_key == unique
+                    and url not in self._emoticon_images):
+                self._request_dm_emoticon_image(url)
+
+    def _request_room_packages(self, room_id: int) -> None:
+        """后台拉取房间表情包（表情面板与弹幕表情悬浮共用；同一房间 30 秒冷却）。"""
+        now = time.monotonic()
+        if now - self._emoticon_fetched_at.get(room_id, 0.0) < EMOTICON_REFRESH_COOLDOWN_S:
+            return
+        self._emoticon_fetched_at[room_id] = now
+        self.hub.submit(self._async_load_emoticons(room_id))
 
     def _request_dm_emoticon_image(self, url: str) -> None:
         """按需下载表情图（悬浮提示用，复用面板的下载管线与 4 并发限流）。"""
@@ -2213,8 +2273,9 @@ class ScMonitorApp:
         提示文本不完全跟随鼠标 / 延时期间鼠标已移开时不再弹在旧位置）。
         """
         text = emoticon_tooltip_text(info, self.app_config.emoticon_tooltip)
-        if not text:
-            return
+        unique = str(info.get("unique") or "")
+        if not text and not (info.get("url") or self._dm_emoticon_urls.get(unique)):
+            return  # 既没有可显示的文案，也没有原图
         self._cancel_emoticon_tooltip()
         self._emoticon_tip_id = self.root.after(
             EMOTICON_TOOLTIP_DELAY_MS,
@@ -2223,17 +2284,20 @@ class ScMonitorApp:
     def _show_emoticon_tooltip(self, info: dict, text: Optional[str] = None) -> None:
         """显示提示，位置取「此刻」的光标位置（显示后不跟随鼠标）。
 
-        表情能拿到原图时一并显示（懒加载：未缓存先发请求，图片就绪后由
-        _on_emoticon_image 刷新正在展示的提示）。
+        表情能拿到原图时**只显示图**（触发词与弹幕内容重复）；拿不到原图则
+        显示文字，并懒加载图片——就绪后由 _on_emoticon_image 刷新展示中的提示。
         """
         self._emoticon_tip_id = None
         if text is None:
             text = emoticon_tooltip_text(info, self.app_config.emoticon_tooltip)
+        self._ensure_dm_emoticon_url(info)
         unique = str(info.get("unique") or "")
-        url = self._dm_emoticon_urls.get(unique, "")
+        url = str(info.get("url") or "") or self._dm_emoticon_urls.get(unique, "")
         image = self._emoticon_images.get(url)
         if url and image is None and self._emoticon_tip_key == unique:
             self._request_dm_emoticon_image(url)
+        if image is not None:
+            text = ""
         self.emoticon_tooltip.show(
             text, self.root.winfo_pointerx(), self.root.winfo_pointery(), image=image)
 
@@ -2262,8 +2326,9 @@ class ScMonitorApp:
         self._cancel_emoticon_tooltip()
         self.emoticon_tooltip.hide()
         if info:
-            # 悬浮要看原图：图片未缓存就懒加载（就绪后提示窗自动补上）
-            url = self._dm_emoticon_urls.get(key, "")
+            # 悬浮要看原图：缺地址先兜底，图片未缓存就懒加载（就绪后提示窗补上）
+            self._ensure_dm_emoticon_url(info)
+            url = str(info.get("url") or "") or self._dm_emoticon_urls.get(key, "")
             if url and url not in self._emoticon_images:
                 self._request_dm_emoticon_image(url)
             self._schedule_emoticon_tooltip(info, event)
