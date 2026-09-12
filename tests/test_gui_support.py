@@ -185,14 +185,12 @@ class GuiConfigTests(unittest.TestCase):
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "status", "pin_live": True,
                               "notify_overlay": False, "notify_persist": True,
-                              "notify_sound": "三连音", "dm_visible": True,
-                              "dm_emoticon_image": False})
+                              "notify_sound": "三连音", "dm_visible": True})
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "status", "pin_live": True,
                           "notify_overlay": False, "notify_persist": True,
-                          "notify_sound": "三连音", "dm_visible": True,
-                          "dm_emoticon_image": False})
-        # 旧配置缺字段时的缺省值（弹幕表情图默认开启）
+                          "notify_sound": "三连音", "dm_visible": True})
+        # 旧配置缺字段时的缺省值
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "manual", "pin_live": False})
         prefs = load_ui_prefs(self.path)
@@ -200,7 +198,6 @@ class GuiConfigTests(unittest.TestCase):
         self.assertFalse(prefs["notify_persist"])
         self.assertEqual(prefs["notify_sound"], "上行双音")
         self.assertFalse(prefs["dm_visible"])
-        self.assertTrue(prefs["dm_emoticon_image"])
 
     def test_ui_prefs_legacy_key_migrates(self):
         # 旧键名 notify_system 迁移到 notify_overlay
@@ -211,8 +208,7 @@ class GuiConfigTests(unittest.TestCase):
     def test_ui_prefs_defaults(self):
         expected = {"sort_mode": "manual", "pin_live": False,
                     "notify_overlay": True, "notify_persist": False,
-                    "notify_sound": "上行双音", "dm_visible": False,
-                    "dm_emoticon_image": True}
+                    "notify_sound": "上行双音", "dm_visible": False}
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"), expected)
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path), expected)
