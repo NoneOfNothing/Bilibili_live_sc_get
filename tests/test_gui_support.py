@@ -595,35 +595,27 @@ class SendDanmakuApiTests(unittest.TestCase):
 
 
 class DanmakuSendGuardTests(unittest.TestCase):
-    """发送弹幕的客户端校验（纯函数）：长度 / 冷却 / 重复内容。"""
+    """发送弹幕的客户端校验（纯函数）：只拦空内容与发送过快。
+
+    长度、重复内容交由服务端判定，发送前不再弹确认框（ROADMAP：取消
+    字数限制 / 重复内容检测 / 发送确认）。
+    """
 
     def test_allows_normal_text(self):
-        self.assertIsNone(danmaku_send_guard("你好", last_text="", last_time=0.0,
-                                             now=10.0))
+        self.assertIsNone(danmaku_send_guard("你好", last_time=0.0, now=10.0))
+
+    def test_allows_repeated_and_long_text(self):
+        # 重复内容与超长不再被客户端拦截（服务端超长返回 1003212 有中文提示）
+        self.assertIsNone(danmaku_send_guard("一样" * 30, last_time=0.0, now=10.0))
+        self.assertIsNone(danmaku_send_guard("一样", last_time=1.0, now=10.0))
 
     def test_blocks_empty(self):
         self.assertIn("不能为空", danmaku_send_guard("   "))
 
-    def test_blocks_too_long(self):
-        self.assertIn("过长", danmaku_send_guard("啊" * 21))
-
-    def test_max_len_none_skips_length_check(self):
-        # 表情包触发词由服务端定义，不受 20 字输入上限约束
-        self.assertIsNone(danmaku_send_guard("啊" * 60, max_len=None))
-        self.assertIn("过长", danmaku_send_guard("啊" * 60))
-
     def test_blocks_within_cooldown(self):
-        msg = danmaku_send_guard("新内容", last_text="旧内容", last_time=10.0, now=11.0)
+        msg = danmaku_send_guard("新内容", last_time=10.0, now=11.0)
         self.assertIn("频繁", msg)
-        self.assertIsNone(danmaku_send_guard("新内容", last_text="旧内容",
-                                             last_time=10.0, now=12.5))
-
-    def test_blocks_duplicate_within_window(self):
-        msg = danmaku_send_guard("一样", last_text="一样", last_time=10.0, now=20.0)
-        self.assertIn("相同", msg)
-        # 超过重复窗口后可再次发送
-        self.assertIsNone(danmaku_send_guard("一样", last_text="一样",
-                                             last_time=10.0, now=45.0))
+        self.assertIsNone(danmaku_send_guard("新内容", last_time=10.0, now=12.5))
 
 
 class SelectDmOptionsTests(unittest.TestCase):

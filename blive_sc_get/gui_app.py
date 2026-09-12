@@ -88,9 +88,6 @@ PanedWindow 按 weight 分配增减空间，从而保持该占比。"""
 DANMAKU_SEND_COOLDOWN_S = 2.0
 """同一房间两次发送弹幕的最小间隔（秒）。"""
 
-DANMAKU_DUP_WINDOW_S = 30.0
-"""相同内容在该时间窗口内（秒）禁止重复发送。"""
-
 DANMAKU_MAX_LEN = 20
 """客户端弹幕长度上限（普通用户约 20 字；超长时服务端返回 1003212）。"""
 
@@ -166,6 +163,10 @@ DM_EMOTICON_INFO_MAX = 400
 DM_COPY_HINT_MS = 1500
 """点击弹幕正文复制后「已复制」提示的保留时长（毫秒）。"""
 
+BOTTOM_HOLD_DEBOUNCE_MS = 80
+"""大小变化后吸底的去抖时长（毫秒）：拖动窗口/分割条时 Configure 连续触发，
+只在停下后处理一次，避免频繁 `see("end")`。"""
+
 SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)")
 
 DM_LINE_PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*")
@@ -237,24 +238,20 @@ def text_scrolled_to_bottom(yview: tuple, tolerance: float = 0.001) -> bool:
     return bottom >= 1.0 - tolerance
 
 
-def danmaku_send_guard(text: str, *, last_text: str = "", last_time: float = 0.0,
-                       now: float = 0.0, cooldown: float = DANMAKU_SEND_COOLDOWN_S,
-                       dup_window: float = DANMAKU_DUP_WINDOW_S,
-                       max_len: Optional[int] = DANMAKU_MAX_LEN) -> Optional[str]:
+def danmaku_send_guard(text: str, *, last_time: float = 0.0,
+                       now: float = 0.0,
+                       cooldown: float = DANMAKU_SEND_COOLDOWN_S) -> Optional[str]:
     """发送弹幕前的客户端校验（纯函数）。
 
+    只拦「空内容」与「发送过快」两类明显误操作；长度与内容重复交由服务端
+    判定（超长返回 1003212 等已有中文提示），发送前也不再弹确认框。
     返回拦截原因（不可发送时的中文提示），可发送时返回 None。
-    ``max_len`` 传 None 表示不校验长度（表情包弹幕的触发词由服务端定义）。
     """
     text = (text or "").strip()
     if not text:
         return "弹幕内容不能为空"
-    if max_len is not None and len(text) > max_len:
-        return f"弹幕过长：最多 {max_len} 字（当前 {len(text)} 字）"
     if last_time and now - last_time < cooldown:
         return f"发送过于频繁，请 {cooldown - (now - last_time):.1f} 秒后再试"
-    if last_text and text == last_text and now - last_time < dup_window:
-        return "内容与上一条相同，请勿重复发送"
     return None
 
 
@@ -649,8 +646,7 @@ class ScMonitorApp:
         self._pane_ratio_done = False  # 三板块默认占比是否已应用（仅首次布局）
         self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
         # 发送弹幕相关状态（仅主线程读写）
-        self._last_dm_send: Dict[int, float] = {}   # 房间号 -> 上次发送时间(monotonic)
-        self._last_dm_text: Dict[int, str] = {}     # 房间号 -> 上次发送内容
+        self._last_dm_send: Dict[int, float] = {}   # 房间号 -> 上次发送时间(monotonic)，冷却用
         self._room_id_map: Dict[int, int] = {}      # 输入房间号 -> 真实房间号
         self._dm_sending = False                    # 是否正在发送（防连点）
         self._dm_reply_target: Optional[dict] = None  # 回复/@ 目标 {kind,uid,uname,dmid,text}
@@ -660,6 +656,10 @@ class ScMonitorApp:
         self._sc_unseen = 0                  # SC 区未读新消息数（滚动条不在底部时累计）
         self._dm_unseen = 0                  # 弹幕区未读新消息数
         self._dm_copy_hint_id: Optional[str] = None  # 「已复制」提示的 after id
+        # 「原本吸底 → 大小变化后保持吸底」（见 _on_text_configure）
+        self._bottom_at: Dict[str, bool] = {"sc": True, "dm": True}  # 当前是否吸底（轮询维护）
+        self._bottom_hold: Dict[str, Optional[str]] = {"sc": None, "dm": None}  # 去抖 after id
+        self._bottom_hold_was: Dict[str, bool] = {"sc": True, "dm": True}  # 变化前是否吸底
         # 表情包（写操作）相关状态
         self._emoticons: Dict[int, List[dict]] = {}   # 房间号 -> 可用表情包（含各自表情）
         self._emoticon_visible = False                # 内嵌表情面板是否已展开
@@ -688,7 +688,6 @@ class ScMonitorApp:
         self.emoticon_tooltip = _EmoticonTooltip(root)
         self._emoticon_tip_id: Optional[str] = None   # 延时弹出的 after id
         self._emoticon_tip_key = ""                   # 当前正在提示的表情（去抖/去重）
-        self._emoticon_tip_pos: Tuple[int, int] = (0, 0)  # 触发时的光标位置
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -897,6 +896,9 @@ class ScMonitorApp:
         self.sc_text = tk.Text(self.sc_frame, wrap="word", state="disabled",
                                font=("Microsoft YaHei UI", 10), padx=6, pady=4,
                                height=10)
+        # 原本吸底时，窗口/区域大小变化后保持吸底（见 _on_text_configure）
+        self.sc_text.bind("<Configure>",
+                          lambda e: self._on_text_configure(e, "sc"))
         scroll = ttk.Scrollbar(self.sc_frame, command=self._on_sc_scroll)
         self.sc_text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -932,6 +934,9 @@ class ScMonitorApp:
         self.dm_text.bind("<Motion>", self._on_dm_motion)
         self.dm_text.bind("<Leave>", lambda _e: self._hide_emoticon_tooltip())
         self.dm_text.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
+        # 原本吸底时，窗口/区域大小变化（含开关表情面板）后保持吸底
+        self.dm_text.bind("<Configure>",
+                          lambda e: self._on_text_configure(e, "dm"))
         # 新消息浮动徽标：滚动条不在底部时显示未读条数，点击回到底部并恢复跟随。
         # 以 place(in_=<Text>) 叠在文本区右下角，不改变既有 pack 布局。
         self.sc_badge = ttk.Button(self.sc_frame, text="", width=16,
@@ -1404,16 +1409,50 @@ class ScMonitorApp:
         badge.lift()
 
     def _sync_unseen_from_scroll(self) -> None:
-        """用户把滚动条拉回底部后，清零未读计数并隐藏徽标（复用 100ms 轮询）。"""
+        """每轮轮询：记录两区是否吸底；用户拉回底部后清零未读并隐藏徽标。"""
         changed = False
-        if self._sc_unseen and text_scrolled_to_bottom(self.sc_text.yview()):
-            self._sc_unseen = 0
-            changed = True
-        if self._dm_unseen and text_scrolled_to_bottom(self.dm_text.yview()):
-            self._dm_unseen = 0
-            changed = True
+        for key, unseen_attr, text in (("sc", "_sc_unseen", self.sc_text),
+                                       ("dm", "_dm_unseen", self.dm_text)):
+            at_bottom = text_scrolled_to_bottom(text.yview())
+            self._bottom_at[key] = at_bottom
+            if getattr(self, unseen_attr) and at_bottom:
+                setattr(self, unseen_attr, 0)
+                changed = True
         if changed:
             self._refresh_unseen_badges()
+
+    # ---------- 大小变化后保持吸底 ----------
+
+    def _on_text_configure(self, _event, key: str) -> None:
+        """文本区大小变化（拖窗口/分割条、开关表情面板）后保持吸底。
+
+        仅当「这轮变化开始前」就位于最底部才吸回底部，不干扰向上翻阅与新消息
+        徽标；Configure 会连续触发，去抖 BOTTOM_HOLD_DEBOUNCE_MS 后统一处理。
+        """
+        if self._bottom_hold[key] is None:
+            # 这串 Configure 的第一次：记下调整前是否吸底（由 100ms 轮询维护）
+            self._bottom_hold_was[key] = self._bottom_at[key]
+        self._cancel_bottom_hold(key)
+        self._bottom_hold[key] = self.root.after(
+            BOTTOM_HOLD_DEBOUNCE_MS, lambda: self._restore_bottom(key))
+
+    def _cancel_bottom_hold(self, key: str) -> None:
+        pending = self._bottom_hold[key]
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+
+    def _restore_bottom(self, key: str) -> None:
+        self._bottom_hold[key] = None
+        if not self._bottom_hold_was[key]:
+            return  # 用户正在向上翻阅：保持视口不动
+        text = self.sc_text if key == "sc" else self.dm_text
+        try:
+            text.see("end")
+        except tk.TclError:
+            pass
 
     def _on_sc_badge_clicked(self) -> None:
         self._sc_unseen = 0
@@ -1545,7 +1584,7 @@ class ScMonitorApp:
         self._set_dm_reply_target(None)
 
     def _on_send_danmaku(self) -> None:
-        """主线程发送入口：门控 → 本地校验 → 二次确认 → 提交后台协程。"""
+        """主线程发送入口：门控 → 本地校验 → 提交后台协程（不再弹确认框）。"""
         if self._dm_sending:
             return
         reason = self._dm_send_block_reason()
@@ -1556,7 +1595,6 @@ class ScMonitorApp:
         text = self.dm_send_var.get().strip()
         guard = danmaku_send_guard(
             text,
-            last_text=self._last_dm_text.get(room_id, ""),
             last_time=self._last_dm_send.get(room_id, 0.0),
             now=time.monotonic(),
         )
@@ -1564,15 +1602,6 @@ class ScMonitorApp:
             self.dm_send_hint_var.set(guard)
             return
         target = self._dm_reply_target or {}
-        anchor = self.anchor_names.get(room_id) or str(room_id)
-        preview = text if len(text) <= 40 else text[:40] + "…"
-        if target:
-            who = "回复" if target.get("kind") == "reply" else "@"
-            preview += f"（{who} {target.get('uname') or '未知用户'}）"
-        if not messagebox.askyesno(
-                "确认发送弹幕",
-                f"直播间：{anchor}\n内容：{preview}\n\n发送后不可撤回，确定发送？"):
-            return
         color = dict(self.dm_colors).get(self.dm_color_var.get(), self.dm_colors[0][1])
         mode = dict(self.dm_modes).get(self.dm_mode_var.get(), self.dm_modes[0][1])
         real_room = self._room_id_map.get(room_id, room_id)
@@ -1618,7 +1647,6 @@ class ScMonitorApp:
             text = str(payload.get("text") or "")
             if room_id is not None:
                 self._last_dm_send[int(room_id)] = time.monotonic()
-                self._last_dm_text[int(room_id)] = text
             if not payload.get("emoticon"):
                 # 表情包发送不影响输入框内容，仅文字弹幕成功后清空
                 self.dm_send_var.set("")
@@ -2265,18 +2293,23 @@ class ScMonitorApp:
         self._schedule_emoticon_tooltip(info, event)
 
     def _schedule_emoticon_tooltip(self, info: dict, event) -> None:
-        """短暂停留后才弹出提示：扫过表情时不弹，避免乱闪。"""
+        """短暂停留后才弹出提示：扫过表情时不弹，避免乱闪。
+
+        只安排延时，不记录坐标——定位在显示瞬间读取当前光标（ROADMAP：
+        提示文本不完全跟随鼠标 / 延时期间鼠标已移开时不再弹在旧位置）。
+        """
         text = emoticon_tooltip_text(info, self.app_config.emoticon_tooltip)
         if not text:
             return
         self._cancel_emoticon_tooltip()
-        self._emoticon_tip_pos = (event.x_root, event.y_root)
         self._emoticon_tip_id = self.root.after(
             EMOTICON_TOOLTIP_DELAY_MS, lambda: self._show_emoticon_tooltip(text))
 
     def _show_emoticon_tooltip(self, text: str) -> None:
+        """显示提示，位置取「此刻」的光标位置（显示后不跟随鼠标）。"""
         self._emoticon_tip_id = None
-        self.emoticon_tooltip.show(text, *self._emoticon_tip_pos)
+        self.emoticon_tooltip.show(
+            text, self.root.winfo_pointerx(), self.root.winfo_pointery())
 
     def _cancel_emoticon_tooltip(self) -> None:
         if self._emoticon_tip_id is None:
@@ -2329,10 +2362,8 @@ class ScMonitorApp:
         trigger = str(emoticon.get("trigger") or emoticon.get("text") or "").strip()
         guard = danmaku_send_guard(
             trigger,
-            last_text=self._last_dm_text.get(room_id, ""),
             last_time=self._last_dm_send.get(room_id, 0.0),
             now=time.monotonic(),
-            max_len=None,  # 触发词由服务端定义，不受 20 字输入上限约束
         )
         if guard:
             self.dm_send_hint_var.set(guard)
