@@ -986,7 +986,7 @@ class ScMonitorApp:
         self.dm_send_entry.bind("<Return>", lambda _e: self._on_send_danmaku())
         self.dm_send_entry.bind("<KeyRelease>", self._update_dm_len_hint)
         self.dm_send_entry.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
-        self.dm_len_var = tk.StringVar(value=f"0/{DANMAKU_MAX_LEN}")
+        self.dm_len_var = tk.StringVar(value="0")
         self.dm_len_label = ttk.Label(row, textvariable=self.dm_len_var,
                                       foreground="#888888")
         self.dm_len_label.pack(side="left")
@@ -1557,8 +1557,9 @@ class ScMonitorApp:
                 self.dm_send_hint_var.set("")
 
     def _update_dm_len_hint(self, _event=None) -> None:
+        """字数计数（仅提示，不再有客户端长度上限）：超长标红提醒服务端可能拒绝。"""
         length = len(self.dm_send_var.get())
-        self.dm_len_var.set(f"{length}/{DANMAKU_MAX_LEN}")
+        self.dm_len_var.set(str(length))
         self.dm_len_label.configure(
             foreground="#c62828" if length > DANMAKU_MAX_LEN else "#888888")
 
