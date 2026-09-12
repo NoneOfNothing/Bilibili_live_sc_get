@@ -709,8 +709,8 @@ class ScMonitorApp:
         self.emoticon_tooltip = _EmoticonTooltip(root)
         self._emoticon_tip_id: Optional[str] = None   # 延时弹出的 after id
         self._emoticon_tip_key = ""                   # 当前正在提示的表情（去抖/去重）
-        # 有原图时是否只显示图：弹幕区是（触发词已在弹幕里），面板不是（需要看触发词）
-        self._emoticon_tip_image_only = False
+        # 有原图时是否显示图：弹幕区是（触发词已在弹幕里）；面板否（只显示触发词）
+        self._emoticon_tip_with_image = False
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -2275,7 +2275,7 @@ class ScMonitorApp:
         if url:
             info["url"] = url
             self._dm_emoticon_urls[unique] = url
-            if (self._emoticon_tip_key == unique
+            if (self._emoticon_tip_key == unique and self._emoticon_tip_with_image
                     and url not in self._emoticon_images):
                 self._request_dm_emoticon_image(url)
 
@@ -2297,9 +2297,9 @@ class ScMonitorApp:
     # ---------- 表情悬浮提示（ROADMAP 40） ----------
 
     def _on_emoticon_hover(self, info: dict, event) -> None:
-        """鼠标进入表情按钮：安排一次延时提示（面板里触发词信息更有用）。"""
+        """鼠标进入表情按钮：安排一次延时提示（面板按钮本身是图，提示只放触发词）。"""
         self._emoticon_tip_key = str(info.get("unique") or "")
-        self._emoticon_tip_image_only = False
+        self._emoticon_tip_with_image = False
         self._cancel_emoticon_tooltip()
         self._schedule_emoticon_tooltip(info, event)
 
@@ -2321,8 +2321,10 @@ class ScMonitorApp:
     def _show_emoticon_tooltip(self, info: dict, text: Optional[str] = None) -> None:
         """显示提示，位置取「此刻」的光标位置（显示后不跟随鼠标）。
 
-        表情能拿到原图时**只显示图**（触发词与弹幕内容重复）；拿不到原图则
-        显示文字，并懒加载图片——就绪后由 _on_emoticon_image 刷新展示中的提示。
+        按悬浮场景区分（见 ``_emoticon_tip_with_image``）：**弹幕区**有原图时
+        只显示图（触发词与弹幕内容重复）；**表情面板**只显示触发词（按钮本身
+        已是图）。需要原图但还没缓存时懒加载——就绪后由 _on_emoticon_image
+        刷新展示中的提示。
         """
         self._emoticon_tip_id = None
         if text is None:
@@ -2330,10 +2332,11 @@ class ScMonitorApp:
         self._ensure_dm_emoticon_url(info)
         unique = str(info.get("unique") or "")
         url = str(info.get("url") or "") or self._dm_emoticon_urls.get(unique, "")
-        image = self._emoticon_images.get(url)
-        if url and image is None and self._emoticon_tip_key == unique:
+        with_image = self._emoticon_tip_with_image
+        image = self._emoticon_images.get(url) if with_image else None
+        if with_image and url and image is None and self._emoticon_tip_key == unique:
             self._request_dm_emoticon_image(url)
-        if image is not None and self._emoticon_tip_image_only:
+        if image is not None:
             text = ""  # 弹幕区：原图即可，触发词与弹幕内容重复
         self.emoticon_tooltip.show(
             text, self.root.winfo_pointerx(), self.root.winfo_pointery(), image=image)
@@ -2360,7 +2363,7 @@ class ScMonitorApp:
         if key == self._emoticon_tip_key:
             return  # 仍在同一个表情上：不重排也不闪
         self._emoticon_tip_key = key
-        self._emoticon_tip_image_only = True  # 弹幕里已有触发词，提示窗只放原图
+        self._emoticon_tip_with_image = True  # 弹幕里已有触发词，提示窗只放原图
         self._cancel_emoticon_tooltip()
         self.emoticon_tooltip.hide()
         if info:
