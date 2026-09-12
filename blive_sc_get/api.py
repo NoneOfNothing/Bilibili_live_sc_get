@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -29,6 +30,9 @@ ANCHOR_INFO_URL = "https://api.live.bilibili.com/live_user/v1/Master/info"
 DANMU_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo"
 SEND_DANMAKU_URL = "https://api.live.bilibili.com/msg/send"
 DM_CONFIG_URL = "https://api.live.bilibili.com/xlive/web-room/v1/dM/GetDMConfigByGroup"
+ROOM_EMOTICON_URL = (
+    "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
+)
 GUARD_TOP_LIST_URL = "https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 HOMEPAGE_URL = "https://www.bilibili.com/"
@@ -84,6 +88,75 @@ def describe_send_error(code: Any, message: str = "") -> str:
     if message:
         return f"发送失败：{message}（code={code}）"
     return f"发送失败（code={code}）"
+
+
+def parse_room_emoticons(data: Any) -> List[Dict[str, Any]]:
+    """把 GetEmoticons 的 data 字段归一化为可发送的表情列表（纯函数，便于单测）。
+
+    实测响应为 ``{"data": [{"emoticons": [...], "pkg_name": ...}, ...]}``
+    （data.data 是"表情包"数组，每个包里再套 ``emoticons``）；同时兼容
+    data 直接就是表情数组的形态。仅保留可用项（``perm`` 为 1 或缺失），
+    按 ``emoticon_unique`` 去重，直播间专属（unique 以 ``room_`` 开头）排在前面。
+
+    返回 ``[{"unique", "id", "trigger", "text", "url", "width", "height"}, ...]``：
+    - ``trigger``：接口给的触发关键词原文（发送时作为 ``msg``）；
+    - ``text``：用于界面展示的 ``[触发词]`` 形式。
+    """
+    if isinstance(data, dict):
+        items = data.get("data")
+    else:
+        items = data
+    if not isinstance(items, list):
+        return []
+    emoticons: List[Any] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        nested = entry.get("emoticons")
+        # data.data[] 为表情包层级（含 emoticons 列表）；兼容直接给出表情的形态
+        emoticons.extend(nested if isinstance(nested, list) else [entry])
+    result: List[Dict[str, Any]] = []
+    seen = set()
+    for item in emoticons:
+        if not isinstance(item, dict):
+            continue
+        perm = item.get("perm")
+        if perm is not None:
+            try:
+                if int(perm) != 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        unique = str(item.get("emoticon_unique") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not unique or not url or unique in seen:
+            continue
+        seen.add(unique)
+        trigger = str(item.get("emoji") or item.get("descript") or "").strip() or unique
+        display = trigger if (trigger.startswith("[") and trigger.endswith("]")
+                              and len(trigger) > 2) else f"[{trigger}]"
+        try:
+            emo_id = int(item.get("emoticon_id") or item.get("id") or 0)
+        except (TypeError, ValueError):
+            emo_id = 0
+        result.append({
+            "unique": unique,
+            "id": emo_id,
+            "trigger": trigger,
+            "text": display,
+            "url": url,
+            "width": _as_int(item.get("width")),
+            "height": _as_int(item.get("height")),
+        })
+    result.sort(key=lambda e: (not e["unique"].startswith("room_"), e["unique"]))
+    return result
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class BilibiliLiveAPI:
@@ -347,14 +420,36 @@ class BilibiliLiveAPI:
         info = data.get("data")
         return info if isinstance(info, dict) else {}
 
+    async def get_room_emoticons(self, room_id: int) -> List[Dict[str, Any]]:
+        """查询当前用户在指定直播间可用的表情包（含直播间专属），失败返回 []。
+
+        对应网页端弹幕输入框旁的「表情」面板；未登录也能拿到公开表情，
+        但专属表情需账号满足解锁条件（``perm`` 为 1），故 GUI 应登录后再取。
+        """
+        try:
+            data = await self._get_json(
+                ROOM_EMOTICON_URL, {"platform": "pc", "room_id": int(room_id)})
+        except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
+            logger.debug("获取直播间表情失败 room=%s: %s", room_id, exc)
+            return []
+        if data.get("code") != 0:
+            logger.debug("获取直播间表情失败 room=%s: code=%s", room_id, data.get("code"))
+            return []
+        return parse_room_emoticons(data.get("data"))
+
     async def send_danmaku(self, room_id: int, msg: str, *, mode: int = 1,
                            color: int = 16777215, fontsize: int = 25,
                            reply_mid: int = 0, reply_uname: str = "",
-                           replay_dmid: str = "") -> Dict[str, Any]:
+                           replay_dmid: str = "",
+                           emoticon: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """发送直播弹幕（写操作，需已登录且 Cookie 含 bili_jct）。
 
         未登录 / 缺少 csrf / 接口返回非 0 均抛 ApiError（code 为接口返回码，
         本地前置校验用 -101 未登录、-111 缺 csrf 表示）。
+
+        传入 ``emoticon``（``get_room_emoticons`` 返回的条目）时按表情包弹幕
+        发送：``dm_type=1``，``msg`` 为表情触发词，另附 ``emoticonOptions``
+        （网页端弹幕面板同款字段，JSON 数组字符串）。不传时行为完全不变。
         """
         if not self._cookie:
             raise ApiError("发送弹幕", -101, "未提供 cookie，无法发送弹幕")
@@ -362,6 +457,11 @@ class BilibiliLiveAPI:
         if not csrf:
             raise ApiError("发送弹幕", -111,
                            "Cookie 中缺少 bili_jct，请用「获取Cookie」重新获取已登录的 Cookie")
+        emoticon_unique = ""
+        if emoticon:
+            emoticon_unique = str(emoticon.get("unique") or "").strip()
+            if not emoticon_unique:
+                raise ApiError("发送表情包", -400, "缺少表情标识（emoticon_unique）")
         data: Dict[str, Any] = {
             "csrf": csrf,
             "csrf_token": csrf,
@@ -382,6 +482,14 @@ class BilibiliLiveAPI:
             data["reply_uname"] = reply_uname
         if replay_dmid:
             data["replay_dmid"] = str(replay_dmid)
+        if emoticon_unique:
+            # 表情包弹幕：dm_type=1 + 网页端同款 emoticonOptions（JSON 数组字符串）。
+            # 触发词用接口返回的 emoji 原文（收到时 DANMU_MSG 的 info[1] 即该值）。
+            trigger = str(emoticon.get("trigger") or emoticon.get("text") or "").strip()
+            data["dm_type"] = 1
+            data["emoticonOptions"] = json.dumps(
+                [{"emoticon_unique": emoticon_unique, "text": trigger}],
+                ensure_ascii=False, separators=(",", ":"))
         payload = await self._post_form_json(SEND_DANMAKU_URL, data)
         code = payload.get("code")
         if code != 0:

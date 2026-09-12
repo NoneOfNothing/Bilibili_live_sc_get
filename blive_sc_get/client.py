@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from datetime import datetime
 from typing import Callable, Optional, Set
@@ -24,14 +25,31 @@ from .storage import SCStorage
 DEFAULT_DANMU_HOST = "broadcastlv.chat.bilibili.com"
 DEFAULT_WSS_PORT = 443
 
-HEARTBEAT_INTERVAL = 30
-"""心跳发送间隔（秒），与 B 站 web 端一致。"""
+HEARTBEAT_INTERVAL = 20
+"""心跳发送间隔（秒）。比 web 端略密，以便更快发现静默断网（如拔网线）。"""
 
-HEARTBEAT_TIMEOUT = 70
-"""超过该秒数未收到心跳应答则主动重连。"""
+HEARTBEAT_TIMEOUT = 45
+"""超过该秒数未收到任何心跳应答则主动重连（约 2 个心跳周期）。
+
+原为 70 秒，静默断网（连接未关闭但不再有数据）时最长要等 70 秒才会发现；
+收紧后短暂断网可更快进入重连流程。
+"""
+
+HEARTBEAT_CHECK_INTERVAL = 5
+"""心跳循环的轮询间隔（秒）：把「超时判定」与「发包节拍」解耦，缩短静默断网
+（连接未关闭但不再有数据，如拔网线）的发现延迟。"""
 
 AUTH_TIMEOUT = 10
 """发出认证包后等待应答的超时（秒）。"""
+
+RECONNECT_BASE_DELAY = 1.0
+"""首次重连前的等待秒数；之后按指数增长。"""
+
+RECONNECT_MAX_DELAY = 30.0
+"""单次重连等待的上限（秒），避免长时间断网后退避过久。"""
+
+RECONNECT_JITTER = 0.3
+"""退避抖动比例（±30%），避免多个房间在同一时刻同步重连。"""
 
 STATUS_REFRESH_DEBOUNCE = 2.0
 """实时刷新房间状态的最小间隔（秒），防止短时间内重复请求接口触发风控。"""
@@ -43,6 +61,26 @@ OFFLINE_CONFIRM_RETRY_DELAY = 5.0
 """关播确认刷新失败后的重试间隔（秒）。"""
 
 LIVE_STATUS_TEXT = {0: "未开播", 1: "直播中", 2: "轮播中"}
+
+
+def compute_reconnect_delay(attempt: int, *, base: float = RECONNECT_BASE_DELAY,
+                            cap: float = RECONNECT_MAX_DELAY,
+                            jitter: float = RECONNECT_JITTER,
+                            rng: Optional[Callable[[], float]] = None) -> float:
+    """第 ``attempt`` 次重连前的等待秒数（纯函数，便于单测）。
+
+    ``attempt`` 从 0 起：0 → base、1 → 2×base……直到 cap 封顶，再叠加
+    ±jitter 比例的随机抖动（默认 ±30%），避免多房间同步重连形成尖峰。
+    ``rng`` 可注入（返回 [0,1) 的可调用对象）以便测试确定化。
+    """
+    if rng is None:
+        rng = random.random
+    index = max(int(attempt), 0)
+    delay = min(base * (2 ** index), cap)
+    spread = delay * max(0.0, float(jitter))
+    if spread > 0:
+        delay += (rng() * 2.0 - 1.0) * spread
+    return round(max(0.1, min(delay, cap)), 3)
 
 
 class NeedReconnect(Exception):
@@ -97,7 +135,7 @@ class RoomClient:
 
     async def run(self) -> None:
         """主循环：断线自动重连；接口级错误或房间被其他实例占用则停止本房间。"""
-        backoff = 1.0
+        attempt = 0  # 连续失败次数（握手成功过就清零），用于指数退避
         try:
             while True:
                 try:
@@ -125,11 +163,15 @@ class RoomClient:
                 if self._auth_ok.is_set():
                     # 这次连接成功过，重置退避时间
                     self._auth_ok.clear()
-                    backoff = 1.0
+                    attempt = 0
                     self._log.info("连接已断开")
-                self._log.info("%.0f 秒后重连", backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                delay = compute_reconnect_delay(attempt)
+                attempt += 1
+                self._log.info("%.1f 秒后重连（第 %d 次）", delay, attempt)
+                self._emit("reconnecting", {
+                    "room_id": self._room_id, "attempt": attempt, "delay": delay,
+                })
+                await asyncio.sleep(delay)
         finally:
             if self._offline_confirm_task is not None:
                 self._offline_confirm_task.cancel()
@@ -193,6 +235,13 @@ class RoomClient:
             try:
                 await asyncio.wait_for(self._auth_ok.wait(), AUTH_TIMEOUT)
                 self._log.info("已接入 %d 直播间，开始监听 SuperChat ...", self._room_id)
+                if self._connect_attempts > 1:
+                    # 断线后的重连握手成功：上报可观测事件，便于确认短时断网已恢复
+                    self._emit("reconnected", {
+                        "room_id": self._room_id,
+                        "attempt": self._connect_attempts,
+                        "url": url,
+                    })
                 done, _pending = await asyncio.wait(
                     {recv_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -239,12 +288,21 @@ class RoomClient:
                 self._log.debug("收到其他 WebSocket 消息: %s", msg.type)
 
     async def _heartbeat_loop(self, ws) -> None:
+        """定时发心跳，并按 HEARTBEAT_CHECK_INTERVAL 高频检查应答超时。
+
+        发送仍严格按 HEARTBEAT_INTERVAL 的节拍（与 web 端一致），但超时判定
+        独立轮询——否则静默断网时最长要等「超时阈值 + 一个发送周期」才发现。
+        """
+        next_send = time.time()
         while True:
             if time.time() - self._last_heartbeat_ack > HEARTBEAT_TIMEOUT:
                 raise NeedReconnect("心跳应答超时，服务器无响应")
-            await ws.send_bytes(build_packet(Operation.HEARTBEAT, b"{}"))
-            self._log.debug("已发送心跳")
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            now = time.time()
+            if now >= next_send:
+                await ws.send_bytes(build_packet(Operation.HEARTBEAT, b"{}"))
+                self._log.debug("已发送心跳")
+                next_send = now + HEARTBEAT_INTERVAL
+            await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
 
     def _process_ws_data(self, raw: bytes) -> None:
         try:

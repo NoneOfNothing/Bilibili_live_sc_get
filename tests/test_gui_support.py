@@ -7,15 +7,22 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from blive_sc_get.api import ApiError, BilibiliLiveAPI, describe_send_error
+from blive_sc_get.api import (
+    ApiError,
+    BilibiliLiveAPI,
+    describe_send_error,
+    parse_room_emoticons,
+)
 from blive_sc_get.app_config import AppConfig, load_app_config
-from blive_sc_get.client import RoomClient
+from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
 from blive_sc_get.gui_app import (
     build_sc_segments,
+    danmaku_content_from_line,
     danmaku_send_guard,
     parse_add_input,
     select_dm_options,
     text_scrolled_to_bottom,
+    unseen_badge_text,
 )
 from blive_sc_get.gui_config import (
     RoomEntry,
@@ -548,6 +555,11 @@ class DanmakuSendGuardTests(unittest.TestCase):
     def test_blocks_too_long(self):
         self.assertIn("过长", danmaku_send_guard("啊" * 21))
 
+    def test_max_len_none_skips_length_check(self):
+        # 表情包触发词由服务端定义，不受 20 字输入上限约束
+        self.assertIsNone(danmaku_send_guard("啊" * 60, max_len=None))
+        self.assertIn("过长", danmaku_send_guard("啊" * 60))
+
     def test_blocks_within_cooldown(self):
         msg = danmaku_send_guard("新内容", last_text="旧内容", last_time=10.0, now=11.0)
         self.assertIn("频繁", msg)
@@ -584,6 +596,177 @@ class SelectDmOptionsTests(unittest.TestCase):
         offered = [("白色", 16777215), ("白色", 16777215), ("蓝色", 255)]
         self.assertEqual(select_dm_options(self.PRESETS, offered),
                          [("白色", 16777215), ("蓝色", 255)])
+
+
+class UnseenBadgeTests(unittest.TestCase):
+    """新消息浮动徽标文案（纯函数）：无新消息时返回空串表示隐藏。"""
+
+    def test_no_unseen_hides_badge(self):
+        self.assertEqual(unseen_badge_text(0, "弹幕"), "")
+        self.assertEqual(unseen_badge_text(-3, "SC"), "")
+        self.assertEqual(unseen_badge_text(None, "SC"), "")
+        self.assertEqual(unseen_badge_text("abc", "SC"), "")
+
+    def test_text_for_unseen(self):
+        self.assertEqual(unseen_badge_text(5, "弹幕"), "5 条新弹幕 ↓")
+        self.assertEqual(unseen_badge_text("7", "SC"), "7 条新SC ↓")
+
+
+class DanmakuContentFromLineTests(unittest.TestCase):
+    """从弹幕整行文本还原正文：剥离「[时间] 」与「用户名：」前缀。"""
+
+    def test_strips_time_and_username(self):
+        self.assertEqual(danmaku_content_from_line("[20:15:30] 弹幕哥：你好世界"), "你好世界")
+
+    def test_content_containing_colon_is_kept(self):
+        self.assertEqual(danmaku_content_from_line("[20:15:30] 张三：a：b"), "a：b")
+
+    def test_emoticon_display_text(self):
+        self.assertEqual(danmaku_content_from_line("[20:15:30] 弹幕哥：[百岁山]"), "[百岁山]")
+
+    def test_without_prefix_returns_as_is(self):
+        self.assertEqual(danmaku_content_from_line("裸文本"), "裸文本")
+
+    def test_empty_and_none(self):
+        self.assertEqual(danmaku_content_from_line(""), "")
+        self.assertEqual(danmaku_content_from_line(None), "")
+
+
+class ReconnectDelayTests(unittest.TestCase):
+    """断线重连退避：指数增长、封顶、随机抖动上下界。"""
+
+    def test_grows_exponentially_and_caps(self):
+        delays = [compute_reconnect_delay(i, jitter=0.0) for i in range(7)]
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+
+    def test_negative_attempt_treated_as_first(self):
+        self.assertEqual(compute_reconnect_delay(-5, jitter=0.0), 1.0)
+
+    def test_jitter_stays_within_bounds(self):
+        for ratio in (0.0, 0.5, 1.0):
+            delay = compute_reconnect_delay(1, rng=lambda r=ratio: r)
+            self.assertGreaterEqual(delay, 1.4)
+            self.assertLessEqual(delay, 2.6)
+
+    def test_never_below_floor_or_above_cap(self):
+        for attempt in range(12):
+            lowest = compute_reconnect_delay(attempt, rng=lambda: 0.0)
+            highest = compute_reconnect_delay(attempt, rng=lambda: 1.0)
+            self.assertGreaterEqual(lowest, 0.1, attempt)
+            self.assertLessEqual(highest, RECONNECT_MAX_DELAY, attempt)
+
+
+EMOTICON_PAYLOAD = {
+    "code": 0,
+    "data": {
+        "data": [
+            {"pkg_name": "官方表情", "emoticons": [
+                {"emoticon_unique": "official_331", "emoticon_id": 331, "emoji": "妙",
+                 "url": "https://i0.hdslb.com/a.png", "width": 132, "height": 60, "perm": 1},
+                {"emoticon_unique": "official_332", "emoticon_id": 332, "emoji": "冲",
+                 "url": "https://i0.hdslb.com/b.png", "perm": 0},
+            ]},
+            {"pkg_name": "房间专属", "emoticons": [
+                {"emoticon_unique": "room_9527_1", "emoticon_id": 109824, "emoji": "百岁山",
+                 "url": "https://i0.hdslb.com/c.png", "width": 162, "height": 60},
+            ]},
+        ]
+    },
+}
+
+
+class ParseRoomEmoticonsTests(unittest.TestCase):
+    """GetEmoticons 响应归一化：套娃结构、可用性过滤、去重与专属优先。"""
+
+    def test_nested_packages_filtered_and_sorted(self):
+        items = parse_room_emoticons(EMOTICON_PAYLOAD["data"])
+        # perm=0 被过滤，直播间专属（room_ 前缀）排在前面
+        self.assertEqual([i["unique"] for i in items],
+                         ["room_9527_1", "official_331"])
+        self.assertEqual(items[0]["trigger"], "百岁山")
+        self.assertEqual(items[0]["text"], "[百岁山]")
+        self.assertEqual(items[0]["id"], 109824)
+        self.assertEqual(items[0]["url"], "https://i0.hdslb.com/c.png")
+        self.assertEqual(items[0]["width"], 162)
+
+    def test_flat_emoticon_entries_supported(self):
+        # 兼容 data 下直接就是表情项（未套 emoticons 列表）的形态
+        items = parse_room_emoticons({"data": [
+            {"emoticon_unique": "official_1", "emoji": "[已带括号]", "url": "u"}]})
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["text"], "[已带括号]")
+
+    def test_flat_list_of_emoticons(self):
+        items = parse_room_emoticons([
+            {"emoticon_unique": "room_1_2", "emoji": "打call", "url": "u"}])
+        self.assertEqual([i["unique"] for i in items], ["room_1_2"])
+        self.assertEqual(items[0]["text"], "[打call]")
+
+    def test_dedup_and_missing_url_skipped(self):
+        items = parse_room_emoticons({"data": [
+            {"emoticon_unique": "official_1", "emoji": "a", "url": "u"},
+            {"emoticon_unique": "official_1", "emoji": "a", "url": "u"},
+            {"emoticon_unique": "official_2", "emoji": "b"},
+            {"emoticon_unique": "", "emoji": "c", "url": "u"},
+            "not-a-dict",
+        ]})
+        self.assertEqual([i["unique"] for i in items], ["official_1"])
+        self.assertEqual(items[0]["trigger"], "a")
+        self.assertEqual(items[0]["text"], "[a]")
+
+    def test_malformed_input_returns_empty(self):
+        for bad in (None, [], {}, {"data": None}, {"data": "x"}, {"data": [1, 2]}):
+            self.assertEqual(parse_room_emoticons(bad), [])
+
+
+class GetRoomEmoticonsApiTests(unittest.TestCase):
+    """表情接口：请求参数与响应解析；失败一律返回空列表（不阻塞界面）。"""
+
+    def test_success(self):
+        session = _FakeSession(EMOTICON_PAYLOAD)
+        api = BilibiliLiveAPI(session)
+        items = asyncio.run(api.get_room_emoticons(9527))
+        self.assertEqual(len(items), 2)
+        url, params = session.calls[0]
+        self.assertIn("GetEmoticons", url)
+        self.assertEqual(params, {"platform": "pc", "room_id": 9527})
+
+    def test_api_error_returns_empty(self):
+        api = BilibiliLiveAPI(_FakeSession({"code": -101, "message": "未登录"}))
+        self.assertEqual(asyncio.run(api.get_room_emoticons(1)), [])
+
+
+class SendEmoticonTests(unittest.TestCase):
+    """发送表情包弹幕：dm_type=1 + emoticonOptions（网页端同款字段）。"""
+
+    COOKIE = "SESSDATA=abc; bili_jct=csrf123"
+    EMOTICON = {"unique": "room_9527_1", "id": 109824, "trigger": "百岁山",
+                "text": "[百岁山]", "url": "u", "width": 0, "height": 0}
+
+    def test_emoticon_form_fields(self):
+        session = _FakeSession({"code": 0})
+        api = BilibiliLiveAPI(session, cookie=self.COOKIE)
+        asyncio.run(api.send_danmaku(9527, "百岁山", emoticon=self.EMOTICON))
+        _url, data, _headers = session.post_calls[0]
+        self.assertEqual(data["msg"], "百岁山")
+        self.assertEqual(data["dm_type"], 1)
+        options = __import__("json").loads(data["emoticonOptions"])
+        self.assertEqual(options,
+                         [{"emoticon_unique": "room_9527_1", "text": "百岁山"}])
+
+    def test_plain_danmaku_has_no_emoticon_fields(self):
+        session = _FakeSession({"code": 0})
+        api = BilibiliLiveAPI(session, cookie=self.COOKIE)
+        asyncio.run(api.send_danmaku(9527, "普通弹幕"))
+        _url, data, _headers = session.post_calls[0]
+        self.assertNotIn("dm_type", data)
+        self.assertNotIn("emoticonOptions", data)
+
+    def test_emoticon_without_unique_raises(self):
+        api = BilibiliLiveAPI(_FakeSession({"code": 0}), cookie=self.COOKIE)
+        with self.assertRaises(ApiError):
+            asyncio.run(api.send_danmaku(1, "x", emoticon={"text": "[x]"}))
+        self.assertEqual(len(api.session.post_calls), 0)
 
 
 if __name__ == "__main__":

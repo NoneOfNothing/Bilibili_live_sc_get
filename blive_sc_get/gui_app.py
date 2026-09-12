@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import math
 import queue
 import re
 import sys
@@ -102,7 +104,22 @@ DM_MODE_TEXTS = {"滚动": 1, "顶部": 5, "底部": 4}
 DM_META_MAX = 2000
 """dmid -> (uid, uname, text) 缓存的条目上限，超出后丢弃最早的一半。"""
 
+EMOTICON_COLUMNS = 8
+"""表情选择弹窗每行展示的表情数。"""
+
+EMOTICON_ICON_MAX_PX = 48
+"""表情图片按钮的最大边长（像素），超过时按整数倍缩小。"""
+
+EMOTICON_IMAGE_CACHE_MAX = 300
+"""表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
+
+DM_COPY_HINT_MS = 1500
+"""点击弹幕正文复制后「已复制」提示的保留时长（毫秒）。"""
+
 SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)")
+
+DM_LINE_PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*")
+"""弹幕行首的「[时间] 」前缀，用于从整行文本还原弹幕正文。"""
 
 
 def parse_add_input(raw: str) -> Tuple[Optional[int], Optional[int]]:
@@ -173,21 +190,44 @@ def text_scrolled_to_bottom(yview: tuple, tolerance: float = 0.001) -> bool:
 def danmaku_send_guard(text: str, *, last_text: str = "", last_time: float = 0.0,
                        now: float = 0.0, cooldown: float = DANMAKU_SEND_COOLDOWN_S,
                        dup_window: float = DANMAKU_DUP_WINDOW_S,
-                       max_len: int = DANMAKU_MAX_LEN) -> Optional[str]:
+                       max_len: Optional[int] = DANMAKU_MAX_LEN) -> Optional[str]:
     """发送弹幕前的客户端校验（纯函数）。
 
     返回拦截原因（不可发送时的中文提示），可发送时返回 None。
+    ``max_len`` 传 None 表示不校验长度（表情包弹幕的触发词由服务端定义）。
     """
     text = (text or "").strip()
     if not text:
         return "弹幕内容不能为空"
-    if len(text) > max_len:
+    if max_len is not None and len(text) > max_len:
         return f"弹幕过长：最多 {max_len} 字（当前 {len(text)} 字）"
     if last_time and now - last_time < cooldown:
         return f"发送过于频繁，请 {cooldown - (now - last_time):.1f} 秒后再试"
     if last_text and text == last_text and now - last_time < dup_window:
         return "内容与上一条相同，请勿重复发送"
     return None
+
+
+def unseen_badge_text(count: int, label: str) -> str:
+    """新消息浮动徽标的文案（纯函数）；无新消息时返回空串表示隐藏。"""
+    try:
+        value = int(count)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    return f"{value} 条新{label} ↓"
+
+
+def danmaku_content_from_line(line: str) -> str:
+    """从一行弹幕文本里还原正文（纯函数）。
+
+    行格式为 ``[HH:MM:SS] 用户名：正文``；剥离行首时间与「用户名：」前缀。
+    仅在拿不到 dmid 元数据时作为兜底使用。
+    """
+    text = DM_LINE_PREFIX_RE.sub("", str(line or "").strip())
+    _uname, sep, rest = text.partition("：")
+    return (rest if sep else text).strip()
 
 
 def select_dm_options(presets, offered):
@@ -317,6 +357,17 @@ class ScMonitorApp:
         self._dm_reply_target: Optional[dict] = None  # 回复/@ 目标 {kind,uid,uname,dmid,text}
         self._dm_send_reason = ""                   # 上次门控原因（避免重复提示）
         self._dm_meta: Dict[str, Tuple[int, str, str]] = {}  # dmid -> (uid, uname, text)
+        # 新消息未读计数与弹幕复制提示（仅主线程读写）
+        self._sc_unseen = 0                  # SC 区未读新消息数（滚动条不在底部时累计）
+        self._dm_unseen = 0                  # 弹幕区未读新消息数
+        self._dm_copy_hint_id: Optional[str] = None  # 「已复制」提示的 after id
+        # 表情包（写操作）相关状态
+        self._emoticons: Dict[int, List[dict]] = {}   # 房间号 -> 可用表情列表
+        self._emoticon_popup: Optional[tk.Toplevel] = None
+        self._emoticon_popup_room: Optional[int] = None
+        self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
+        self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
+        self._emoticon_pending: set = set()  # 正在下载的图片 url
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -548,6 +599,12 @@ class ScMonitorApp:
             self.dm_text.tag_configure(tag, foreground=color)
         self.dm_text.bind("<Button-1>", self._on_dm_click)
         self.dm_text.bind("<Button-3>", self._on_dm_right_click)
+        # 新消息浮动徽标：滚动条不在底部时显示未读条数，点击回到底部并恢复跟随。
+        # 以 place(in_=<Text>) 叠在文本区右下角，不改变既有 pack 布局。
+        self.sc_badge = ttk.Button(self.sc_frame, text="", width=16,
+                                   command=self._on_sc_badge_clicked)
+        self.dm_badge = ttk.Button(self.dm_frame, text="", width=16,
+                                   command=self._on_dm_badge_clicked)
         if self.dm_var.get():
             self.paned.add(self.dm_frame, weight=PANE_WEIGHTS[2])
             self._dm_grew = True
@@ -580,6 +637,10 @@ class ScMonitorApp:
             row, textvariable=self.dm_mode_var, width=5, state="readonly",
             values=[name for name, _mode in self.dm_modes])
         self.dm_mode_box.pack(side="left", padx=(4, 0))
+        # 表情按钮：点击弹出该直播间专属表情网格，点选即发送（写操作，受总开关约束）
+        self.dm_emoji_btn = ttk.Button(row, text="表情", width=5,
+                                       command=self._on_open_emoticons)
+        self.dm_emoji_btn.pack(side="left", padx=(4, 0))
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
@@ -595,6 +656,10 @@ class ScMonitorApp:
         self.dm_send_hint_var = tk.StringVar(value="")
         ttk.Label(area, textvariable=self.dm_send_hint_var,
                   foreground="#888888").pack(side="top", fill="x")
+        # 复制提示行：与发送提示独立，避免点弹幕复制时覆盖发送状态文案
+        self.dm_copy_hint_var = tk.StringVar(value="")
+        ttk.Label(area, textvariable=self.dm_copy_hint_var,
+                  foreground="#1a7f37").pack(side="top", fill="x")
         # 回复/@ 目标提示行：默认隐藏，显示时插入到发送行上方
         self.dm_reply_var = tk.StringVar(value="")
         self.dm_reply_bar = ttk.Frame(area)
@@ -957,12 +1022,56 @@ class ScMonitorApp:
         self.dm_text.configure(state="normal")
         self.dm_text.delete("1.0", "end")
         self.dm_text.configure(state="disabled")
+        self._dm_unseen = 0
+        self._refresh_unseen_badges()
+
+    # ---------- 新消息浮动徽标 ----------
+
+    def _refresh_unseen_badges(self) -> None:
+        """按未读计数显示/隐藏 SC 区与弹幕区的新消息徽标。"""
+        self._sync_badge(self.sc_badge, self.sc_text,
+                         unseen_badge_text(self._sc_unseen, "SC"))
+        self._sync_badge(self.dm_badge, self.dm_text,
+                         unseen_badge_text(self._dm_unseen, "弹幕"))
+
+    def _sync_badge(self, badge: ttk.Button, text_widget: tk.Text, label: str) -> None:
+        if not label:
+            badge.place_forget()
+            return
+        badge.configure(text=label)
+        badge.place(in_=text_widget, relx=1.0, rely=1.0, anchor="se", x=-12, y=-6)
+        badge.lift()
+
+    def _sync_unseen_from_scroll(self) -> None:
+        """用户把滚动条拉回底部后，清零未读计数并隐藏徽标（复用 100ms 轮询）。"""
+        changed = False
+        if self._sc_unseen and text_scrolled_to_bottom(self.sc_text.yview()):
+            self._sc_unseen = 0
+            changed = True
+        if self._dm_unseen and text_scrolled_to_bottom(self.dm_text.yview()):
+            self._dm_unseen = 0
+            changed = True
+        if changed:
+            self._refresh_unseen_badges()
+
+    def _on_sc_badge_clicked(self) -> None:
+        self._sc_unseen = 0
+        self.sc_text.see("end")
+        self._refresh_unseen_badges()
+
+    def _on_dm_badge_clicked(self) -> None:
+        self._dm_unseen = 0
+        self.dm_text.see("end")
+        self._refresh_unseen_badges()
+
+    # ---------- 弹幕点击：用户名跳转 / 正文复制 ----------
 
     def _on_dm_click(self, event) -> None:
-        """点击弹幕中的用户名 → 打开其个人空间。"""
-        index = self.dm_text.index(f"@{event.x},{event.y}")
-        for tag in self.dm_text.tag_names(index):
-            tag = str(tag)
+        """点击弹幕：命中用户名 → 跳转其个人空间；命中正文 → 复制该条弹幕内容。"""
+        text = self.dm_text
+        index = text.index(f"@{event.x},{event.y}")
+        tags = [str(t) for t in text.tag_names(index)]
+        for tag in tags:
             if tag.startswith("dmuid:"):
                 try:
                     uid = int(tag.split(":", 1)[1])
@@ -971,6 +1080,42 @@ class ScMonitorApp:
                 if uid:
                     webbrowser.open(f"https://space.bilibili.com/{uid}")
                 return
+        if not any(t == "dmbody" or t.startswith("dmbody:") for t in tags):
+            return  # 时间、行尾空白等非正文区域不触发复制
+        content = ""
+        for tag in tags:
+            if tag.startswith("dmbody:"):
+                meta = self._dm_meta.get(tag.split(":", 1)[1])
+                if meta:
+                    content = str(meta[2] or "")
+                break
+        if not content:
+            # 无 dmid（拿不到元数据）时从整行文本兜底还原正文
+            content = danmaku_content_from_line(
+                text.get(f"{index} linestart", f"{index} lineend"))
+        if content:
+            self._copy_dm_content(content)
+
+    def _copy_dm_content(self, content: str) -> None:
+        """复制弹幕正文到剪贴板，并短暂显示「已复制」提示。"""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            self.root.update_idletasks()
+        except tk.TclError:
+            return
+        snippet = content if len(content) <= 20 else content[:20] + "…"
+        self.dm_copy_hint_var.set(f"已复制：{snippet}")
+        if self._dm_copy_hint_id is not None:
+            try:
+                self.root.after_cancel(self._dm_copy_hint_id)
+            except Exception:
+                pass
+        self._dm_copy_hint_id = self.root.after(DM_COPY_HINT_MS, self._clear_dm_copy_hint)
+
+    def _clear_dm_copy_hint(self) -> None:
+        self._dm_copy_hint_id = None
+        self.dm_copy_hint_var.set("")
 
     # ---------- 发送弹幕 ----------
 
@@ -998,6 +1143,7 @@ class ScMonitorApp:
         self.dm_send_btn.configure(state="normal" if enabled else "disabled")
         self.dm_color_box.configure(state="readonly" if enabled else "disabled")
         self.dm_mode_box.configure(state="readonly" if enabled else "disabled")
+        self.dm_emoji_btn.configure(state="normal" if enabled else "disabled")
         if reason != self._dm_send_reason:
             previous = self._dm_send_reason
             self._dm_send_reason = reason
@@ -1078,30 +1224,27 @@ class ScMonitorApp:
 
     async def _async_send_danmaku(self, room_id: int, text: str, *, color: int,
                                   mode: int, reply_mid: int, reply_uname: str,
-                                  replay_dmid: str) -> None:
-        """在 asyncio 线程内发送弹幕，结果经 ui_queue 回主线程。"""
+                                  replay_dmid: str,
+                                  emoticon: Optional[dict] = None) -> None:
+        """在 asyncio 线程内发送弹幕/表情包，结果经 ui_queue 回主线程。"""
         api = self.hub.api
         if api is None:
             self.ui_queue.put(("dm_send_result",
                                {"ok": False, "error": "后台未就绪，发送取消"}))
             return
+        info = {"room_id": room_id, "text": text, "emoticon": bool(emoticon)}
         try:
             await api.send_danmaku(room_id, text, color=color, mode=mode,
                                    reply_mid=reply_mid, reply_uname=reply_uname,
-                                   replay_dmid=replay_dmid)
+                                   replay_dmid=replay_dmid, emoticon=emoticon)
         except ApiError as exc:
-            self.ui_queue.put(("dm_send_result", {
-                "ok": False, "room_id": room_id, "text": text,
-                "error": describe_send_error(exc.code, exc.message),
-            }))
+            self.ui_queue.put(("dm_send_result", dict(
+                info, ok=False, error=describe_send_error(exc.code, exc.message))))
         except Exception as exc:  # 兜底：避免后台任务静默失败
-            self.ui_queue.put(("dm_send_result", {
-                "ok": False, "room_id": room_id, "text": text,
-                "error": f"发送异常：{exc}",
-            }))
+            self.ui_queue.put(("dm_send_result", dict(
+                info, ok=False, error=f"发送异常：{exc}")))
         else:
-            self.ui_queue.put(("dm_send_result", {
-                "ok": True, "room_id": room_id, "text": text}))
+            self.ui_queue.put(("dm_send_result", dict(info, ok=True)))
 
     def _on_dm_send_result(self, payload: dict) -> None:
         """发送结果回主线程：成功清空输入与目标并记录冷却，失败给出内联提示。"""
@@ -1112,11 +1255,13 @@ class ScMonitorApp:
             if room_id is not None:
                 self._last_dm_send[int(room_id)] = time.monotonic()
                 self._last_dm_text[int(room_id)] = text
-            self.dm_send_var.set("")
-            self._update_dm_len_hint()
-            self._set_dm_reply_target(None)
+            if not payload.get("emoticon"):
+                # 表情包发送不影响输入框内容，仅文字弹幕成功后清空
+                self.dm_send_var.set("")
+                self._update_dm_len_hint()
+                self._set_dm_reply_target(None)
             self.dm_send_hint_var.set("已发送")
-            logger.info("已发送弹幕：%s", text)
+            logger.info("已发送%s：%s", "表情包" if payload.get("emoticon") else "弹幕", text)
         else:
             error = payload.get("error") or "发送失败"
             self.dm_send_hint_var.set(error)
@@ -1164,6 +1309,199 @@ class ScMonitorApp:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    # ---------- 发送表情包（写操作） ----------
+
+    def _on_open_emoticons(self) -> None:
+        """打开当前直播间专属表情面板（懒加载：首次打开时才向后端请求）。"""
+        reason = self._dm_send_block_reason()
+        if reason:
+            self.dm_send_hint_var.set(reason)
+            return
+        room_id = self._selected_room_id
+        if room_id is None:
+            return
+        self._build_emoticon_popup()
+        self._emoticon_popup_room = room_id
+        items = self._emoticons.get(room_id)
+        if items is None:
+            self._render_emoticons(room_id, None, "正在获取该直播间的专属表情…")
+            self.hub.submit(self._async_load_emoticons(room_id))
+        else:
+            self._render_emoticons(room_id, items, "")
+        self._emoticon_popup.deiconify()
+        self._emoticon_popup.lift()
+
+    def _build_emoticon_popup(self) -> None:
+        if self._emoticon_popup is not None and self._emoticon_popup.winfo_exists():
+            return
+        win = tk.Toplevel(self.root)
+        win.title("发送表情包")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._close_emoticon_popup)
+        win.bind("<Escape>", lambda _e: self._close_emoticon_popup())
+        self._emoticon_hint_var = tk.StringVar(value="")
+        self._emoticon_grid = ttk.Frame(win)
+        self._emoticon_grid.pack(side="top", fill="both", expand=True, padx=8, pady=8)
+        ttk.Label(win, textvariable=self._emoticon_hint_var, foreground="#888888",
+                  wraplength=420, justify="left").pack(side="bottom", fill="x",
+                                                      padx=8, pady=(0, 8))
+        self._emoticon_popup = win
+
+    def _close_emoticon_popup(self) -> None:
+        win = self._emoticon_popup
+        self._emoticon_popup = None
+        self._emoticon_popup_room = None
+        self._emoticon_buttons = {}
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    async def _async_load_emoticons(self, room_id: int) -> None:
+        api = self.hub.api
+        if api is None:
+            return
+        items = await api.get_room_emoticons(self._room_id_map.get(room_id, room_id))
+        self.ui_queue.put(("emoticons", {"room_id": room_id, "items": items}))
+
+    def _on_emoticons(self, payload: dict) -> None:
+        room_id = int(payload.get("room_id") or 0)
+        items = payload.get("items") or []
+        self._emoticons[room_id] = items
+        if self._emoticon_popup is None or self._emoticon_popup_room != room_id:
+            return  # 弹窗已关闭或已切到其他房间，仅入缓存
+        self._render_emoticons(room_id, items, "")
+
+    def _render_emoticons(self, room_id: int, items: Optional[List[dict]],
+                          hint: str) -> None:
+        """把表情渲染为网格按钮；图片异步加载，未就绪时先显示触发词文字。"""
+        if self._emoticon_popup is None:
+            return
+        for child in self._emoticon_grid.winfo_children():
+            child.destroy()
+        self._emoticon_buttons = {}
+        if not items:
+            self._emoticon_hint_var.set(
+                hint or "该直播间暂无可用专属表情（需已登录，且账号在该房间有可用表情）")
+            return
+        self._emoticon_hint_var.set(f"点击即发送（与网页端一致）；共 {len(items)} 个可用表情")
+        missing: List[str] = []
+        for index, item in enumerate(items):
+            url = str(item.get("url") or "")
+            image = self._emoticon_images.get(url)
+            btn = tk.Button(self._emoticon_grid, text=str(item.get("text") or url),
+                            width=7, height=2, relief="groove",
+                            command=lambda it=item: self._send_emoticon(it))
+            if image is not None:
+                btn.configure(image=image, text="")
+            btn.grid(row=index // EMOTICON_COLUMNS, column=index % EMOTICON_COLUMNS,
+                     padx=2, pady=2, sticky="nsew")
+            if url:
+                self._emoticon_buttons[url] = btn
+                if image is None and url not in self._emoticon_pending:
+                    missing.append(url)
+        if missing:
+            self._emoticon_pending.update(missing)
+            self.hub.submit(self._async_load_emoticon_images(missing))
+
+    async def _async_load_emoticon_images(self, urls: List[str]) -> None:
+        """后台下载表情图片（限流 4 并发）；解码只能在主线程做（Tk 限制）。"""
+        api = self.hub.api
+        if api is None:
+            return
+        semaphore = self._emoticon_semaphore()
+        await asyncio.gather(
+            *(self._download_emoticon_image(api, url, semaphore) for url in urls),
+            return_exceptions=True)
+
+    async def _download_emoticon_image(self, api, url: str, semaphore) -> None:
+        try:
+            async with semaphore:
+                async with api.session.get(url, headers=api.ws_headers()) as resp:
+                    resp.raise_for_status()
+                    raw = await resp.read()
+        except Exception as exc:
+            logger.debug("下载表情图片失败 %s: %s", url, exc)
+            self.ui_queue.put(("emoticon_image", {"url": url, "data": ""}))
+            return
+        self.ui_queue.put(("emoticon_image", {
+            "url": url, "data": base64.b64encode(raw).decode("ascii")}))
+
+    def _emoticon_semaphore(self) -> asyncio.Semaphore:
+        """在事件循环内惰性创建并发信号量（避免在 GUI 线程绑定到错误的 loop）。"""
+        semaphore = getattr(self.hub, "_emoticon_sem", None)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(4)
+            self.hub._emoticon_sem = semaphore
+        return semaphore
+
+    def _on_emoticon_image(self, payload: dict) -> None:
+        url = str(payload.get("url") or "")
+        data = str(payload.get("data") or "")
+        self._emoticon_pending.discard(url)
+        if not url or not data:
+            return
+        try:
+            raw = tk.PhotoImage(master=self.root, data=data)
+        except tk.TclError:
+            logger.debug("表情图片格式不受 Tk 支持（如 WebP），保留文字按钮: %s", url)
+            return
+        image = self._shrink_photo(raw)
+        if len(self._emoticon_images) >= EMOTICON_IMAGE_CACHE_MAX:
+            self._emoticon_images.clear()
+        self._emoticon_images[url] = image
+        btn = self._emoticon_buttons.get(url)
+        try:
+            if btn is not None and btn.winfo_exists():
+                btn.configure(image=image, text="")
+        except tk.TclError:
+            pass  # 弹窗已关闭，按钮已销毁：仅保留图片缓存供下次打开复用
+
+    @staticmethod
+    def _shrink_photo(image: tk.PhotoImage) -> tk.PhotoImage:
+        """按整数倍缩小过大的表情图片（Tk 只支持 subsample，不支持任意缩放）。"""
+        longest = max(image.width(), image.height())
+        if longest <= EMOTICON_ICON_MAX_PX:
+            return image
+        factor = int(math.ceil(longest / EMOTICON_ICON_MAX_PX))
+        try:
+            return image.subsample(factor, factor)
+        except tk.TclError:
+            return image
+
+    def _send_emoticon(self, emoticon: dict) -> None:
+        """点击表情即发送（与网页端一致）：沿用写操作总开关、登录态与冷却/重复拦截。"""
+        if self._dm_sending:
+            return
+        reason = self._dm_send_block_reason()
+        if reason:
+            self.dm_send_hint_var.set(reason)
+            return
+        room_id = self._selected_room_id
+        trigger = str(emoticon.get("trigger") or emoticon.get("text") or "").strip()
+        guard = danmaku_send_guard(
+            trigger,
+            last_text=self._last_dm_text.get(room_id, ""),
+            last_time=self._last_dm_send.get(room_id, 0.0),
+            now=time.monotonic(),
+            max_len=None,  # 触发词由服务端定义，不受 20 字输入上限约束
+        )
+        if guard:
+            self.dm_send_hint_var.set(guard)
+            return
+        color = dict(self.dm_colors).get(self.dm_color_var.get(), self.dm_colors[0][1])
+        mode = dict(self.dm_modes).get(self.dm_mode_var.get(), self.dm_modes[0][1])
+        real_room = self._room_id_map.get(room_id, room_id)
+        self._dm_sending = True
+        self._refresh_dm_send_state()
+        self.dm_send_hint_var.set("发送表情中…")
+        self.hub.submit(self._async_send_danmaku(
+            real_room, trigger, color=color, mode=mode,
+            reply_mid=0, reply_uname="", replay_dmid="", emoticon=emoticon,
+        ))
+        self._close_emoticon_popup()
 
     def _load_dm_options_for_selected(self) -> None:
         """已登录且弹幕区可见时，拉取当前房间可用的弹幕颜色/模式（尽力而为）。"""
@@ -1256,14 +1594,20 @@ class ScMonitorApp:
             dm_tag = f"dm:{dmid}" if dmid else ""
             if dmid:
                 self._remember_dm_meta(dmid, uid, uname, content)
+            # dmbody:<dmid> 标记正文段，供「点击正文复制」精确定位（点时间不触发）
+            body_tag = f"dmbody:{dmid}" if dmid else "dmbody"
             text.insert("end", f"[{time_str[11:19] or time_str}] ",
                         f"dm_time {dm_tag}".strip())
             user_tag = f"dm_user dmuid:{uid}" if uid else "dm_user"
             text.insert("end", f"{uname}：", f"{user_tag} {dm_tag}".strip())
-            text.insert("end", f"{content}\n", dm_tag or ())
+            text.insert("end", f"{content}\n", f"{dm_tag} {body_tag}".strip())
         text.configure(state="disabled")
         if follow:
             text.see("end")
+        else:
+            # 用户正在向上翻阅：累加未读计数并显示「N 条新弹幕 ↓」徽标
+            self._dm_unseen += len(batch)
+            self._refresh_unseen_badges()
 
     def _sorted_room_ids(self) -> List[int]:
         mode = next(k for k, v in SORT_MODE_TEXTS.items() if v == self.sort_mode_var.get())
@@ -1772,6 +2116,8 @@ class ScMonitorApp:
         self.sc_text.configure(state="normal")
         self.sc_text.delete("1.0", "end")
         self.sc_text.configure(state="disabled")
+        self._sc_unseen = 0
+        self._refresh_unseen_badges()
 
     def _mark_sc_deleted(self, sc_id) -> None:
         """实时标记已删除/退款的 SC：在原弹幕行尾追加说明并整条置灰。
@@ -1828,6 +2174,10 @@ class ScMonitorApp:
         self.sc_text.configure(state="disabled")
         if follow:
             self.sc_text.see("end")
+        else:
+            # 用户正在向上翻阅：累加未读计数并显示「N 条新SC ↓」徽标
+            self._sc_unseen += 1
+            self._refresh_unseen_badges()
 
     def _notify_live(self, room_id: int, title: str) -> None:
         """开播提醒：提示音 + 任务栏图标闪烁（悬浮窗由主开关另控）。"""
@@ -2029,6 +2379,15 @@ class ScMonitorApp:
                 self.guard_num[room_id] = num
                 if room_id == self._selected_room_id:
                     self._update_sc_header(room_id)
+        elif event_type == "reconnecting":
+            # 细粒度重连轨迹（默认日志级别不显示）；INFO 级轨迹由 client 自身的
+            # 「连接中断 / N 秒后重连」日志给出，避免重复刷屏
+            logger.debug("房间 %s 连接中断，%.1f 秒后进行第 %d 次重连",
+                         room_id, float(payload.get("delay") or 0),
+                         int(payload.get("attempt") or 0))
+        elif event_type == "reconnected":
+            logger.info("房间 %s 断线后已自动重连成功（第 %d 次尝试）",
+                        room_id, int(payload.get("attempt") or 0))
 
     async def _async_fetch_uid(self, room_id: int) -> None:
         """后台查询房间对应主播的 uid（点击主播名跳转个人空间用）。"""
@@ -2132,11 +2491,17 @@ class ScMonitorApp:
                 elif kind == "dm_send_result":
                     self._on_dm_send_result(item[1])
                 elif kind == "dm_state":
-                    # 登录态变化（如刚获取 Cookie）后刷新门控并补拉可用颜色/样式
+                    # 登录态变化（如刚获取 Cookie）后刷新门控并补拉可用颜色/样式；
+                    # 可用表情随登录身份变化，缓存一并失效
+                    self._emoticons.clear()
                     self._refresh_dm_send_state()
                     self._load_dm_options_for_selected()
                 elif kind == "dm_config":
                     self._on_dm_config(item[1])
+                elif kind == "emoticons":
+                    self._on_emoticons(item[1])
+                elif kind == "emoticon_image":
+                    self._on_emoticon_image(item[1])
         except queue.Empty:
             pass
         # 本轮所有日志行合并为一次插入，缓解拖动窗口时的卡顿
@@ -2147,6 +2512,8 @@ class ScMonitorApp:
             selected = self._selected_room_id
             self._append_dm_batch(
                 [d for d in batch if d.get("room_id") == selected])
+        # 用户手动滚回底部后清除未读计数（复用同一轮询，不新增定时器）
+        self._sync_unseen_from_scroll()
         self.root.after(100, self._poll_queue)
 
     def _on_close(self) -> None:

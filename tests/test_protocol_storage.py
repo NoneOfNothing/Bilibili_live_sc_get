@@ -7,6 +7,7 @@ import os
 import shutil
 import struct
 import tempfile
+import time
 import unittest
 import zlib
 from datetime import datetime
@@ -15,7 +16,7 @@ from unittest import mock
 
 from blive_sc_get import protocol
 from blive_sc_get import client as client_module
-from blive_sc_get.client import RoomClient
+from blive_sc_get.client import NeedReconnect, RoomClient
 from blive_sc_get.room_lock import RoomLock, RoomLockAcquireError
 from blive_sc_get.storage import SCStorage
 
@@ -574,6 +575,53 @@ class OfflineSignalTests(unittest.TestCase):
             self.assertEqual(len([p for t, p in events if t == "status"]), 2)
 
         asyncio.run(scenario())
+
+
+class HeartbeatTimeoutTests(unittest.TestCase):
+    """静默断网（连接未关闭但长时间无应答）应被及时判定并触发重连。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._orig = (client_module.HEARTBEAT_CHECK_INTERVAL,
+                      client_module.HEARTBEAT_TIMEOUT,
+                      client_module.HEARTBEAT_INTERVAL)
+        client_module.HEARTBEAT_CHECK_INTERVAL = 0.01
+        client_module.HEARTBEAT_TIMEOUT = 0.05
+        client_module.HEARTBEAT_INTERVAL = 0.02
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (client_module.HEARTBEAT_CHECK_INTERVAL,
+         client_module.HEARTBEAT_TIMEOUT,
+         client_module.HEARTBEAT_INTERVAL) = self._orig
+
+    def test_stale_ack_raises_need_reconnect_quickly(self):
+        client = RoomClient(api=None, room_id=9527, storage=SCStorage(self.tmp))
+        client._last_heartbeat_ack = time.time() - 10  # 早已无应答
+
+        class _FakeWS:
+            async def send_bytes(self, _data):
+                raise AssertionError("已超时不应再发心跳")
+
+        with self.assertRaises(NeedReconnect):
+            asyncio.run(asyncio.wait_for(client._heartbeat_loop(_FakeWS()), 2.0))
+
+    def test_heartbeat_sent_before_timeout(self):
+        client = RoomClient(api=None, room_id=9527, storage=SCStorage(self.tmp))
+        sent = []
+
+        class _FakeWS:
+            async def send_bytes(self, data):
+                sent.append(data)
+
+        async def scenario():
+            client._last_heartbeat_ack = time.time()  # 视为刚收到应答
+            with self.assertRaises(NeedReconnect):
+                await asyncio.wait_for(client._heartbeat_loop(_FakeWS()), 2.0)
+
+        asyncio.run(scenario())
+        self.assertGreaterEqual(len(sent), 1)  # 超时前已按节拍发出心跳
 
 
 if __name__ == "__main__":
