@@ -105,7 +105,7 @@ DM_META_MAX = 2000
 """dmid -> (uid, uname, text) 缓存的条目上限，超出后丢弃最早的一半。"""
 
 EMOTICON_COLUMNS = 6
-"""表情面板每行展示的表情数。"""
+"""表情面板的**兜底/初始**列数；实际列数按面板可用宽度自适应（面板未完成布局时用它）。"""
 
 EMOTICON_ICON_MAX_PX = 72
 """表情图片按钮的显示边长（像素），超过时按整数倍缩小。"""
@@ -114,7 +114,7 @@ EMOTICON_GRID_PAD = 6
 """表情按钮的内边距（像素），决定图标之间的间距。"""
 
 EMOTICON_GRID_ROWS = 3
-"""内嵌表情面板网格的可视行数；超出的表情在该包内滚动查看。"""
+"""表情网格最多显示的行数；实际高度按内容行数收缩，超出部分在该包内滚动查看。"""
 
 EMOTICON_IMAGE_CACHE_MAX = 300
 """表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
@@ -373,6 +373,9 @@ class ScMonitorApp:
         self._emoticon_panel_room: Optional[int] = None  # 面板当前展示的房间号
         self._emoticon_packages: List[dict] = []      # 当前面板载入的表情包
         self._emoticon_page = 0                       # 当前显示的表情包序号（一页 = 一包）
+        self._emoticon_button_list: List[Tuple[str, tk.Button]] = []  # 当前页按钮（按顺序）
+        self._emoticon_columns = 0                    # 当前每行列数（0 = 待重排）
+        self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
         self._emoticon_pending: set = set()  # 正在下载的图片 url
@@ -1385,12 +1388,13 @@ class ScMonitorApp:
                   wraplength=EMOTICON_COLUMNS * cell, justify="left").pack(
             side="bottom", fill="x", padx=4, pady=(0, 4))
 
-        # 网格区：固定高度的画布 + 垂直滚动条，表情包很大时可滚动查看
+        # 网格区：画布 + 垂直滚动条。画布宽度撑满面板（每行列数按宽度自适应），
+        # 高度按实际内容行数收缩（最多 EMOTICON_GRID_ROWS 行），避免留下大片空白
         body = ttk.Frame(parent)
         body.pack(side="top", fill="x", padx=4, pady=(0, 4))
         self._emoticon_canvas = tk.Canvas(body, highlightthickness=0,
                                          width=EMOTICON_COLUMNS * cell,
-                                         height=EMOTICON_GRID_ROWS * cell)
+                                         height=cell)
         vbar = ttk.Scrollbar(body, orient="vertical",
                              command=self._emoticon_canvas.yview)
         self._emoticon_canvas.configure(yscrollcommand=vbar.set)
@@ -1403,13 +1407,76 @@ class ScMonitorApp:
             "<Configure>",
             lambda _e: self._emoticon_canvas.configure(
                 scrollregion=self._emoticon_canvas.bbox("all")))
-        self._emoticon_canvas.bind(
-            "<Configure>",
-            lambda e: self._emoticon_canvas.itemconfigure(self._emoticon_grid_id,
-                                                          width=e.width))
+        self._emoticon_canvas.bind("<Configure>", self._on_emoticon_canvas_configure)
         for widget in (self._emoticon_canvas, self._emoticon_grid):
             widget.bind("<MouseWheel>", self._on_emoticon_wheel)
             widget.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
+
+    @staticmethod
+    def _emoticon_cell() -> int:
+        """一个表情格子（图标 + 两侧间距）的边长（像素）。"""
+        return EMOTICON_ICON_MAX_PX + 2 * EMOTICON_GRID_PAD
+
+    def _on_emoticon_canvas_configure(self, event) -> None:
+        """画布尺寸变化：让内层网格跟随宽度，并在列数变化时重排列数。"""
+        try:
+            self._emoticon_canvas.itemconfigure(self._emoticon_grid_id, width=event.width)
+        except tk.TclError:
+            return
+        self._schedule_emoticon_regrid()
+
+    def _schedule_emoticon_regrid(self) -> None:
+        """宽度变化后延迟重排（合并连续 resize，避免拖动窗口时反复重排）。"""
+        if not self._emoticon_visible or not self._emoticon_button_list:
+            return
+        if self._emoticon_regrid_id is not None:
+            return
+        self._emoticon_regrid_id = self.root.after(80, self._run_emoticon_regrid)
+
+    def _run_emoticon_regrid(self) -> None:
+        self._emoticon_regrid_id = None
+        if not self._emoticon_visible:
+            return
+        try:
+            self._apply_emoticon_grid_layout()
+        except tk.TclError:
+            pass  # 窗口正在销毁
+
+    def _emoticon_grid_rows(self) -> int:
+        """当前页实际占用的行数（按已排好的列数计算，至少 1 行）。"""
+        columns = self._emoticon_columns or EMOTICON_COLUMNS
+        return max(1, math.ceil(len(self._emoticon_button_list) / columns))
+
+    def _apply_emoticon_grid_layout(self) -> None:
+        """按面板当前可用宽度决定每行列数，并把画布高度压缩到实际内容高度。
+
+        列数自适应后一屏能放下更多表情，行数随之减少——既用满右侧空间，
+        也让面板高度随内容收缩（不再固定占满 EMOTICON_GRID_ROWS 行）。
+        """
+        buttons = self._emoticon_button_list
+        if not buttons:
+            return
+        cell = self._emoticon_cell()
+        width = self._emoticon_canvas.winfo_width()
+        if width <= 1:  # 尚未完成布局（如面板刚创建）：退回请求宽度
+            width = self._emoticon_canvas.winfo_reqwidth()
+        columns = int(width // cell)
+        if columns < 1:
+            columns = EMOTICON_COLUMNS
+        if columns == self._emoticon_columns:
+            return
+        self._emoticon_columns = columns
+        for position, (_url, button) in enumerate(buttons):
+            try:
+                button.grid_configure(row=position // columns, column=position % columns)
+            except tk.TclError:
+                return
+        rows = max(1, math.ceil(len(buttons) / columns))
+        try:
+            self._emoticon_canvas.configure(height=min(rows, EMOTICON_GRID_ROWS) * cell)
+            self._emoticon_canvas.yview_moveto(0)
+        except tk.TclError:
+            return
 
     def _show_emoticon_panel(self) -> None:
         """把表情面板展开到发送行上方。"""
@@ -1417,6 +1484,11 @@ class ScMonitorApp:
             return
         self._emoticon_visible = True
         self.emoticon_panel.pack(side="top", fill="x", before=self.dm_send_row)
+        try:
+            # 先让布局生效，随后渲染才能按真实宽度算出行列数（避免先按兜底列数闪一下）
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
 
     def _hide_emoticon_panel(self) -> None:
         """收起表情面板（保留已载入的表情包与图片缓存，再次展开无需重新请求）。"""
@@ -1448,6 +1520,8 @@ class ScMonitorApp:
         for child in self._emoticon_grid.winfo_children():
             child.destroy()
         self._emoticon_buttons = {}
+        self._emoticon_button_list = []
+        self._emoticon_columns = 0
         self._emoticon_packages = list(packages or [])
         if not self._emoticon_packages:
             self._emoticon_pkg_box.configure(values=[])
@@ -1481,6 +1555,7 @@ class ScMonitorApp:
         for child in self._emoticon_grid.winfo_children():
             child.destroy()
         self._emoticon_buttons = {}
+        self._emoticon_button_list = []
         self._emoticon_pkg_var.set(self._emoticon_pkg_label(index, package))
         self._emoticon_page_var.set(
             f"第 {index + 1} / {len(packages)} 包 · 共 {len(emoticons)} 个表情")
@@ -1492,7 +1567,8 @@ class ScMonitorApp:
         except tk.TclError:
             return
         missing: List[str] = []
-        for position, item in enumerate(emoticons):
+        self._emoticon_button_list = []
+        for item in emoticons:
             url = str(item.get("url") or "")
             image = self._emoticon_images.get(url)
             btn = tk.Button(
@@ -1504,14 +1580,16 @@ class ScMonitorApp:
             if image is not None:
                 # 图片就绪：按钮按图片自然尺寸（+内边距）显示，图标更大更清楚
                 btn.configure(image=image, text="", width=0, height=0)
-            btn.grid(row=position // EMOTICON_COLUMNS,
-                     column=position % EMOTICON_COLUMNS,
-                     padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD)
+            btn.grid(row=0, column=0, padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD)
             btn.bind("<MouseWheel>", self._on_emoticon_wheel)
+            self._emoticon_button_list.append((url, btn))
             if url:
                 self._emoticon_buttons[url] = btn
                 if image is None and url not in self._emoticon_pending:
                     missing.append(url)
+        # 行列数按面板宽度自适应（换页时强制重排一次）
+        self._emoticon_columns = 0
+        self._apply_emoticon_grid_layout()
         if missing:
             self._emoticon_pending.update(missing)
             self.hub.submit(self._async_load_emoticon_images(missing))
