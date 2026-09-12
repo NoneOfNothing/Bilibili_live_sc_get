@@ -11,7 +11,7 @@ from blive_sc_get.api import (
     ApiError,
     BilibiliLiveAPI,
     describe_send_error,
-    parse_room_emoticons,
+    parse_room_emoticon_packages,
 )
 from blive_sc_get.app_config import AppConfig, load_app_config
 from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
@@ -660,63 +660,77 @@ EMOTICON_PAYLOAD = {
     "code": 0,
     "data": {
         "data": [
-            {"pkg_name": "官方表情", "emoticons": [
+            {"pkg_name": "官方表情", "pkg_id": 1, "pkg_type": 1, "emoticons": [
                 {"emoticon_unique": "official_331", "emoticon_id": 331, "emoji": "妙",
                  "url": "https://i0.hdslb.com/a.png", "width": 132, "height": 60, "perm": 1},
                 {"emoticon_unique": "official_332", "emoticon_id": 332, "emoji": "冲",
                  "url": "https://i0.hdslb.com/b.png", "perm": 0},
             ]},
-            {"pkg_name": "房间专属", "emoticons": [
+            {"pkg_name": "房间专属", "pkg_id": 99, "pkg_type": 2, "emoticons": [
                 {"emoticon_unique": "room_9527_1", "emoticon_id": 109824, "emoji": "百岁山",
                  "url": "https://i0.hdslb.com/c.png", "width": 162, "height": 60},
             ]},
+            {"pkg_name": "空表情包", "pkg_id": 100, "emoticons": []},
         ]
     },
 }
 
 
-class ParseRoomEmoticonsTests(unittest.TestCase):
-    """GetEmoticons 响应归一化：套娃结构、可用性过滤、去重与专属优先。"""
+class ParseRoomEmoticonPackagesTests(unittest.TestCase):
+    """GetEmoticons 归一化为表情包：保持服务端分页顺序、过滤不可用项、剔除空包。"""
 
-    def test_nested_packages_filtered_and_sorted(self):
-        items = parse_room_emoticons(EMOTICON_PAYLOAD["data"])
-        # perm=0 被过滤，直播间专属（room_ 前缀）排在前面
-        self.assertEqual([i["unique"] for i in items],
-                         ["room_9527_1", "official_331"])
-        self.assertEqual(items[0]["trigger"], "百岁山")
-        self.assertEqual(items[0]["text"], "[百岁山]")
-        self.assertEqual(items[0]["id"], 109824)
-        self.assertEqual(items[0]["url"], "https://i0.hdslb.com/c.png")
-        self.assertEqual(items[0]["width"], 162)
+    def test_packages_keep_server_order_and_drop_empty(self):
+        packages = parse_room_emoticon_packages(EMOTICON_PAYLOAD["data"])
+        # 顺序与服务端一致（与直播间内表情面板的分页一致）；无可用表情的包被剔除
+        self.assertEqual([p["name"] for p in packages], ["官方表情", "房间专属"])
+        self.assertEqual(packages[0]["id"], 1)
+        self.assertEqual(packages[1]["type"], 2)
 
-    def test_flat_emoticon_entries_supported(self):
+    def test_unavailable_emoticon_filtered_out(self):
+        packages = parse_room_emoticon_packages(EMOTICON_PAYLOAD["data"])
+        first = packages[0]["emoticons"]
+        self.assertEqual([e["unique"] for e in first], ["official_331"])
+        self.assertEqual(first[0]["trigger"], "妙")
+        self.assertEqual(first[0]["text"], "[妙]")
+        self.assertEqual(first[0]["url"], "https://i0.hdslb.com/a.png")
+        self.assertEqual(first[0]["width"], 132)
+
+    def test_room_exclusive_emoticon_normalized(self):
+        packages = parse_room_emoticon_packages(EMOTICON_PAYLOAD["data"])
+        emo = packages[1]["emoticons"][0]
+        self.assertEqual(emo["unique"], "room_9527_1")
+        self.assertEqual(emo["trigger"], "百岁山")
+        self.assertEqual(emo["text"], "[百岁山]")
+        self.assertEqual(emo["id"], 109824)
+
+    def test_flat_emoticon_entries_become_single_package(self):
         # 兼容 data 下直接就是表情项（未套 emoticons 列表）的形态
-        items = parse_room_emoticons({"data": [
-            {"emoticon_unique": "official_1", "emoji": "[已带括号]", "url": "u"}]})
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["text"], "[已带括号]")
+        packages = parse_room_emoticon_packages({"data": [
+            {"emoticon_unique": "official_1", "emoji": "[已带括号]", "url": "u"},
+            {"emoticon_unique": "official_2", "emoji": "打call", "url": "v"}]})
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0]["name"], "全部表情")
+        self.assertEqual([e["text"] for e in packages[0]["emoticons"]],
+                         ["[已带括号]", "[打call]"])
 
-    def test_flat_list_of_emoticons(self):
-        items = parse_room_emoticons([
-            {"emoticon_unique": "room_1_2", "emoji": "打call", "url": "u"}])
-        self.assertEqual([i["unique"] for i in items], ["room_1_2"])
-        self.assertEqual(items[0]["text"], "[打call]")
-
-    def test_dedup_and_missing_url_skipped(self):
-        items = parse_room_emoticons({"data": [
-            {"emoticon_unique": "official_1", "emoji": "a", "url": "u"},
-            {"emoticon_unique": "official_1", "emoji": "a", "url": "u"},
-            {"emoticon_unique": "official_2", "emoji": "b"},
-            {"emoticon_unique": "", "emoji": "c", "url": "u"},
-            "not-a-dict",
+    def test_dedup_across_packages_and_missing_fields_skipped(self):
+        packages = parse_room_emoticon_packages({"data": [
+            {"pkg_name": "A", "emoticons": [
+                {"emoticon_unique": "x", "emoji": "a", "url": "u"},
+                {"emoticon_unique": "x", "emoji": "a", "url": "u"},
+                {"emoticon_unique": "no-url", "emoji": "b"},
+                "not-a-dict"]},
+            {"pkg_name": "B", "emoticons": [
+                {"emoticon_unique": "x", "emoji": "a", "url": "u"},
+                {"emoticon_unique": "y", "emoji": "c", "url": "w"}]},
         ]})
-        self.assertEqual([i["unique"] for i in items], ["official_1"])
-        self.assertEqual(items[0]["trigger"], "a")
-        self.assertEqual(items[0]["text"], "[a]")
+        self.assertEqual([p["name"] for p in packages], ["A", "B"])
+        self.assertEqual([e["unique"] for e in packages[0]["emoticons"]], ["x"])
+        self.assertEqual([e["unique"] for e in packages[1]["emoticons"]], ["y"])
 
     def test_malformed_input_returns_empty(self):
         for bad in (None, [], {}, {"data": None}, {"data": "x"}, {"data": [1, 2]}):
-            self.assertEqual(parse_room_emoticons(bad), [])
+            self.assertEqual(parse_room_emoticon_packages(bad), [])
 
 
 class GetRoomEmoticonsApiTests(unittest.TestCase):
@@ -725,8 +739,8 @@ class GetRoomEmoticonsApiTests(unittest.TestCase):
     def test_success(self):
         session = _FakeSession(EMOTICON_PAYLOAD)
         api = BilibiliLiveAPI(session)
-        items = asyncio.run(api.get_room_emoticons(9527))
-        self.assertEqual(len(items), 2)
+        packages = asyncio.run(api.get_room_emoticons(9527))
+        self.assertEqual([p["name"] for p in packages], ["官方表情", "房间专属"])
         url, params = session.calls[0]
         self.assertIn("GetEmoticons", url)
         self.assertEqual(params, {"platform": "pc", "room_id": 9527})

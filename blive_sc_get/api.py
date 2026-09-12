@@ -90,34 +90,61 @@ def describe_send_error(code: Any, message: str = "") -> str:
     return f"发送失败（code={code}）"
 
 
-def parse_room_emoticons(data: Any) -> List[Dict[str, Any]]:
-    """把 GetEmoticons 的 data 字段归一化为可发送的表情列表（纯函数，便于单测）。
+def parse_room_emoticon_packages(data: Any) -> List[Dict[str, Any]]:
+    """把 GetEmoticons 的 data 字段归一化为「表情包」列表（纯函数，便于单测）。
 
-    实测响应为 ``{"data": [{"emoticons": [...], "pkg_name": ...}, ...]}``
-    （data.data 是"表情包"数组，每个包里再套 ``emoticons``）；同时兼容
-    data 直接就是表情数组的形态。仅保留可用项（``perm`` 为 1 或缺失），
-    按 ``emoticon_unique`` 去重，直播间专属（unique 以 ``room_`` 开头）排在前面。
+    实测响应为 ``{"data": [{"pkg_name": ..., "emoticons": [...]}, ...]}``
+    （data.data 是表情包数组，每个包里再套 ``emoticons``），**保持服务端返回的
+    包顺序**，与直播间内表情面板的分页一致；同时兼容 data 直接就是表情数组的
+    形态（归入单个「全部表情」包）。
 
-    返回 ``[{"unique", "id", "trigger", "text", "url", "width", "height"}, ...]``：
+    每个表情包为 ``{"name", "id", "type", "cover", "emoticons": [表情, ...]}``，
+    其中表情为 ``{"unique", "id", "trigger", "text", "url", "width", "height"}``：
     - ``trigger``：接口给的触发关键词原文（发送时作为 ``msg``）；
     - ``text``：用于界面展示的 ``[触发词]`` 形式。
+
+    仅保留可用项（``perm`` 为 1 或缺失）并按 unique 去重（跨包去重）；
+    无可用表情的空包被剔除。
     """
     if isinstance(data, dict):
         items = data.get("data")
     else:
         items = data
     if not isinstance(items, list):
-        return []
-    emoticons: List[Any] = []
-    for entry in items:
-        if not isinstance(entry, dict):
+        items = []
+    entries = [e for e in items if isinstance(e, dict)]
+    # 没有任何一项带 emoticons 列表 → 视为扁平的「单个表情」数组
+    if not any(isinstance(e.get("emoticons"), list) for e in entries):
+        emoticons = _normalize_emoticons(entries)
+        if not emoticons:
+            return []
+        return [{"name": "全部表情", "id": 0, "type": 0, "cover": "",
+                 "emoticons": emoticons}]
+
+    packages: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entry in entries:
+        raw_list = entry.get("emoticons")
+        emoticons = _dedup_emoticons(
+            _normalize_emoticons(raw_list if isinstance(raw_list, list) else []), seen)
+        if not emoticons:
             continue
-        nested = entry.get("emoticons")
-        # data.data[] 为表情包层级（含 emoticons 列表）；兼容直接给出表情的形态
-        emoticons.extend(nested if isinstance(nested, list) else [entry])
+        packages.append({
+            "name": str(entry.get("pkg_name") or "").strip() or "表情",
+            "id": _as_int(entry.get("pkg_id")),
+            "type": _as_int(entry.get("pkg_type")),
+            "cover": str(entry.get("current_cover") or "").strip(),
+            "emoticons": emoticons,
+        })
+    return packages
+
+
+def _normalize_emoticons(raw_items: Any) -> List[Dict[str, Any]]:
+    """把原始表情项逐条归一化，丢弃不可用（``perm`` 非 1）或字段缺失的项。"""
     result: List[Dict[str, Any]] = []
-    seen = set()
-    for item in emoticons:
+    if not isinstance(raw_items, list):
+        return result
+    for item in raw_items:
         if not isinstance(item, dict):
             continue
         perm = item.get("perm")
@@ -129,26 +156,32 @@ def parse_room_emoticons(data: Any) -> List[Dict[str, Any]]:
                 continue
         unique = str(item.get("emoticon_unique") or "").strip()
         url = str(item.get("url") or "").strip()
-        if not unique or not url or unique in seen:
+        if not unique or not url:
             continue
-        seen.add(unique)
         trigger = str(item.get("emoji") or item.get("descript") or "").strip() or unique
         display = trigger if (trigger.startswith("[") and trigger.endswith("]")
                               and len(trigger) > 2) else f"[{trigger}]"
-        try:
-            emo_id = int(item.get("emoticon_id") or item.get("id") or 0)
-        except (TypeError, ValueError):
-            emo_id = 0
         result.append({
             "unique": unique,
-            "id": emo_id,
+            "id": _as_int(item.get("emoticon_id") or item.get("id")),
             "trigger": trigger,
             "text": display,
             "url": url,
             "width": _as_int(item.get("width")),
             "height": _as_int(item.get("height")),
         })
-    result.sort(key=lambda e: (not e["unique"].startswith("room_"), e["unique"]))
+    return result
+
+
+def _dedup_emoticons(items: List[Dict[str, Any]], seen: set) -> List[Dict[str, Any]]:
+    """按 ``unique`` 跨包去重（同一表情可能出现在多个包里）。"""
+    result: List[Dict[str, Any]] = []
+    for item in items:
+        unique = item["unique"]
+        if unique in seen:
+            continue
+        seen.add(unique)
+        result.append(item)
     return result
 
 
@@ -423,8 +456,10 @@ class BilibiliLiveAPI:
     async def get_room_emoticons(self, room_id: int) -> List[Dict[str, Any]]:
         """查询当前用户在指定直播间可用的表情包（含直播间专属），失败返回 []。
 
-        对应网页端弹幕输入框旁的「表情」面板；未登录也能拿到公开表情，
-        但专属表情需账号满足解锁条件（``perm`` 为 1），故 GUI 应登录后再取。
+        对应网页端弹幕输入框旁的「表情」面板：返回按**表情包**分组的列表
+        （``parse_room_emoticon_packages`` 的结构），供 GUI 按包分页展示。
+        未登录也能拿到公开表情，但专属表情需账号满足解锁条件（``perm`` 为 1），
+        故 GUI 应登录后再取。
         """
         try:
             data = await self._get_json(
@@ -435,7 +470,7 @@ class BilibiliLiveAPI:
         if data.get("code") != 0:
             logger.debug("获取直播间表情失败 room=%s: code=%s", room_id, data.get("code"))
             return []
-        return parse_room_emoticons(data.get("data"))
+        return parse_room_emoticon_packages(data.get("data"))
 
     async def send_danmaku(self, room_id: int, msg: str, *, mode: int = 1,
                            color: int = 16777215, fontsize: int = 25,

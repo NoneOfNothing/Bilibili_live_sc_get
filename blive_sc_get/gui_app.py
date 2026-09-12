@@ -104,11 +104,17 @@ DM_MODE_TEXTS = {"滚动": 1, "顶部": 5, "底部": 4}
 DM_META_MAX = 2000
 """dmid -> (uid, uname, text) 缓存的条目上限，超出后丢弃最早的一半。"""
 
-EMOTICON_COLUMNS = 8
-"""表情选择弹窗每行展示的表情数。"""
+EMOTICON_COLUMNS = 6
+"""表情面板每行展示的表情数。"""
 
-EMOTICON_ICON_MAX_PX = 48
-"""表情图片按钮的最大边长（像素），超过时按整数倍缩小。"""
+EMOTICON_ICON_MAX_PX = 72
+"""表情图片按钮的显示边长（像素），超过时按整数倍缩小。"""
+
+EMOTICON_GRID_PAD = 6
+"""表情按钮的内边距（像素），决定图标之间的间距。"""
+
+EMOTICON_GRID_ROWS = 5
+"""表情网格的可视行数；超出的表情在该包内滚动查看。"""
 
 EMOTICON_IMAGE_CACHE_MAX = 300
 """表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
@@ -362,9 +368,11 @@ class ScMonitorApp:
         self._dm_unseen = 0                  # 弹幕区未读新消息数
         self._dm_copy_hint_id: Optional[str] = None  # 「已复制」提示的 after id
         # 表情包（写操作）相关状态
-        self._emoticons: Dict[int, List[dict]] = {}   # 房间号 -> 可用表情列表
+        self._emoticons: Dict[int, List[dict]] = {}   # 房间号 -> 可用表情包（含各自表情）
         self._emoticon_popup: Optional[tk.Toplevel] = None
         self._emoticon_popup_room: Optional[int] = None
+        self._emoticon_packages: List[dict] = []      # 当前弹窗载入的表情包
+        self._emoticon_page = 0                       # 当前显示的表情包序号（一页 = 一包）
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 已解码图片
         self._emoticon_pending: set = set()  # 正在下载的图片 url
@@ -1081,7 +1089,9 @@ class ScMonitorApp:
                     webbrowser.open(f"https://space.bilibili.com/{uid}")
                 return
         if not any(t == "dmbody" or t.startswith("dmbody:") for t in tags):
-            return  # 时间、行尾空白等非正文区域不触发复制
+            return  # 时间、用户名等非正文区域不触发复制
+        if text.get(index, f"{index}+1c") in ("", "\n"):
+            return  # 点在正文右侧的空白/行尾换行处：没有文字可复制，不触发
         content = ""
         for tag in tags:
             if tag.startswith("dmbody:"):
@@ -1323,16 +1333,21 @@ class ScMonitorApp:
             return
         self._build_emoticon_popup()
         self._emoticon_popup_room = room_id
-        items = self._emoticons.get(room_id)
-        if items is None:
+        packages = self._emoticons.get(room_id)
+        if packages is None:
             self._render_emoticons(room_id, None, "正在获取该直播间的专属表情…")
             self.hub.submit(self._async_load_emoticons(room_id))
         else:
-            self._render_emoticons(room_id, items, "")
+            self._render_emoticons(room_id, packages, "")
         self._emoticon_popup.deiconify()
         self._emoticon_popup.lift()
 
     def _build_emoticon_popup(self) -> None:
+        """构建表情面板：顶部分页栏（按表情包分页）+ 可滚动的表情网格。
+
+        与直播间内的表情面板一致——**一页 = 一个表情包**；包内表情较多时可在
+        网格区拖动滚动条（或滚轮）查看。
+        """
         if self._emoticon_popup is not None and self._emoticon_popup.winfo_exists():
             return
         win = tk.Toplevel(self.root)
@@ -1340,12 +1355,56 @@ class ScMonitorApp:
         win.transient(self.root)
         win.protocol("WM_DELETE_WINDOW", self._close_emoticon_popup)
         win.bind("<Escape>", lambda _e: self._close_emoticon_popup())
+        cell = EMOTICON_ICON_MAX_PX + 2 * EMOTICON_GRID_PAD
+
+        # 分页栏：上一包 / 包名下拉（可直接跳页） / 下一包 / 页码说明
+        bar = ttk.Frame(win)
+        bar.pack(side="top", fill="x", padx=8, pady=(8, 2))
+        self._emoticon_prev_btn = ttk.Button(bar, text="◀ 上一包", width=9,
+                                            command=self._on_emoticon_prev_page)
+        self._emoticon_prev_btn.pack(side="left")
+        self._emoticon_pkg_var = tk.StringVar(value="")
+        self._emoticon_pkg_box = ttk.Combobox(bar, textvariable=self._emoticon_pkg_var,
+                                             state="readonly", width=18)
+        self._emoticon_pkg_box.pack(side="left", padx=6)
+        self._emoticon_pkg_box.bind("<<ComboboxSelected>>", self._on_emoticon_pkg_selected)
+        self._emoticon_next_btn = ttk.Button(bar, text="下一包 ▶", width=9,
+                                            command=self._on_emoticon_next_page)
+        self._emoticon_next_btn.pack(side="left")
+        self._emoticon_page_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._emoticon_page_var,
+                  foreground="#666666").pack(side="left", padx=(8, 0))
+
+        # 提示行先占位（底部固定条），避免后 pack 被网格区挤成 0 高
         self._emoticon_hint_var = tk.StringVar(value="")
-        self._emoticon_grid = ttk.Frame(win)
-        self._emoticon_grid.pack(side="top", fill="both", expand=True, padx=8, pady=8)
         ttk.Label(win, textvariable=self._emoticon_hint_var, foreground="#888888",
-                  wraplength=420, justify="left").pack(side="bottom", fill="x",
-                                                      padx=8, pady=(0, 8))
+                  wraplength=EMOTICON_COLUMNS * cell, justify="left").pack(
+            side="bottom", fill="x", padx=8, pady=(0, 8))
+
+        # 网格区：画布 + 垂直滚动条，表情包很大时可滚动查看
+        body = ttk.Frame(win)
+        body.pack(side="top", fill="both", expand=True, padx=8, pady=4)
+        self._emoticon_canvas = tk.Canvas(body, highlightthickness=0,
+                                         width=EMOTICON_COLUMNS * cell,
+                                         height=EMOTICON_GRID_ROWS * cell)
+        vbar = ttk.Scrollbar(body, orient="vertical",
+                             command=self._emoticon_canvas.yview)
+        self._emoticon_canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        self._emoticon_canvas.pack(side="left", fill="both", expand=True)
+        self._emoticon_grid = ttk.Frame(self._emoticon_canvas)
+        self._emoticon_grid_id = self._emoticon_canvas.create_window(
+            (0, 0), window=self._emoticon_grid, anchor="nw")
+        self._emoticon_grid.bind(
+            "<Configure>",
+            lambda _e: self._emoticon_canvas.configure(
+                scrollregion=self._emoticon_canvas.bbox("all")))
+        self._emoticon_canvas.bind(
+            "<Configure>",
+            lambda e: self._emoticon_canvas.itemconfigure(self._emoticon_grid_id,
+                                                          width=e.width))
+        self._emoticon_canvas.bind("<MouseWheel>", self._on_emoticon_wheel)
+        self._emoticon_grid.bind("<MouseWheel>", self._on_emoticon_wheel)
         self._emoticon_popup = win
 
     def _close_emoticon_popup(self) -> None:
@@ -1353,6 +1412,8 @@ class ScMonitorApp:
         self._emoticon_popup = None
         self._emoticon_popup_room = None
         self._emoticon_buttons = {}
+        self._emoticon_packages = []
+        self._emoticon_page = 0
         if win is not None:
             try:
                 win.destroy()
@@ -1363,41 +1424,85 @@ class ScMonitorApp:
         api = self.hub.api
         if api is None:
             return
-        items = await api.get_room_emoticons(self._room_id_map.get(room_id, room_id))
-        self.ui_queue.put(("emoticons", {"room_id": room_id, "items": items}))
+        packages = await api.get_room_emoticons(self._room_id_map.get(room_id, room_id))
+        self.ui_queue.put(("emoticons", {"room_id": room_id, "packages": packages}))
 
     def _on_emoticons(self, payload: dict) -> None:
         room_id = int(payload.get("room_id") or 0)
-        items = payload.get("items") or []
-        self._emoticons[room_id] = items
+        packages = payload.get("packages") or []
+        self._emoticons[room_id] = packages
         if self._emoticon_popup is None or self._emoticon_popup_room != room_id:
             return  # 弹窗已关闭或已切到其他房间，仅入缓存
-        self._render_emoticons(room_id, items, "")
+        self._render_emoticons(room_id, packages, "")
 
-    def _render_emoticons(self, room_id: int, items: Optional[List[dict]],
+    def _render_emoticons(self, room_id: int, packages: Optional[List[dict]],
                           hint: str) -> None:
-        """把表情渲染为网格按钮；图片异步加载，未就绪时先显示触发词文字。"""
+        """载入某房间的表情包并显示第一页。"""
         if self._emoticon_popup is None:
             return
         for child in self._emoticon_grid.winfo_children():
             child.destroy()
         self._emoticon_buttons = {}
-        if not items:
+        self._emoticon_packages = list(packages or [])
+        if not self._emoticon_packages:
+            self._emoticon_pkg_box.configure(values=[])
+            self._emoticon_pkg_var.set("")
+            self._emoticon_page_var.set("")
+            self._emoticon_prev_btn.configure(state="disabled")
+            self._emoticon_next_btn.configure(state="disabled")
             self._emoticon_hint_var.set(
                 hint or "该直播间暂无可用专属表情（需已登录，且账号在该房间有可用表情）")
             return
-        self._emoticon_hint_var.set(f"点击即发送（与网页端一致）；共 {len(items)} 个可用表情")
+        self._emoticon_hint_var.set("点击表情即发送（与网页端一致）；表情较多时可滚轮/拖动滚动条查看")
+        self._emoticon_pkg_box.configure(
+            values=[self._emoticon_pkg_label(i, p)
+                    for i, p in enumerate(self._emoticon_packages)])
+        self._show_emoticon_page(0)
+
+    @staticmethod
+    def _emoticon_pkg_label(index: int, package: dict) -> str:
+        """分页下拉里展示的包名（带序号，便于确认分页位置）。"""
+        return f"{index + 1}. {package.get('name') or '表情'}"
+
+    def _show_emoticon_page(self, index: int) -> None:
+        """显示第 index 个表情包（一页 = 一个包，与直播间内面板一致）。"""
+        packages = self._emoticon_packages
+        if self._emoticon_popup is None or not packages:
+            return
+        index = max(0, min(index, len(packages) - 1))
+        self._emoticon_page = index
+        package = packages[index]
+        emoticons = package.get("emoticons") or []
+        for child in self._emoticon_grid.winfo_children():
+            child.destroy()
+        self._emoticon_buttons = {}
+        self._emoticon_pkg_var.set(self._emoticon_pkg_label(index, package))
+        self._emoticon_page_var.set(
+            f"第 {index + 1} / {len(packages)} 包 · 共 {len(emoticons)} 个表情")
+        self._emoticon_prev_btn.configure(state="normal" if index > 0 else "disabled")
+        self._emoticon_next_btn.configure(
+            state="normal" if index < len(packages) - 1 else "disabled")
+        try:
+            self._emoticon_canvas.yview_moveto(0)
+        except tk.TclError:
+            return
         missing: List[str] = []
-        for index, item in enumerate(items):
+        for position, item in enumerate(emoticons):
             url = str(item.get("url") or "")
             image = self._emoticon_images.get(url)
-            btn = tk.Button(self._emoticon_grid, text=str(item.get("text") or url),
-                            width=7, height=2, relief="groove",
-                            command=lambda it=item: self._send_emoticon(it))
+            btn = tk.Button(
+                self._emoticon_grid, text=str(item.get("text") or url),
+                width=8, height=3, relief="groove",
+                wraplength=EMOTICON_ICON_MAX_PX * 2,
+                padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD,
+                command=lambda it=item: self._send_emoticon(it))
             if image is not None:
-                btn.configure(image=image, text="")
-            btn.grid(row=index // EMOTICON_COLUMNS, column=index % EMOTICON_COLUMNS,
-                     padx=2, pady=2, sticky="nsew")
+                # 图片就绪：按钮按图片自然尺寸（+内边距）显示，图标更大更清楚
+                btn.configure(image=image, text="", width=0, height=0)
+            btn.grid(row=position // EMOTICON_COLUMNS,
+                     column=position % EMOTICON_COLUMNS,
+                     padx=EMOTICON_GRID_PAD, pady=EMOTICON_GRID_PAD)
+            btn.bind("<MouseWheel>", self._on_emoticon_wheel)
             if url:
                 self._emoticon_buttons[url] = btn
                 if image is None and url not in self._emoticon_pending:
@@ -1405,6 +1510,27 @@ class ScMonitorApp:
         if missing:
             self._emoticon_pending.update(missing)
             self.hub.submit(self._async_load_emoticon_images(missing))
+
+    def _on_emoticon_prev_page(self) -> None:
+        self._show_emoticon_page(self._emoticon_page - 1)
+
+    def _on_emoticon_next_page(self) -> None:
+        self._show_emoticon_page(self._emoticon_page + 1)
+
+    def _on_emoticon_pkg_selected(self, _event=None) -> None:
+        values = [str(v) for v in self._emoticon_pkg_box.cget("values")]
+        try:
+            index = values.index(self._emoticon_pkg_var.get())
+        except ValueError:
+            return
+        self._show_emoticon_page(index)
+
+    def _on_emoticon_wheel(self, event) -> None:
+        """滚轮翻动表情网格（Tk 不会自动向上冒泡，故逐个按钮也要绑定）。"""
+        try:
+            self._emoticon_canvas.yview_scroll(int(-event.delta / 120), "units")
+        except (tk.TclError, AttributeError):
+            pass
 
     async def _async_load_emoticon_images(self, urls: List[str]) -> None:
         """后台下载表情图片（限流 4 并发）；解码只能在主线程做（Tk 限制）。"""
@@ -1455,7 +1581,7 @@ class ScMonitorApp:
         btn = self._emoticon_buttons.get(url)
         try:
             if btn is not None and btn.winfo_exists():
-                btn.configure(image=image, text="")
+                btn.configure(image=image, text="", width=0, height=0)
         except tk.TclError:
             pass  # 弹窗已关闭，按钮已销毁：仅保留图片缓存供下次打开复用
 
@@ -1594,13 +1720,16 @@ class ScMonitorApp:
             dm_tag = f"dm:{dmid}" if dmid else ""
             if dmid:
                 self._remember_dm_meta(dmid, uid, uname, content)
-            # dmbody:<dmid> 标记正文段，供「点击正文复制」精确定位（点时间不触发）
+            # dmbody:<dmid> 标记正文段，供「点击正文复制」精确定位（点时间不触发）；
+            # 行尾换行只带 dm:<dmid>（供右键回复），不带 dmbody——否则点击该行
+            # 右侧的空白区域也会误判为"点在正文上"
             body_tag = f"dmbody:{dmid}" if dmid else "dmbody"
             text.insert("end", f"[{time_str[11:19] or time_str}] ",
                         f"dm_time {dm_tag}".strip())
             user_tag = f"dm_user dmuid:{uid}" if uid else "dm_user"
             text.insert("end", f"{uname}：", f"{user_tag} {dm_tag}".strip())
-            text.insert("end", f"{content}\n", f"{dm_tag} {body_tag}".strip())
+            text.insert("end", content, f"{dm_tag} {body_tag}".strip())
+            text.insert("end", "\n", dm_tag or ())
         text.configure(state="disabled")
         if follow:
             text.see("end")
