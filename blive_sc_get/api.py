@@ -256,6 +256,16 @@ class BilibiliLiveAPI:
         """WebSocket 握手用的请求头。"""
         return {"User-Agent": USER_AGENT}
 
+    def image_headers(self) -> Dict[str, str]:
+        """下载图片资源用的请求头。
+
+        带 Referer/Origin：表情等 CDN 资源有防盗链校验，缺 Referer 时部分
+        资源会返回 403（表现为对应直播间的表情全部显示为文字）。
+        """
+        return {"User-Agent": USER_AGENT,
+                "Referer": "https://live.bilibili.com/",
+                "Origin": "https://live.bilibili.com"}
+
     async def _get_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         async with self.session.get(url, params=params, headers=self._headers()) as resp:
             resp.raise_for_status()

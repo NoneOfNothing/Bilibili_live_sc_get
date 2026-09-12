@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import math
 import queue
@@ -19,6 +20,11 @@ import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime
+
+try:  # 可选依赖：用于把 WebP 等 Tk 不支持的图片格式转成 PNG（缺失时回退为文字）
+    from PIL import Image
+except ImportError:
+    Image = None
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Tuple
@@ -703,6 +709,8 @@ class ScMonitorApp:
         self.emoticon_tooltip = _EmoticonTooltip(root)
         self._emoticon_tip_id: Optional[str] = None   # 延时弹出的 after id
         self._emoticon_tip_key = ""                   # 当前正在提示的表情（去抖/去重）
+        # 有原图时是否只显示图：弹幕区是（触发词已在弹幕里），面板不是（需要看触发词）
+        self._emoticon_tip_image_only = False
         # 以下状态仅主线程读写
         self.client_states: Dict[int, str] = {}  # starting/running/stopped/occupied/disabled
         self.live_state: Dict[int, str] = {}     # 最近一次的直播状态文本
@@ -2128,7 +2136,7 @@ class ScMonitorApp:
     async def _download_emoticon_image(self, api, url: str, semaphore) -> None:
         try:
             async with semaphore:
-                async with api.session.get(url, headers=api.ws_headers()) as resp:
+                async with api.session.get(url, headers=api.image_headers()) as resp:
                     resp.raise_for_status()
                     raw = await resp.read()
         except Exception as exc:
@@ -2155,8 +2163,18 @@ class ScMonitorApp:
         try:
             raw = tk.PhotoImage(master=self.root, data=data)
         except tk.TclError:
-            logger.debug("表情图片格式不受 Tk 支持（如 WebP），保留文字按钮: %s", url)
-            return
+            # WebP 等 Tk 不支持的格式（实测部分直播间房间专属表情是 WebP）：
+            # 用 Pillow 转成 PNG 再解码；未安装 Pillow 时回退为文字
+            converted = self._convert_image_data(data)
+            if converted is None:
+                logger.debug("表情图片格式不受 Tk 支持且无法转换（如 WebP，需 Pillow）: %s",
+                             url)
+                return
+            try:
+                raw = tk.PhotoImage(master=self.root, data=converted)
+            except tk.TclError:
+                logger.debug("表情图片转换后仍无法解码: %s", url)
+                return
         image = self._scale_photo(raw)
         if len(self._emoticon_images) >= EMOTICON_IMAGE_CACHE_MAX:
             self._emoticon_images.clear()
@@ -2192,6 +2210,24 @@ class ScMonitorApp:
             return image.zoom(zoom, zoom).subsample(sub, sub)
         except tk.TclError:
             return image
+
+    @staticmethod
+    def _convert_image_data(data: str) -> Optional[str]:
+        """用 Pillow 把 Tk 不支持的图片数据（如 WebP）转成 PNG base64。
+
+        返回转换后的 base64；Pillow 未安装或转换失败时返回 None。
+        """
+        if Image is None:
+            return None
+        try:
+            src = Image.open(io.BytesIO(base64.b64decode(data)))
+            if src.mode not in ("RGB", "RGBA"):
+                src = src.convert("RGBA")
+            buffer = io.BytesIO()
+            src.save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode("ascii")
+        except Exception:
+            return None
 
     # ---------- 弹幕区表情（悬浮显示原图） ----------
 
@@ -2261,8 +2297,9 @@ class ScMonitorApp:
     # ---------- 表情悬浮提示（ROADMAP 40） ----------
 
     def _on_emoticon_hover(self, info: dict, event) -> None:
-        """鼠标进入表情按钮：安排一次延时提示。"""
+        """鼠标进入表情按钮：安排一次延时提示（面板里触发词信息更有用）。"""
         self._emoticon_tip_key = str(info.get("unique") or "")
+        self._emoticon_tip_image_only = False
         self._cancel_emoticon_tooltip()
         self._schedule_emoticon_tooltip(info, event)
 
@@ -2296,8 +2333,8 @@ class ScMonitorApp:
         image = self._emoticon_images.get(url)
         if url and image is None and self._emoticon_tip_key == unique:
             self._request_dm_emoticon_image(url)
-        if image is not None:
-            text = ""
+        if image is not None and self._emoticon_tip_image_only:
+            text = ""  # 弹幕区：原图即可，触发词与弹幕内容重复
         self.emoticon_tooltip.show(
             text, self.root.winfo_pointerx(), self.root.winfo_pointery(), image=image)
 
@@ -2323,6 +2360,7 @@ class ScMonitorApp:
         if key == self._emoticon_tip_key:
             return  # 仍在同一个表情上：不重排也不闪
         self._emoticon_tip_key = key
+        self._emoticon_tip_image_only = True  # 弹幕里已有触发词，提示窗只放原图
         self._cancel_emoticon_tooltip()
         self.emoticon_tooltip.hide()
         if info:

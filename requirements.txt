@@ -1,3 +1,5 @@
 aiohttp>=3.8.6,<4
 Brotli>=1.0.9
 pycryptodome>=3.19
+
+Pillow>=10.0
