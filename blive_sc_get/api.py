@@ -16,6 +16,12 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from .medal_tasks import (
+    dedupe_medals,
+    parse_medal_panel,
+    parse_task_info_list,
+)
+
 logger = logging.getLogger(__name__)
 
 USER_AGENT = (
@@ -34,9 +40,31 @@ ROOM_EMOTICON_URL = (
     "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
 )
 GUARD_TOP_LIST_URL = "https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList"
+MEDAL_PANEL_URL = "https://api.live.bilibili.com/xlive/app-ucenter/v1/fansMedal/panel"
+MEDAL_TASK_URL = (
+    "https://api.live.bilibili.com/xlive/app-ucenter/v1/fansMedal/GetActivatedMedalInfo"
+)
+LIKE_REPORT_URL = (
+    "https://api.live.bilibili.com/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3"
+)
+LIKE_INTERACT_URL = (
+    "https://api.live.bilibili.com/xlive/web-ucenter/v1/interact/likeInteract"
+)
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 HOMEPAGE_URL = "https://www.bilibili.com/"
 BUVID_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+
+MEDAL_PANEL_PAGE_SIZE = 10
+"""粉丝勋章列表分页大小；接口上限为 10，超出会报参数异常。"""
+
+MEDAL_PANEL_MAX_PAGES = 50
+"""分页安全上限，避免服务端异常时无限翻页。"""
+
+MEDAL_WEB_LOCATION = "444.260"
+"""粉丝牌任务接口的 web_location 埋点值（对齐网页端调用）。"""
+
+LIKE_WEB_LOCATION = "444.8"
+"""点赞接口的 web_location 埋点值。"""
 
 DEFAULT_DANMU_HOST = "broadcastlv.chat.bilibili.com"
 DEFAULT_WSS_PORT = 443
@@ -90,6 +118,31 @@ def describe_send_error(code: Any, message: str = "") -> str:
     if message:
         return f"发送失败：{message}（code={code}）"
     return f"发送失败（code={code}）"
+
+
+# 点赞接口返回码 -> 中文提示（供 GUI 与日志复用）
+LIKE_ERROR_HINTS = {
+    -101: "账号未登录：请在浏览器登录 B 站后用「获取Cookie」重新获取已登录的 Cookie",
+    -111: "csrf 校验失败：Cookie 中的 bili_jct 与请求不一致，请重新获取 Cookie",
+    -400: "请求参数错误",
+    -352: "触发风控，请稍后再试或检查 Cookie",
+    -403: "触发风控（无权操作）",
+    -412: "触发风控（请求被拦截）",
+}
+
+
+def describe_like_error(code: Any, message: str = "") -> str:
+    """把点赞接口的返回码映射为中文可读提示（纯函数，供 API 与 GUI 复用）。"""
+    try:
+        key = int(code)
+    except (TypeError, ValueError):
+        key = None
+    hint = LIKE_ERROR_HINTS.get(key)
+    if hint:
+        return f"{hint}（code={code}）"
+    if message:
+        return f"点赞失败：{message}（code={code}）"
+    return f"点赞失败（code={code}）"
 
 
 def parse_room_emoticon_packages(data: Any) -> List[Dict[str, Any]]:
@@ -286,6 +339,19 @@ class BilibiliLiveAPI:
             raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(payload)[:120]}")
         return payload
 
+    async def _post_query_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST 请求（参数放 query、body 为空）返回 JSON 对象。
+
+        点赞 likeReportV3 等接口把业务参数（含 WBI 签名）放在 query、body 为空，
+        与 :meth:`_post_form_json`（表单 body）区分开。
+        """
+        async with self.session.post(url, params=params, headers=self._headers()) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
+        if not isinstance(payload, dict):
+            raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(payload)[:120]}")
+        return payload
+
     async def init_session_info(self) -> None:
         """尽量拿到 buvid3（弹幕接口风控需要）和登录 uid；失败不致命，只打日志。"""
         if not self.buvid3:
@@ -406,6 +472,133 @@ class BilibiliLiveAPI:
             return int(info.get("num") or 0)
         except (TypeError, ValueError):
             return -1
+
+    async def get_medals(self) -> List[Dict[str, Any]]:
+        """分页拉取账号持有的粉丝勋章（等级 / 亲密度 / 主播 / 房间等）。
+
+        需已登录（Cookie 含 SESSDATA）；未提供 Cookie 时抛 ApiError(-101)，
+        接口返回非 0 抛 ApiError。跨页按 ``medal_id`` 去重，``special_list``
+        （当前佩戴）排在前面。
+        """
+        if not self.has_cookie:
+            raise ApiError("获取粉丝牌", -101,
+                           "未提供 cookie，请先用「获取Cookie」获取已登录的 Cookie")
+        medals: List[Dict[str, Any]] = []
+        page = 1
+        while page <= MEDAL_PANEL_MAX_PAGES:
+            data = await self._get_json(
+                MEDAL_PANEL_URL,
+                {"page": page, "page_size": MEDAL_PANEL_PAGE_SIZE},
+            )
+            if data.get("code") != 0:
+                raise ApiError("获取粉丝牌", data.get("code"), data.get("message", ""))
+            info = data.get("data") or {}
+            page_medals = parse_medal_panel(info)
+            medals.extend(page_medals)
+            page_info = info.get("page_info") or {}
+            total_page = _as_int(page_info.get("total_page"))
+            has_raw = bool(info.get("list") or info.get("special_list"))
+            if not has_raw or not page_medals:
+                break
+            if total_page and page >= total_page:
+                break
+            page += 1
+        return dedupe_medals(medals)
+
+    async def get_medal_task_info(self, target_id: int) -> Dict[str, Any]:
+        """查询指定主播（``target_id`` = 主播 uid）的粉丝牌任务信息。
+
+        返回 ``{"target_id", "tasks", "free_intimacy", "reach_free_intimacy_limit"}``，
+        其中 ``tasks`` 为 ``medal_tasks.normalize_task`` 归一化后的任务列表
+        （``jump_type`` / ``title`` / ``current`` / ``limit`` / ``is_done``），
+        任务上限随粉丝牌等级变化、每日刷新，一律以接口为准。
+
+        需已登录且 Cookie 含 ``bili_jct``（csrf）；失败抛 ApiError。
+        """
+        if not self.has_cookie:
+            raise ApiError("获取粉丝牌任务", -101,
+                           "未提供 cookie，请先用「获取Cookie」获取已登录的 Cookie")
+        if not self.csrf:
+            raise ApiError("获取粉丝牌任务", -111,
+                           "Cookie 中缺少 bili_jct，请重新「获取Cookie」")
+        if not target_id:
+            raise ApiError("获取粉丝牌任务", -400, "缺少主播 uid")
+        params = {
+            "csrf": self.csrf,
+            "target_id": int(target_id),
+            "web_location": MEDAL_WEB_LOCATION,
+        }
+        data = await self._get_json(MEDAL_TASK_URL, params)
+        if data.get("code") != 0:
+            raise ApiError("获取粉丝牌任务", data.get("code"), data.get("message", ""))
+        info = data.get("data") or {}
+        return {
+            "target_id": int(target_id),
+            "tasks": parse_task_info_list(info),
+            "free_intimacy": _as_int(info.get("free_intimacy")),
+            "reach_free_intimacy_limit": bool(info.get("reach_free_intimacy_limit")),
+        }
+
+    async def like_room(self, room_id: int, anchor_uid: int, *,
+                        click_time: int = 1) -> Dict[str, Any]:
+        """给直播间点赞（写操作，需已登录且 Cookie 含 bili_jct）。
+
+        优先 ``likeReportV3``（WBI 签名、参数在 query、body 为空）；仅在**非风控类**
+        失败（含网络异常）时回退免签名的 ``likeInteract``。风控码
+        （``-352/-403/-412``）与未登录/缺 csrf 直接抛出，不再重试，避免加剧风控。
+        """
+        if not self.has_cookie:
+            raise ApiError("点赞", -101,
+                           "未提供 cookie，请先用「获取Cookie」获取已登录的 Cookie")
+        csrf = self.csrf
+        if not csrf:
+            raise ApiError("点赞", -111, "Cookie 中缺少 bili_jct，请重新「获取Cookie」")
+        clicks = max(1, int(click_time))
+        try:
+            return await self._like_via_report(room_id, anchor_uid, clicks, csrf)
+        except ApiError as exc:
+            if exc.code in RISK_CONTROL_CODES or exc.code in (-101, -111):
+                raise
+            logger.debug("likeReportV3 失败（code=%s），回退 likeInteract", exc.code)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.debug("likeReportV3 网络异常（%s），回退 likeInteract", exc)
+        return await self._like_via_interact(room_id, csrf)
+
+    async def _like_via_report(self, room_id: int, anchor_uid: int,
+                               click_time: int, csrf: str) -> Dict[str, Any]:
+        """likeReportV3：参数（含 WBI 签名）放 query，body 为空。"""
+        try:
+            await self._ensure_wbi_key()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
+            logger.debug("获取 wbi 密钥失败，点赞将不带签名: %s", exc)
+        params: Dict[str, Any] = {
+            "click_time": click_time,
+            "room_id": int(room_id),
+            "uid": int(self.uid),
+            "anchor_id": int(anchor_uid),
+            "web_location": LIKE_WEB_LOCATION,
+            "csrf": csrf,
+        }
+        params = self._add_wbi_sign(params)
+        payload = await self._post_query_json(LIKE_REPORT_URL, params)
+        code = payload.get("code")
+        if code != 0:
+            raise ApiError("点赞", code, payload.get("message") or payload.get("msg") or "")
+        return payload
+
+    async def _like_via_interact(self, room_id: int, csrf: str) -> Dict[str, Any]:
+        """likeInteract：免 WBI 的网页端点赞备选（单次点击）。"""
+        data = {
+            "platform": "pc",
+            "roomid": int(room_id),
+            "csrf": csrf,
+            "csrf_token": csrf,
+        }
+        payload = await self._post_form_json(LIKE_INTERACT_URL, data)
+        code = payload.get("code")
+        if code != 0:
+            raise ApiError("点赞", code, payload.get("message") or payload.get("msg") or "")
+        return payload
 
     async def get_room_id_by_uid(self, mid: int) -> int:
         """通过主播 uid 查询其直播间房间号（用于个人空间网址添加直播间）。

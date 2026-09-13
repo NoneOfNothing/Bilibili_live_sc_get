@@ -32,13 +32,28 @@ EMOTICON_TOOLTIP_FIELDS = ("text", "unique", "id")
 DEFAULT_EMOTICON_TOOLTIP: Tuple[str, ...] = ("text",)
 """悬浮提示的默认字段：**仅触发词**（可在 config.json 的 emoticon_tooltip 段增删）。"""
 
+DEFAULT_MEDAL_LIKE_INTERVAL: Tuple[float, float] = (15.0, 20.0)
+"""自动点赞两次之间的随机间隔（秒），降低风控风险。"""
+
+DEFAULT_MEDAL_DANMAKU_INTERVAL: Tuple[float, float] = (6.0, 8.0)
+"""自动发送弹幕两次之间的随机间隔（秒），降低刷屏/风控风险。"""
+
+DEFAULT_MEDAL_MAX_RETRY: int = 3
+"""单个写任务**连续无进展/失败**多少次后停止本轮（等待下次或自动任务下一轮继续）。"""
+
 DEFAULT_CONFIG_TEMPLATE = """{
-  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
+  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，仍需在界面里对具体房间开启，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
   "allow_write_operations": false,
   "emoticon_tooltip": {
     "text": true,
     "unique": false,
     "id": false
+  },
+  "medal_tasks": {
+    "auto": false,
+    "like_interval_sec": [15, 20],
+    "danmaku_interval_sec": [6, 8],
+    "max_retry": 3
   }
 }
 """
@@ -57,6 +72,22 @@ class AppConfig:
 
     默认仅 ``text``（触发词）；给空元组表示不显示悬浮提示。
     """
+
+    auto_medal_tasks: bool = False
+    """粉丝牌任务「全自动」总开关（默认 False）。
+
+    仅当此开关与**具体房间**的自动开关同时开启、且 ``allow_write_operations``
+    为 True 时，该房间才会后台自动执行点赞/发弹幕任务。
+    """
+
+    medal_like_interval: Tuple[float, float] = DEFAULT_MEDAL_LIKE_INTERVAL
+    """自动点赞的随机间隔区间（秒）。"""
+
+    medal_danmaku_interval: Tuple[float, float] = DEFAULT_MEDAL_DANMAKU_INTERVAL
+    """自动发弹幕的随机间隔区间（秒）。"""
+
+    medal_max_retry: int = DEFAULT_MEDAL_MAX_RETRY
+    """单个写任务**连续无进展/失败**多少次后停止本轮。"""
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -95,6 +126,34 @@ def _parse_tooltip_fields(value: Any) -> Tuple[str, ...]:
     return matched or DEFAULT_EMOTICON_TOOLTIP
 
 
+def _parse_interval(value: Any, default: Tuple[float, float]) -> Tuple[float, float]:
+    """解析 ``[最小, 最大]`` 间隔区间；非法值回退默认（负值/类型错/长度不为 2）。
+
+    最大值小于最小值时自动交换，保证返回 ``(low <= high)``。
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return default
+    try:
+        low = float(value[0])
+        high = float(value[1])
+    except (TypeError, ValueError):
+        return default
+    if low < 0 or high < 0:
+        return default
+    if high < low:
+        low, high = high, low
+    return (low, high)
+
+
+def _parse_retry(value: Any, default: int, *, upper: int = 10) -> int:
+    """解析重试上限：仅接受非负整数，超过上限则截断到 ``upper``。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    if value < 0:
+        return default
+    return min(value, upper)
+
+
 def _write_default_config(config_path: Path) -> None:
     """首次运行（或文件不存在）时生成带字段说明的默认配置文件。
 
@@ -128,7 +187,17 @@ def load_app_config(path: Optional[Union[str, Path]] = None) -> AppConfig:
     raw: Dict[str, Any] = data if isinstance(data, dict) else {}
     if not isinstance(data, dict):
         logger.warning("应用配置格式异常（应为 JSON 对象），使用默认（写操作关闭）")
+    medal_raw = raw.get("medal_tasks")
+    medal = medal_raw if isinstance(medal_raw, dict) else {}
+    if medal_raw is not None and not isinstance(medal_raw, dict):
+        logger.warning("配置 medal_tasks 应为对象，使用默认（自动任务关闭）")
     return AppConfig(
         allow_write_operations=_as_bool(raw.get("allow_write_operations"), False),
         emoticon_tooltip=_parse_tooltip_fields(raw.get("emoticon_tooltip")),
+        auto_medal_tasks=_as_bool(medal.get("auto"), False),
+        medal_like_interval=_parse_interval(
+            medal.get("like_interval_sec"), DEFAULT_MEDAL_LIKE_INTERVAL),
+        medal_danmaku_interval=_parse_interval(
+            medal.get("danmaku_interval_sec"), DEFAULT_MEDAL_DANMAKU_INTERVAL),
+        medal_max_retry=_parse_retry(medal.get("max_retry"), DEFAULT_MEDAL_MAX_RETRY),
     )

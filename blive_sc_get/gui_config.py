@@ -42,6 +42,13 @@ class RoomEntry:
     notify_live: bool = True
     """该直播间开播时是否提醒（提示音 + 任务栏闪烁）。"""
 
+    auto_medal_tasks: bool = False
+    """该直播间是否加入「粉丝牌任务」全自动执行（默认关闭）。
+
+    仅在 ``config.json`` 的 ``medal_tasks.auto`` 与 ``allow_write_operations``
+    同时开启时生效；关闭时仍可用每房间的「一键完成」手动执行。
+    """
+
 
 def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
     """读取房间列表；文件缺失或损坏时返回空列表。"""
@@ -70,6 +77,7 @@ def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
             enabled=bool(item.get("enabled", True)),
             uid=int(item.get("uid") or 0),
             notify_live=bool(item.get("notify_live", True)),
+            auto_medal_tasks=bool(item.get("auto_medal_tasks", False)),
         ))
     return entries
 

@@ -42,6 +42,14 @@ from .browser_cookie import get_bilibili_cookie
 from .browser_rooms import is_room_being_recorded
 from .cli import COOKIE_FILE_NAME, _pending_flush_loop, parse_room_id, resolve_cookie
 from .client import LIVE_STATUS_TEXT, RoomClient
+from .medal_runner import MedalTaskRunner
+from .medal_tasks import (
+    TASK_LIKE,
+    TASK_SEND_DANMAKU,
+    TASK_WATCH_LIVE,
+    is_task_complete,
+    task_label,
+)
 from .gui_config import (
     NOTIFY_SOUNDS,
     RoomEntry,
@@ -170,6 +178,18 @@ BOTTOM_HOLD_DEBOUNCE_MS = 80
 只在停下后处理一次，避免频繁 `see("end")`。"""
 
 SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(\d+)")
+
+MEDAL_AUTO_INTERVAL_MS = 5 * 60 * 1000
+"""粉丝牌自动任务的检查间隔（毫秒）：每轮为「开启自动」的房间补做未完成任务。"""
+
+MEDAL_TASK_REFRESH_GAP_S = 0.5
+"""批量刷新各房间粉丝牌任务时的请求间隔（秒），避免瞬时并发触发风控。"""
+
+MEDAL_LINK_COLUMNS = {"#3": "space", "#4": "room"}
+"""「我持有的粉丝牌」表的跳转列：#3 主播 → 个人空间、#4 房间 → 直播间。"""
+
+MEDAL_TASK_LINK_COLUMNS = {"#1": "room", "#2": "space"}
+"""「监听房间 · 任务」表的跳转列：#1 房间 → 直播间、#2 主播 → 个人空间。"""
 
 DM_LINE_PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*")
 """弹幕行首的「[时间] 」前缀，用于从整行文本还原弹幕正文。"""
@@ -722,6 +742,19 @@ class ScMonitorApp:
         self._sc_total: Dict[int, int] = {}  # 房间号 -> 当前累计 SC 条数（含历史+实时）
         self._resize_wrap_frozen = False   # 拖动窗口期间 SC 文本暂停 word 换行
         self._wrap_restore_id: Optional[str] = None
+        # 粉丝牌（任务）状态（仅主线程读写）
+        self._medals: List[dict] = []                 # 账号粉丝牌列表（panel 结果）
+        self._medal_levels_room: Dict[int, int] = {}  # 房间号 -> 粉丝牌等级
+        self._medal_levels_uid: Dict[int, int] = {}   # 主播 uid -> 粉丝牌等级
+        self._medal_names_room: Dict[int, str] = {}   # 房间号 -> 粉丝牌名称
+        self._medal_names_uid: Dict[int, str] = {}    # 主播 uid -> 粉丝牌名称
+        self._medal_uid_by_iid: Dict[str, int] = {}   # 粉丝牌行 iid -> 主播 uid（跳转用）
+        self._medal_room_by_iid: Dict[str, int] = {}  # 粉丝牌行 iid -> 房间号（跳转用）
+        self._medal_pending = None                    # 按下待跳转的单元格（点击保护）
+        self._medal_tasks: Dict[int, dict] = {}       # 房间号 -> {tasks, error, ...}
+        self._medal_running: set = set()              # 正在执行任务的输入房间号
+        self._medal_runner: Optional[MedalTaskRunner] = None
+        self._medal_auto_after_id: Optional[str] = None
 
         self._setup_logging()
         logger.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
@@ -731,8 +764,12 @@ class ScMonitorApp:
         # 拖动窗口大小时暂停 SC 文本 word 换行，停止后恢复（见 _on_root_configure）
         self.root.bind("<Configure>", self._on_root_configure)
         self._populate_rows()
+        self._sync_medal_task_rows()
+        self._update_medal_status()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queue()
+        self._medal_auto_after_id = self.root.after(
+            MEDAL_AUTO_INTERVAL_MS, self._medal_auto_tick)
         self.hub.start()
 
     # ---------- UI 构建 ----------
@@ -756,8 +793,11 @@ class ScMonitorApp:
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=6, pady=6)
+        self._notebook = notebook
         self._build_rooms_tab(notebook)
+        self._build_medal_tab(notebook)
         self._build_debug_tab(notebook)
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_rooms_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook)
@@ -1072,6 +1112,621 @@ class ScMonitorApp:
         self.debug_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
         self._bind_autoscroll(self.debug_text)
 
+    # ---------- 粉丝牌 / 任务 ----------
+
+    def _build_medal_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text="粉丝牌")
+        self._medal_tab = tab
+
+        bar = ttk.Frame(tab)
+        bar.pack(side="top", fill="x", padx=6, pady=(6, 2))
+        ttk.Button(bar, text="刷新粉丝牌", command=self._on_refresh_medals).pack(side="left")
+        self.medal_status_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.medal_status_var,
+                  foreground="#666666").pack(side="left", padx=(8, 0))
+
+        ttk.Label(tab, text="我持有的粉丝牌（点击主播 / 房间可跳转）").pack(anchor="w", padx=6)
+        medal_wrap = ttk.Frame(tab)
+        medal_wrap.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 6))
+        mcols = ("name", "level", "anchor", "room", "today", "exp", "state")
+        self.medal_hscroll = ttk.Scrollbar(medal_wrap, orient="horizontal")
+        self.medal_tree = ttk.Treeview(medal_wrap, columns=mcols, show="headings", height=6,
+                                       xscrollcommand=self.medal_hscroll.set)
+        self.medal_hscroll.configure(command=self.medal_tree.xview)
+        for col, text, width, minwidth, anchor in (
+            ("name", "勋章", 120, 80, "w"),
+            ("level", "等级", 50, 40, "center"),
+            ("anchor", "主播", 150, 80, "w"),
+            ("room", "房间", 100, 70, "center"),
+            ("today", "今日亲密度", 100, 80, "center"),
+            ("exp", "当前/升级需", 110, 90, "center"),
+            ("state", "状态", 110, 80, "center"),
+        ):
+            self.medal_tree.heading(col, text=text)
+            self.medal_tree.column(col, width=width, minwidth=minwidth,
+                                   anchor=anchor, stretch=False)
+        mscroll = ttk.Scrollbar(medal_wrap, command=self.medal_tree.yview)
+        self.medal_tree.configure(yscrollcommand=mscroll.set)
+        mscroll.pack(side="right", fill="y")
+        self.medal_hscroll.pack(side="bottom", fill="x")
+        self.medal_tree.pack(side="left", fill="both", expand=True)
+        self.medal_tree.bind("<ButtonPress-1>", self._on_medal_press, add=True)
+        self.medal_tree.bind("<ButtonRelease-1>", self._on_medal_release, add=True)
+
+        ttk.Label(tab, text="监听房间 · 粉丝牌任务（上限随等级提升、每日刷新；点击主播 / 房间可跳转）").pack(
+            anchor="w", padx=6)
+        task_wrap = ttk.Frame(tab)
+        task_wrap.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 4))
+        tcols = ("room", "anchor", "level", "watch", "danmaku", "like", "auto")
+        self.medal_task_hscroll = ttk.Scrollbar(task_wrap, orient="horizontal")
+        self.medal_task_tree = ttk.Treeview(task_wrap, columns=tcols, show="headings",
+                                            height=6,
+                                            xscrollcommand=self.medal_task_hscroll.set)
+        self.medal_task_hscroll.configure(command=self.medal_task_tree.xview)
+        for col, text, width, minwidth, anchor in (
+            ("room", "房间", 100, 70, "center"),
+            ("anchor", "主播", 150, 80, "w"),
+            ("level", "粉丝牌", 70, 50, "center"),
+            ("watch", "观看直播", 110, 80, "center"),
+            ("danmaku", "发弹幕", 110, 80, "center"),
+            ("like", "点赞", 110, 80, "center"),
+            ("auto", "自动", 50, 40, "center"),
+        ):
+            self.medal_task_tree.heading(col, text=text)
+            self.medal_task_tree.column(col, width=width, minwidth=minwidth,
+                                        anchor=anchor, stretch=False)
+        tscroll = ttk.Scrollbar(task_wrap, command=self.medal_task_tree.yview)
+        self.medal_task_tree.configure(yscrollcommand=tscroll.set)
+        tscroll.pack(side="right", fill="y")
+        self.medal_task_hscroll.pack(side="bottom", fill="x")
+        self.medal_task_tree.pack(side="left", fill="both", expand=True)
+        self.medal_task_tree.bind("<<TreeviewSelect>>", lambda _e: self._update_medal_buttons())
+        self.medal_task_tree.bind("<ButtonPress-1>", self._on_medal_press, add=True)
+        self.medal_task_tree.bind("<ButtonRelease-1>", self._on_medal_release, add=True)
+
+        self.medal_hint_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.medal_hint_var, foreground="#666666",
+                  wraplength=900, justify="left").pack(anchor="w", padx=6)
+
+        bottom = ttk.Frame(tab)
+        bottom.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+        self.medal_refresh_tasks_btn = ttk.Button(
+            bottom, text="刷新任务（全部监听房间）", command=self._on_refresh_medal_tasks)
+        self.medal_refresh_tasks_btn.pack(side="left")
+        # 按钮顺序与上方任务列表的列顺序（观看直播 / 发弹幕 / 点赞）保持一致
+        self.medal_danmaku_btn = ttk.Button(
+            bottom, text="发弹幕（选中房间）", command=self._on_complete_medal_danmaku)
+        self.medal_danmaku_btn.pack(side="left", padx=(6, 0))
+        self.medal_like_btn = ttk.Button(
+            bottom, text="点赞（选中房间）", command=self._on_complete_medal_like)
+        self.medal_like_btn.pack(side="left", padx=(6, 0))
+        self.medal_auto_var = tk.BooleanVar(value=False)
+        self.medal_auto_check = ttk.Checkbutton(
+            bottom, text="自动完成选中房间（两项都做）", variable=self.medal_auto_var,
+            command=self._on_medal_auto_toggle)
+        self.medal_auto_check.pack(side="left", padx=(10, 0))
+        self._update_medal_buttons()
+
+    def _on_tab_changed(self, _event=None) -> None:
+        """切到「粉丝牌」页签时同步房间行；尚未拉取粉丝牌则自动拉一次。"""
+        try:
+            if self._notebook.select() != str(self._medal_tab):
+                return
+        except Exception:
+            return
+        self._sync_medal_task_rows()
+        self._update_medal_buttons()
+        if not self._medals and self.hub.ready.is_set():
+            self._on_refresh_medals()
+
+    def _medal_master_text(self) -> str:
+        return (f"写操作：{'启用' if self.app_config.allow_write_operations else '关闭'}"
+                f" · 全自动总开关：{'开' if self.app_config.auto_medal_tasks else '关'}")
+
+    def _update_medal_status(self) -> None:
+        if hasattr(self, "medal_status_var"):
+            self.medal_status_var.set(self._medal_master_text())
+
+    def _medal_info_for(self, room_id: int, uid: int = 0):
+        """返回该房间的（粉丝牌名称, 等级）；未持有该主播粉丝牌时返回 ("", 0)。"""
+        if room_id in self._medal_levels_room:
+            return (self._medal_names_room.get(room_id, ""),
+                    self._medal_levels_room[room_id])
+        if uid and uid in self._medal_levels_uid:
+            return (self._medal_names_uid.get(uid, ""),
+                    self._medal_levels_uid[uid])
+        return "", 0
+
+    def _medal_level_for(self, room_id: int, uid: int = 0) -> int:
+        return self._medal_info_for(room_id, uid)[1]
+
+    def _get_selected_medal_room(self) -> Optional[int]:
+        tree = getattr(self, "medal_task_tree", None)
+        if tree is None:
+            return None
+        selection = tree.selection()
+        try:
+            return int(selection[0]) if selection else None
+        except (TypeError, ValueError):
+            return None
+
+    def _sync_medal_task_rows(self) -> None:
+        tree = getattr(self, "medal_task_tree", None)
+        if tree is None:
+            return
+        existing = {int(iid) for iid in tree.get_children()}
+        wanted = set(self.entries.keys())
+        for room_id in existing - wanted:
+            tree.delete(str(room_id))
+        for room_id in self.entries:
+            if room_id not in existing:
+                tree.insert("", "end", iid=str(room_id), values=("",) * 7)
+            self._update_medal_task_row(room_id)
+        self._apply_medal_task_order()
+
+    def _apply_medal_task_order(self) -> None:
+        """让「监听房间 · 任务」列表的行顺序与直播间列表**完全一致**（实时跟随）。
+
+        直播间页的排序 / 拖动 / 置顶结果都会即时反映到粉丝牌页；粉丝牌页只跟随、
+        不允许在此单独排序。不在直播间列表中的异常行保持在末尾。
+        """
+        tree = getattr(self, "medal_task_tree", None)
+        if tree is None:
+            return
+        existing = list(tree.get_children())
+        if not existing:
+            return
+        existing_set = set(existing)
+        ordered = [iid for iid in self.tree.get_children() if iid in existing_set]
+        for iid in existing:
+            if iid not in ordered:
+                ordered.append(iid)
+        for index, iid in enumerate(ordered):
+            if tree.index(iid) != index:
+                tree.move(iid, "", index)
+
+    def _update_medal_task_row(self, room_id: int) -> None:
+        tree = getattr(self, "medal_task_tree", None)
+        if tree is None or not tree.exists(str(room_id)):
+            return
+        entry = self.entries.get(room_id)
+        uid = int(entry.uid) if entry else 0
+        level = self._medal_level_for(room_id, uid)
+        info = self._medal_tasks.get(room_id) or {}
+        if info.get("no_medal"):
+            cells = ("无粉丝牌", "无粉丝牌", "无粉丝牌")
+        elif info.get("error"):
+            cells = ("获取失败", "获取失败", "获取失败")
+        else:
+            tasks = info.get("tasks") or []
+            cells = (self._format_medal_task(tasks, TASK_WATCH_LIVE),
+                     self._format_medal_task(tasks, TASK_SEND_DANMAKU),
+                     self._format_medal_task(tasks, TASK_LIKE))
+        tree.item(str(room_id), values=(
+            room_id,
+            self.anchor_names.get(room_id, ""),
+            level or "—",
+            cells[0], cells[1], cells[2],
+            "开" if (entry and entry.auto_medal_tasks) else "关",
+        ))
+
+    @staticmethod
+    def _format_medal_task(tasks: List[dict], jump_type: str) -> str:
+        for task in tasks or []:
+            if task.get("jump_type") != jump_type:
+                continue
+            limit = int(task.get("limit") or 0)
+            current = int(task.get("current") or 0)
+            if is_task_complete(task):
+                return f"{current}/{limit} 完成" if limit else "已完成"
+            if limit <= 0:
+                # sub_title 非进度文案（如「仅点亮」）：当前不适用
+                return "仅点亮"
+            return f"{current}/{limit}"
+        return "—"
+
+    def _update_medal_buttons(self) -> None:
+        if not hasattr(self, "medal_like_btn"):
+            return
+        room_id = self._get_selected_medal_room()
+        has = room_id is not None and room_id in self.entries
+        running = bool(has and room_id in self._medal_running)
+        state = "normal" if (has and not running) else "disabled"
+        self.medal_like_btn.configure(state=state)
+        self.medal_danmaku_btn.configure(state=state)
+        self.medal_auto_check.configure(state="normal" if has else "disabled")
+        if has:
+            self.medal_auto_var.set(bool(self.entries[room_id].auto_medal_tasks))
+
+    def _on_medal_press(self, event) -> None:
+        """按下粉丝牌两张表的跳转列：记录待跳转单元格并**阻止改变选中行**（点击保护）。
+
+        与直播间列表页一致：跳转列（主播 / 房间）按下时返回 "break"，不触发 ttk
+        默认的选中行为；真正的跳转在**松开且未拖动到其它单元格**时才执行，避免
+        拖动列宽/误触时误开浏览器。
+        """
+        self._medal_pending = None
+        tree = event.widget
+        if tree.identify_region(event.x, event.y) != "cell":
+            return None
+        col = tree.identify_column(event.x)
+        mapping = (MEDAL_TASK_LINK_COLUMNS if tree is self.medal_task_tree
+                   else MEDAL_LINK_COLUMNS)
+        kind = mapping.get(col)
+        if not kind:
+            return None
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return None
+        self._medal_pending = (tree, iid, col, kind)
+        return "break"
+
+    def _on_medal_release(self, event) -> None:
+        """松开：仅当仍在同一单元格（即未拖动）时才执行跳转。"""
+        pending = self._medal_pending
+        self._medal_pending = None
+        if pending is None:
+            return
+        tree, iid, col, kind = pending
+        if tree is not event.widget:
+            return
+        if tree.identify_row(event.y) != iid or tree.identify_column(event.x) != col:
+            return
+        self._open_medal_link(tree, iid, kind)
+
+    def _open_medal_link(self, tree, iid: str, kind: str) -> None:
+        """打开粉丝牌表里「主播 → 个人空间」「房间 → 直播间」的链接。"""
+        if kind == "room":
+            room_id = (int(iid) if tree is self.medal_task_tree
+                       else int(self._medal_room_by_iid.get(iid, 0)))
+            if room_id:
+                webbrowser.open(f"https://live.bilibili.com/{room_id}")
+            return
+        # kind == "space"：任务表用房间号反查主播 uid；粉丝牌表直接查映射
+        if tree is self.medal_task_tree:
+            try:
+                room_id = int(iid)
+            except (TypeError, ValueError):
+                return
+            entry = self.entries.get(room_id)
+            uid = int(entry.uid) if entry else 0
+            if not uid:
+                if self.hub.ready.is_set():
+                    # uid 未知：后台查询一次，成功后再点即可跳转（与房间列表页一致）
+                    self.hub.submit(self._async_fetch_uid(room_id))
+                    logger.info("正在获取房间 %s 的主播信息，稍后再次点击主播名即可打开个人空间",
+                                room_id)
+                return
+        else:
+            uid = int(self._medal_uid_by_iid.get(iid, 0))
+        if uid:
+            webbrowser.open(f"https://space.bilibili.com/{uid}")
+
+    # ---------- 粉丝牌：拉取与展示 ----------
+
+    def _on_refresh_medals(self) -> None:
+        if not self.hub.ready.is_set():
+            if hasattr(self, "medal_status_var"):
+                self.medal_status_var.set("后台初始化中，请稍候…")
+            return
+        self.medal_status_var.set("正在获取粉丝牌…")
+        self.hub.submit(self._async_refresh_medals())
+
+    async def _async_fetch_medals(self) -> Optional[List[dict]]:
+        """拉取粉丝牌列表并入队；返回结果（供任务刷新判断「是否持有该主播粉丝牌」）。"""
+        api = self.hub.api
+        if api is None:
+            self.ui_queue.put(("medal_list", {"ok": False, "error": "后台初始化中"}))
+            return None
+        try:
+            medals = await api.get_medals()
+        except ApiError as exc:
+            self.ui_queue.put(("medal_list", {"ok": False, "error": str(exc)}))
+            return None
+        except Exception as exc:
+            self.ui_queue.put(("medal_list", {"ok": False, "error": f"获取失败：{exc}"}))
+            return None
+        self.ui_queue.put(("medal_list", {"ok": True, "medals": medals}))
+        return medals
+
+    async def _async_refresh_medals(self) -> None:
+        await self._async_fetch_medals()
+
+    async def _async_refresh_medals_and_tasks(self) -> None:
+        """启动时自动执行：先拉粉丝牌（使 SC 标题栏立即能显示等级），再刷新各房间任务。"""
+        medals = await self._async_fetch_medals()
+        room_ids = list(self.entries.keys())
+        if room_ids:
+            await self._async_refresh_medal_tasks(room_ids, medals)
+
+    def _on_medal_list(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            error = payload.get("error") or "未知错误"
+            self.medal_status_var.set(f"获取粉丝牌失败：{error}")
+            logger.warning("获取粉丝牌失败：%s", error)
+            return
+        medals = payload.get("medals") or []
+        self._medals = medals
+        self._medal_levels_room = {}
+        self._medal_levels_uid = {}
+        self._medal_names_room = {}
+        self._medal_names_uid = {}
+        self._medal_uid_by_iid = {}
+        self._medal_room_by_iid = {}
+        tree = self.medal_tree
+        tree.delete(*tree.get_children())
+        for medal in medals:
+            room_id = int(medal.get("room_id") or 0)
+            uid = int(medal.get("target_id") or 0)
+            level = int(medal.get("level") or 0)
+            name = str(medal.get("medal_name") or "")
+            if room_id and room_id not in self._medal_levels_room:
+                self._medal_levels_room[room_id] = level
+                self._medal_names_room[room_id] = name
+            if uid and uid not in self._medal_levels_uid:
+                self._medal_levels_uid[uid] = level
+                self._medal_names_uid[uid] = name
+            state = "点亮" if int(medal.get("is_lighted") or 0) == 1 else "未点亮"
+            if int(medal.get("living_status") or 0) == 1:
+                state += "·直播中"
+            # 拆成两列：今日亲密度 = 今日已获取（today_feed）；
+            # 当前经验/升级需 = 当前亲密度 intimacy / 下一级门槛 next_intimacy
+            today_feed = int(medal.get("today_feed") or 0)
+            intimacy = int(medal.get("intimacy") or 0)
+            next_intimacy = int(medal.get("next_intimacy") or 0)
+            today = f"+{today_feed}"
+            exp = (f"{intimacy}/{next_intimacy}" if next_intimacy else str(intimacy))
+            iid = str(int(medal.get("medal_id") or 0))
+            self._medal_uid_by_iid[iid] = uid
+            self._medal_room_by_iid[iid] = room_id
+            tree.insert("", "end", iid=iid, values=(
+                name, level or "—",
+                medal.get("anchor_name") or "", room_id or "—", today, exp, state))
+        self.medal_status_var.set(f"共 {len(medals)} 个粉丝牌 · {self._medal_master_text()}")
+        for room_id in self.entries:
+            self._update_medal_task_row(room_id)
+        if self._selected_room_id is not None:
+            self._update_sc_header(self._selected_room_id)
+
+    # ---------- 粉丝牌：任务刷新 ----------
+
+    def _on_refresh_medal_tasks(self) -> None:
+        room_ids = list(self.entries.keys())
+        if not room_ids:
+            self.medal_hint_var.set("没有监听中的直播间")
+            return
+        if not self.hub.ready.is_set():
+            self.medal_hint_var.set("后台初始化中，请稍候…")
+            return
+        self.medal_hint_var.set("正在刷新任务…")
+        self._sync_medal_task_rows()
+        self.hub.submit(self._async_refresh_medal_tasks(room_ids))
+
+    async def _async_refresh_medal_tasks(
+            self, room_ids: List[int],
+            medals: Optional[List[dict]] = None) -> None:
+        """逐个房间刷新任务并节流；结束后上报一次汇总（用于清除「刷新中」提示）。
+
+        ``medals`` 为已拉取的粉丝牌列表（None 时用界面上缓存的），用于跳过
+        **未持有粉丝牌** 的直播间——这些房间直接标记为「无粉丝牌」，不再请求接口。
+        """
+        api = self.hub.api
+        if api is None:
+            self.ui_queue.put(("medal_tasks_done", {"total": len(room_ids), "api": False}))
+            return
+        source = self._medals if medals is None else medals
+        known_uids = {int(m.get("target_id") or 0) for m in (source or [])}
+        known_rooms = {int(m.get("room_id") or 0) for m in (source or [])}
+        stats = {"total": len(room_ids), "ok": 0, "no_medal": 0, "error": 0}
+        for index, room_id in enumerate(room_ids):
+            entry = self.entries.get(room_id)
+            uid = int(entry.uid) if entry else 0
+            real_room = self._room_id_map.get(room_id, room_id)
+            if not uid:
+                self.ui_queue.put(("medal_task_info", {
+                    "room_id": room_id, "ok": False, "error": "未知主播 uid"}))
+                stats["error"] += 1
+            elif known_uids and uid not in known_uids and real_room not in known_rooms:
+                # 已加载的粉丝牌列表里没有该主播 → 未持有粉丝灯牌，无需请求接口
+                self.ui_queue.put(("medal_task_info", {
+                    "room_id": room_id, "ok": True, "no_medal": True, "tasks": []}))
+                stats["no_medal"] += 1
+            else:
+                try:
+                    info = await api.get_medal_task_info(uid)
+                except ApiError as exc:
+                    self.ui_queue.put(("medal_task_info", {
+                        "room_id": room_id, "ok": False, "error": str(exc)}))
+                    stats["error"] += 1
+                except Exception as exc:
+                    self.ui_queue.put(("medal_task_info", {
+                        "room_id": room_id, "ok": False, "error": f"获取失败：{exc}"}))
+                    stats["error"] += 1
+                else:
+                    payload = {"room_id": room_id, "ok": True}
+                    payload.update(info)
+                    self.ui_queue.put(("medal_task_info", payload))
+                    stats["ok"] += 1
+            if index + 1 < len(room_ids):
+                await asyncio.sleep(MEDAL_TASK_REFRESH_GAP_S)
+        self.ui_queue.put(("medal_tasks_done", stats))
+
+    def _on_medal_tasks_done(self, payload: dict) -> None:
+        """一次批量刷新结束：更新提示，避免一直停留在「正在刷新任务…」。"""
+        if payload.get("api") is False:
+            self.medal_hint_var.set("后台未就绪，任务刷新取消")
+            return
+        total = int(payload.get("total") or 0)
+        parts = [f"任务刷新完成（{total} 个房间）"]
+        if payload.get("ok"):
+            parts.append(f"有任务 {payload['ok']}")
+        if payload.get("no_medal"):
+            parts.append(f"无粉丝牌 {payload['no_medal']}")
+        if payload.get("error"):
+            parts.append(f"失败 {payload['error']}")
+        self.medal_hint_var.set("；".join(parts))
+
+    def _on_medal_task_info(self, payload: dict) -> None:
+        room_id = payload.get("room_id")
+        if room_id is None:
+            return
+        room_id = int(room_id)
+        self._medal_tasks[room_id] = {
+            "no_medal": bool(payload.get("no_medal")),
+            "error": "" if payload.get("ok") else (payload.get("error") or "获取失败"),
+            "tasks": payload.get("tasks") or [],
+            "free_intimacy": int(payload.get("free_intimacy") or 0),
+            "reach_free_intimacy_limit": bool(payload.get("reach_free_intimacy_limit")),
+        }
+        self._update_medal_task_row(room_id)
+
+    # ---------- 粉丝牌：执行（手动 / 自动） ----------
+
+    def _get_medal_runner(self) -> Optional[MedalTaskRunner]:
+        if self._medal_runner is None:
+            api = self.hub.api
+            if api is None:
+                return None
+            self._medal_runner = MedalTaskRunner(api, self.app_config, emit=self._medal_emit)
+        return self._medal_runner
+
+    def _medal_emit(self, event_type: str, payload: dict) -> None:
+        """供执行引擎（asyncio 线程）上报事件；只做线程安全入队。"""
+        self.ui_queue.put(("medal_event", event_type, payload))
+
+    def _on_complete_medal_like(self) -> None:
+        self._complete_medal_selected(TASK_LIKE)
+
+    def _on_complete_medal_danmaku(self) -> None:
+        self._complete_medal_selected(TASK_SEND_DANMAKU)
+
+    def _complete_medal_selected(self, only: str) -> None:
+        """按指定任务类型对**选中房间**执行（点赞 / 发弹幕各自独立按钮）。"""
+        room_id = self._get_selected_medal_room()
+        if room_id is None or room_id not in self.entries:
+            self.medal_hint_var.set("请先在上方列表选择一个直播间")
+            return
+        self._start_medal_room(room_id, only=only)
+
+    def _start_medal_room(self, room_id: int, *, manual: bool = True,
+                          only: Optional[str] = None) -> None:
+        """对**单个房间**触发一次任务执行（按钮与自动均走这里，互不串房间）。
+
+        ``only`` 为任务类型（点赞 / 发弹幕），``None`` 表示两项都做（自动模式）。
+        """
+        if room_id in self._medal_running:
+            self.medal_hint_var.set("该房间任务正在执行中")
+            return
+        if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
+            self.medal_hint_var.set("该主播未持有粉丝牌，无法执行任务")
+            return
+        runner = self._get_medal_runner()
+        if runner is None:
+            self.medal_hint_var.set("后台初始化中，请稍候…")
+            return
+        entry = self.entries.get(room_id)
+        uid = int(entry.uid) if entry else 0
+        real_room = self._room_id_map.get(room_id, room_id)
+        live = 1 if self.live_state.get(room_id) == "直播中" else 0
+        label = self.anchor_names.get(room_id) or str(room_id)
+        self._medal_running.add(room_id)
+        self._update_medal_buttons()
+        if manual:
+            what = task_label(only) if only else "粉丝牌"
+            self.medal_hint_var.set(f"正在执行房间 {room_id}（{label}）的{what}任务…")
+        self.hub.submit(self._async_complete_medal_room(
+            runner, room_id, real_room, uid, live, label, manual, only))
+
+    async def _async_complete_medal_room(self, runner: MedalTaskRunner, room_id: int,
+                                         real_room: int, uid: int, live: int,
+                                         label: str, manual: bool = True,
+                                         only: Optional[str] = None) -> None:
+        try:
+            result = await runner.complete_room(real_room, uid, live,
+                                                room_label=label, only=only)
+        except Exception as exc:
+            logger.exception("粉丝牌任务执行异常 room=%s", room_id)
+            result = {"room_id": real_room, "status": "error",
+                      "message": f"执行异常：{exc}", "details": {}}
+        result = dict(result or {})
+        result["room_id"] = room_id  # 映射回输入房间号，供 GUI 定位
+        result["manual"] = manual
+        self.ui_queue.put(("medal_result", result))
+
+    def _on_medal_result(self, payload: dict) -> None:
+        room_id = payload.get("room_id")
+        if room_id is not None:
+            self._medal_running.discard(int(room_id))
+        status = payload.get("status") or "error"
+        message = payload.get("message") or ""
+        elapsed = payload.get("elapsed")
+        suffix = f"（总耗时 {elapsed}s）" if elapsed is not None else ""
+        prefix = {"done": "完成", "partial": "部分完成", "risk": "风控中止",
+                  "blocked": "未执行", "error": "失败"}.get(status, status)
+        # 自动执行「无事可做」时静默（仅记日志），避免每轮覆盖用户可见提示
+        if bool(payload.get("manual", True)) or status != "done":
+            self.medal_hint_var.set(f"{prefix}：{message}{suffix}")
+        if status in ("risk", "error"):
+            logger.warning("粉丝牌任务%s：%s%s", prefix, message, suffix)
+        else:
+            logger.info("粉丝牌任务%s：%s%s", prefix, message, suffix)
+        self._update_medal_buttons()
+        if room_id is not None and self.hub.ready.is_set():
+            self.hub.submit(self._async_refresh_medal_tasks([int(room_id)]))
+
+    def _on_medal_auto_toggle(self) -> None:
+        room_id = self._get_selected_medal_room()
+        if room_id is None or room_id not in self.entries:
+            return
+        enabled = bool(self.medal_auto_var.get())
+        self.entries[room_id].auto_medal_tasks = enabled
+        self._save_config()
+        self._update_medal_task_row(room_id)
+        if enabled and not self.app_config.auto_medal_tasks:
+            self.medal_hint_var.set(
+                "已为该房间开启自动，但 config.json 的 medal_tasks.auto 为 false，暂不会自动执行")
+        elif enabled and not self.app_config.allow_write_operations:
+            self.medal_hint_var.set(
+                "已为该房间开启自动，但 allow_write_operations 为 false，暂不会自动执行")
+        else:
+            self.medal_hint_var.set("已为该房间" + ("开启" if enabled else "关闭") + "自动完成")
+
+    def _medal_auto_tick(self) -> None:
+        """周期性为「开启自动」的房间补做未完成任务（完成即停由执行引擎保证）。"""
+        self._medal_auto_after_id = None
+        try:
+            if (self.app_config.auto_medal_tasks and self.app_config.allow_write_operations
+                    and self.hub.ready.is_set()):
+                for room_id, entry in list(self.entries.items()):
+                    if not entry.auto_medal_tasks or not entry.enabled:
+                        continue
+                    if room_id in self._medal_running:
+                        continue
+                    if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
+                        continue
+                    self._start_medal_room(room_id, manual=False)
+        finally:
+            self._medal_auto_after_id = self.root.after(
+                MEDAL_AUTO_INTERVAL_MS, self._medal_auto_tick)
+
+    def _on_medal_event(self, event_type: str, payload: dict) -> None:
+        room_id = payload.get("room_id")
+        label = payload.get("room_label") or room_id
+        if event_type == "medal_note":
+            message = str(payload.get("message") or "")
+            self.medal_hint_var.set(f"房间 {label}：{message}")
+            logger.info("粉丝牌任务（房间 %s）：%s", label, message)
+        elif event_type == "medal_start":
+            logger.info("房间 %s 开始执行粉丝牌任务", label)
+        elif event_type == "medal_progress":
+            outcome = payload.get("outcome") or {}
+            elapsed = outcome.get("elapsed")
+            tail = f"（用时 {elapsed}s）" if elapsed is not None else ""
+            logger.info("房间 %s %s：%s%s", label,
+                        task_label(str(payload.get("jump_type") or "")),
+                        outcome.get("message") or "", tail)
+
     # ---------- 日志 ----------
 
     def _setup_logging(self) -> None:
@@ -1123,6 +1778,8 @@ class ScMonitorApp:
                 room_id, "disabled" if not self.entries[room_id].enabled else "starting"
             )
             self._insert_row(room_id)
+        # 粉丝牌页任务列表跟随直播间列表顺序
+        self._sync_medal_task_rows()
 
     def _insert_row(self, room_id: int) -> None:
         entry = self.entries[room_id]
@@ -1253,6 +1910,7 @@ class ScMonitorApp:
                 self.entries = {rid: self.entries[rid] for rid in order
                                 if rid in self.entries}
                 self._save_config()
+                self._apply_medal_task_order()  # 粉丝牌页任务列表实时跟随拖动顺序
             elif not (event.state & 0x0005):  # Ctrl/Shift 多选点击不触发跳转
                 self._open_tree_link(event)
         self._drag_iid = None
@@ -2578,6 +3236,7 @@ class ScMonitorApp:
             if self.tree.exists(iid):
                 self.tree.move(iid, "", idx)
         self.entries = {rid: self.entries[rid] for rid in order if rid in self.entries}
+        self._apply_medal_task_order()  # 粉丝牌页任务列表实时跟随排序
 
     def _get_selected_room_id(self) -> Optional[int]:
         selection = self.tree.selection()
@@ -2659,6 +3318,7 @@ class ScMonitorApp:
             self.anchor_names[room_id] = payload["anchor_name"]
         self._save_config()
         self._insert_row(room_id)
+        self._sync_medal_task_rows()  # 粉丝牌页新增行并保持顺序
         self.tree.set(str(room_id), "title", payload.get("title") or "")
         self.tree.selection_set(str(room_id))
         self.tree.see(str(room_id))
@@ -2716,6 +3376,7 @@ class ScMonitorApp:
         for room_id in valid:
             if self.tree.exists(str(room_id)):
                 self.tree.delete(str(room_id))
+        self._sync_medal_task_rows()  # 粉丝牌页同步移除行并保持顺序
         self._on_room_selected()
 
     def _on_refresh_history(self) -> None:
@@ -2864,6 +3525,13 @@ class ScMonitorApp:
             parts.append(f"同接 {self.viewers[room_id]}")
         if room_id in self.guard_num:
             parts.append(f"舰长 {self.guard_num[room_id]}")
+        entry = self.entries.get(room_id)
+        medal_name, level = self._medal_info_for(
+            room_id, int(entry.uid) if entry else 0)
+        if level:
+            # 用实际粉丝牌名称（如「小路泥」）代替「粉丝牌」字样
+            parts.append(f"{medal_name} Lv{level}" if medal_name
+                         else f"粉丝牌 Lv{level}")
         self.sc_frame.configure(text="  |  ".join(parts))
 
     def _update_sc_total_label(self) -> None:
@@ -3249,6 +3917,9 @@ class ScMonitorApp:
         self._apply_dm_gate()
         self._refresh_dm_send_state()
         self._load_dm_options_for_selected()
+        # 启动即拉取粉丝牌与各房间任务：无需先点开「粉丝牌」页签，
+        # SC 标题栏也能直接显示粉丝牌名称与等级。
+        self.hub.submit(self._async_refresh_medals_and_tasks())
 
     def _on_hub_failed(self, error: str) -> None:
         logger.error("后台初始化失败：%s", error)
@@ -3451,6 +4122,16 @@ class ScMonitorApp:
                     self._on_emoticons(item[1])
                 elif kind == "emoticon_image":
                     self._on_emoticon_image(item[1])
+                elif kind == "medal_list":
+                    self._on_medal_list(item[1])
+                elif kind == "medal_task_info":
+                    self._on_medal_task_info(item[1])
+                elif kind == "medal_tasks_done":
+                    self._on_medal_tasks_done(item[1])
+                elif kind == "medal_result":
+                    self._on_medal_result(item[1])
+                elif kind == "medal_event":
+                    self._on_medal_event(item[1], item[2])
         except queue.Empty:
             pass
         # 本轮所有日志行合并为一次插入，缓解拖动窗口时的卡顿
@@ -3483,6 +4164,12 @@ class ScMonitorApp:
         self.hub.request_shutdown()
 
     def _destroy(self) -> None:
+        if self._medal_auto_after_id is not None:
+            try:
+                self.root.after_cancel(self._medal_auto_after_id)
+            except Exception:
+                pass
+            self._medal_auto_after_id = None
         try:
             # 兜底：任何退出路径都把当前表情包落盘（无变化时内部会跳过写盘）
             self._remember_emoticon_page()
