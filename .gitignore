@@ -20,3 +20,5 @@ cookie.txt
 .zcode/
 .vscode/
 .codebuddy/
+# 个人应用配置（含写操作开关与悬浮提示配置），勿提交；首次运行自动生成
+config.json

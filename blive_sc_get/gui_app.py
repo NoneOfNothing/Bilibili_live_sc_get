@@ -1229,7 +1229,9 @@ class ScMonitorApp:
         iid = self.tree.identify_row(event.y)
         if iid:
             self._drag_iid = iid
-        if col in ("#1", "#2"):  # 房间号 / 主播：点击跳转，不切换选中直播间
+        if col in ("#1", "#2", "#4"):
+            # 房间号 / 主播：点击跳转；提醒：切换开播提醒开关——
+            # 都不改变选中直播间（否则点开关会连带把 SC/弹幕面板切走）
             return "break"
 
     def _on_tree_drag_motion(self, event) -> None:

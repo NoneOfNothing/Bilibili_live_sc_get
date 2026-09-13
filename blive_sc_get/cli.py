@@ -14,6 +14,7 @@ from typing import Dict, Optional, Sequence, Set
 import aiohttp
 
 from .api import ApiError, BilibiliLiveAPI
+from .app_config import load_app_config
 from .browser_rooms import find_open_live_rooms, is_room_being_recorded
 from .client import RoomClient
 from .storage import SCStorage
@@ -223,6 +224,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    # 任意入口（GUI/CLI）运行时确保 config.json 存在：缺失即生成默认模板
+    load_app_config()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.gui:

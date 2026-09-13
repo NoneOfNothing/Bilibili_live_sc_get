@@ -32,6 +32,18 @@ EMOTICON_TOOLTIP_FIELDS = ("text", "unique", "id")
 DEFAULT_EMOTICON_TOOLTIP: Tuple[str, ...] = ("text",)
 """悬浮提示的默认字段：**仅触发词**（可在 config.json 的 emoticon_tooltip 段增删）。"""
 
+DEFAULT_CONFIG_TEMPLATE = """{
+  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
+  "allow_write_operations": false,
+  "emoticon_tooltip": {
+    "text": true,
+    "unique": false,
+    "id": false
+  }
+}
+"""
+"""首次运行自动生成的默认 ``config.json`` 模板（带字段说明）。"""
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -83,13 +95,31 @@ def _parse_tooltip_fields(value: Any) -> Tuple[str, ...]:
     return matched or DEFAULT_EMOTICON_TOOLTIP
 
 
+def _write_default_config(config_path: Path) -> None:
+    """首次运行（或文件不存在）时生成带字段说明的默认配置文件。
+
+    生成失败（如目录只读）仅记录日志，不影响本次运行使用默认值。
+    """
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
+        logger.info("已生成默认应用配置 %s（写操作默认关闭）", config_path)
+    except OSError as exc:
+        logger.debug("生成默认应用配置失败（%s）: %s", config_path, exc)
+
+
 def load_app_config(path: Optional[Union[str, Path]] = None) -> AppConfig:
-    """读取应用配置；文件缺失/损坏/字段非法时回退默认（写操作关闭）。"""
+    """读取应用配置；文件损坏/字段非法时回退默认（写操作关闭）。
+
+    文件不存在时视为首次运行：自动生成带字段说明的默认配置文件
+    （生成失败不影响本次运行）。
+    """
     config_path = Path(path) if path is not None else CONFIG_FILE_PATH
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        logger.debug("未找到应用配置 %s，使用默认（写操作关闭）", config_path)
+        logger.debug("未找到应用配置 %s，生成默认配置（写操作关闭）", config_path)
+        _write_default_config(config_path)
         return AppConfig()
     except (OSError, ValueError) as exc:
         logger.warning("读取应用配置失败（%s），使用默认（写操作关闭）: %s",

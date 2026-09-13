@@ -233,6 +233,31 @@ class AppConfigTests(unittest.TestCase):
         self.assertFalse(AppConfig().allow_write_operations)
         self.assertFalse(load_app_config(self.tmp / "nope.json").allow_write_operations)
 
+    def test_missing_config_auto_created_with_template(self):
+        # 首次运行：自动生成带字段说明的默认 config.json（ROADMAP 49）
+        path = self.tmp / "auto" / "config.json"
+        cfg = load_app_config(path)
+        self.assertFalse(cfg.allow_write_operations)
+        self.assertEqual(cfg.emoticon_tooltip, DEFAULT_EMOTICON_TOOLTIP)
+        self.assertTrue(path.exists(), "应自动生成配置文件")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("_说明", data)
+        self.assertIs(data["allow_write_operations"], False)
+        self.assertEqual(data["emoticon_tooltip"], {"text": True, "unique": False,
+                                                    "id": False})
+
+    def test_existing_config_not_overwritten(self):
+        self.path.write_text('{"allow_write_operations": true}', encoding="utf-8")
+        self.assertTrue(load_app_config(self.path).allow_write_operations)
+        self.assertEqual(self.path.read_text(encoding="utf-8"),
+                         '{"allow_write_operations": true}')
+
+    def test_corrupt_config_not_overwritten(self):
+        # 损坏的配置按默认处理，但不覆盖用户文件（避免吞掉可手工修复的内容）
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertFalse(load_app_config(self.path).allow_write_operations)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{not json")
+
     def test_explicit_true_enables_write(self):
         self.path.write_text('{"allow_write_operations": true}', encoding="utf-8")
         self.assertTrue(load_app_config(self.path).allow_write_operations)
