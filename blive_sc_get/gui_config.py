@@ -42,11 +42,21 @@ class RoomEntry:
     notify_live: bool = True
     """该直播间开播时是否提醒（提示音 + 任务栏闪烁）。"""
 
-    auto_medal_tasks: bool = False
-    """该直播间是否加入「粉丝牌任务」全自动执行（默认关闭）。
+    auto_like: bool = False
+    """该直播间是否加入「点赞」任务的全自动执行（默认关闭）。"""
 
-    仅在 ``config.json`` 的 ``medal_tasks.auto`` 与 ``allow_write_operations``
-    同时开启时生效；关闭时仍可用每房间的「一键完成」手动执行。
+    auto_danmaku: bool = False
+    """该直播间是否加入「发弹幕」任务的全自动执行（默认关闭）。
+
+    两项均仅在 ``config.json`` 的 ``medal_tasks.auto`` 与
+    ``allow_write_operations`` 同时开启时生效；关闭时仍可用对应按钮手动执行。
+    """
+
+    auto_danmaku_when_live: bool = False
+    """开播时是否也执行「自动发弹幕」（默认关闭 = **仅未开播时**自动发弹幕）。
+
+    发弹幕会出现在直播弹幕区，默认避免在开播时自动刷屏；显式开启后才在开播时执行。
+    仅约束**自动**任务，手动「发弹幕」按钮不受影响。
     """
 
 
@@ -71,13 +81,18 @@ def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
         if room_id in seen:
             continue
         seen.add(room_id)
+        # 旧配置只有一个 auto_medal_tasks（两项合在一起）→ 迁移为两项都按原值
+        legacy_auto = item.get("auto_medal_tasks")
+        auto_default = bool(legacy_auto) if legacy_auto is not None else False
         entries.append(RoomEntry(
             room_id=room_id,
             note=str(item.get("note") or ""),
             enabled=bool(item.get("enabled", True)),
             uid=int(item.get("uid") or 0),
             notify_live=bool(item.get("notify_live", True)),
-            auto_medal_tasks=bool(item.get("auto_medal_tasks", False)),
+            auto_like=bool(item.get("auto_like", auto_default)),
+            auto_danmaku=bool(item.get("auto_danmaku", auto_default)),
+            auto_danmaku_when_live=bool(item.get("auto_danmaku_when_live", False)),
         ))
     return entries
 

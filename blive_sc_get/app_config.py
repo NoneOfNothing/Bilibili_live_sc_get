@@ -42,7 +42,7 @@ DEFAULT_MEDAL_MAX_RETRY: int = 3
 """单个写任务**连续无进展/失败**多少次后停止本轮（等待下次或自动任务下一轮继续）。"""
 
 DEFAULT_CONFIG_TEMPLATE = """{
-  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，仍需在界面里对具体房间开启，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
+  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，同时约束点赞与发弹幕两项；仍需在界面里对具体房间分别开启「自动点赞」/「自动发弹幕」，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
   "allow_write_operations": false,
   "emoticon_tooltip": {
     "text": true,
@@ -74,10 +74,10 @@ class AppConfig:
     """
 
     auto_medal_tasks: bool = False
-    """粉丝牌任务「全自动」总开关（默认 False）。
+    """粉丝牌自动任务的**总开关**（默认 False，同时约束点赞与发弹幕两项）。
 
-    仅当此开关与**具体房间**的自动开关同时开启、且 ``allow_write_operations``
-    为 True 时，该房间才会后台自动执行点赞/发弹幕任务。
+    仅当此开关、``allow_write_operations``、以及**具体房间**的「自动点赞」/
+    「自动发弹幕」开关（各自独立）同时满足时，该房间才会后台自动执行对应任务。
     """
 
     medal_like_interval: Tuple[float, float] = DEFAULT_MEDAL_LIKE_INTERVAL

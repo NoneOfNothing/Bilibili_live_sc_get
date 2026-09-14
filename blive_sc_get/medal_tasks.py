@@ -132,6 +132,17 @@ def is_task_complete(task: Any) -> bool:
     return limit > 0 and current >= limit
 
 
+def should_auto_danmaku(live_status: int, when_live: bool) -> bool:
+    """自动发弹幕本轮是否应执行：**未开播时总是执行**；开播时需 ``when_live`` 允许。
+
+    发弹幕出现在主播弹幕区会造成刷屏，故自动任务默认只在**未开播**时执行；
+    用户显式开启「开播时也自动发弹幕」后才在直播中执行（手动按钮不受此限制）。
+    """
+    if _int(live_status) == 1:
+        return bool(when_live)
+    return True
+
+
 def is_task_applicable(task: Any) -> bool:
     """任务当前是否**可执行**：有正数上限且尚未完成。
 

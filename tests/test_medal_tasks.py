@@ -44,6 +44,7 @@ from blive_sc_get.medal_tasks import (
     pending_write_tasks,
     room_exclusive_emoticons,
     select_emoticon_cycle,
+    should_auto_danmaku,
     task_label,
 )
 
@@ -188,6 +189,14 @@ class TaskParsingTests(unittest.TestCase):
         self.assertFalse(is_task_applicable(
             {"limit": 0, "current": 0, "is_done": True}))
         self.assertFalse(is_task_applicable(None))
+
+    def test_should_auto_danmaku(self):
+        # 未开播：总是执行
+        self.assertTrue(should_auto_danmaku(0, False))
+        self.assertTrue(should_auto_danmaku(0, True))
+        # 开播：默认不执行，需显式开启「开播时也自动发弹幕」
+        self.assertFalse(should_auto_danmaku(1, False))
+        self.assertTrue(should_auto_danmaku(1, True))
 
     def test_pending_write_tasks_skips_not_lit(self):
         # 未点亮（sub_title「仅点亮」）解析出的 limit 为 0，不应计入待办
@@ -441,13 +450,31 @@ class RoomEntryAutoMedalTests(unittest.TestCase):
         self.path = self.tmp / "gui_rooms.json"
 
     def test_roundtrip(self):
-        entries = [RoomEntry(1, auto_medal_tasks=True), RoomEntry(2)]
+        entries = [RoomEntry(1, auto_like=True, auto_danmaku=True),
+                   RoomEntry(2, auto_danmaku=True, auto_danmaku_when_live=True),
+                   RoomEntry(3)]
         save_room_entries(self.path, entries)
         self.assertEqual(load_room_entries(self.path), entries)
 
-    def test_legacy_config_defaults_off(self):
-        self.path.write_text('{"rooms": [{"room_id": 789}]}', encoding="utf-8")
-        self.assertFalse(load_room_entries(self.path)[0].auto_medal_tasks)
+    def test_legacy_auto_medal_migrates_to_both(self):
+        # 旧配置只有一个 auto_medal_tasks（两项合在一起）→ 迁移为两项都开启
+        self.path.write_text(
+            '{"rooms": [{"room_id": 789, "auto_medal_tasks": true}]}',
+            encoding="utf-8")
+        entry = load_room_entries(self.path)[0]
+        self.assertTrue(entry.auto_like)
+        self.assertTrue(entry.auto_danmaku)
+
+    def test_two_switches_independent_and_default_off(self):
+        self.path.write_text(
+            '{"rooms": [{"room_id": 789}, {"room_id": 790, "auto_like": true}]}',
+            encoding="utf-8")
+        first, second = load_room_entries(self.path)
+        self.assertFalse(first.auto_like)
+        self.assertFalse(first.auto_danmaku)
+        self.assertFalse(first.auto_danmaku_when_live)  # 默认仅未开播时自动发弹幕
+        self.assertTrue(second.auto_like)
+        self.assertFalse(second.auto_danmaku)
 
 
 class _StubApi:
@@ -585,6 +612,21 @@ class MedalRunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "done")
         self.assertIn("仅点亮", result["message"])
 
+    def test_emits_task_progress_events(self):
+        """每轮复核后上报实时进度，供界面在执行期间就地更新该行。"""
+        tasks = [{"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
+                  "limit": 3, "is_done": False, "raw": {}}]
+        api = _StubApi(tasks, like_step=1)
+        events = []
+        runner = MedalTaskRunner(api, _fast_config(),
+                                 emit=lambda t, p: events.append((t, p)))
+        result = asyncio.run(runner.complete_room(100, 200, 1))
+        self.assertEqual(result["status"], "done")
+        prog = [p for t, p in events if t == "medal_task_progress"]
+        self.assertEqual([p["current"] for p in prog], [0, 1, 2])
+        self.assertTrue(all(p["jump_type"] == TASK_LIKE for p in prog))
+        self.assertEqual([p["limit"] for p in prog], [3, 3, 3])
+
     def test_only_runs_selected_task(self):
         """only=like 时只点赞，不动发弹幕（界面上两个独立按钮）。"""
         tasks = [
@@ -614,6 +656,25 @@ class MedalRunnerTests(unittest.TestCase):
         self.assertEqual(api.like_calls, [])
         self.assertEqual(len(api.danmaku_calls), 3)
         self.assertEqual(result["status"], "done")
+
+    def test_only_accepts_multiple_types(self):
+        """自动开关两项都开时，传入类型列表，两项都执行。"""
+        tasks = [
+            {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
+             "limit": 3, "is_done": False, "raw": {}},
+            {"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
+             "limit": 2, "is_done": False, "raw": {}},
+            {"jump_type": TASK_WATCH_LIVE, "title": "观看直播满15分钟", "current": 0,
+             "limit": 9, "is_done": False, "raw": {}},
+        ]
+        api = _StubApi(tasks, like_step=1)
+        result = asyncio.run(MedalTaskRunner(api, _fast_config()).complete_room(
+            100, 200, 1, only=[TASK_LIKE, TASK_SEND_DANMAKU]))
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(len(api.like_calls), 3)
+        self.assertEqual(len(api.danmaku_calls), 2)
+        self.assertIn("like", result["details"])
+        self.assertIn("danmaku", result["details"])
 
     def test_only_completed_reports_reason(self):
         tasks = [{"jump_type": TASK_LIKE, "title": "点赞30次", "current": 10,

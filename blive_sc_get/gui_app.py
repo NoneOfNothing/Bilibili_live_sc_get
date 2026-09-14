@@ -27,7 +27,7 @@ except ImportError:
     Image = None
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
@@ -47,7 +47,9 @@ from .medal_tasks import (
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     TASK_WATCH_LIVE,
+    find_task,
     is_task_complete,
+    should_auto_danmaku,
     task_label,
 )
 from .gui_config import (
@@ -190,6 +192,10 @@ MEDAL_LINK_COLUMNS = {"#3": "space", "#4": "room"}
 
 MEDAL_TASK_LINK_COLUMNS = {"#1": "room", "#2": "space"}
 """「监听房间 · 任务」表的跳转列：#1 房间 → 直播间、#2 主播 → 个人空间。"""
+
+MEDAL_TAB_REFRESH_MS = 90 * 1000
+"""停留在「粉丝牌」页签时的自动刷新间隔（毫秒）：刷新粉丝牌列表与各房间任务，
+使进度（含在别处产生的进展）能自动反映到界面，无需手动点刷新。"""
 
 DM_LINE_PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*")
 """弹幕行首的「[时间] 」前缀，用于从整行文本还原弹幕正文。"""
@@ -751,6 +757,7 @@ class ScMonitorApp:
         self._medal_uid_by_iid: Dict[str, int] = {}   # 粉丝牌行 iid -> 主播 uid（跳转用）
         self._medal_room_by_iid: Dict[str, int] = {}  # 粉丝牌行 iid -> 房间号（跳转用）
         self._medal_pending = None                    # 按下待跳转的单元格（点击保护）
+        self._medal_tab_refresh_id: Optional[str] = None  # 「粉丝牌」页签自动刷新的 after id
         self._medal_tasks: Dict[int, dict] = {}       # 房间号 -> {tasks, error, ...}
         self._medal_running: set = set()              # 正在执行任务的输入房间号
         self._medal_runner: Optional[MedalTaskRunner] = None
@@ -1171,7 +1178,7 @@ class ScMonitorApp:
             ("watch", "观看直播", 110, 80, "center"),
             ("danmaku", "发弹幕", 110, 80, "center"),
             ("like", "点赞", 110, 80, "center"),
-            ("auto", "自动", 50, 40, "center"),
+            ("auto", "自动", 70, 50, "center"),
         ):
             self.medal_task_tree.heading(col, text=text)
             self.medal_task_tree.column(col, width=width, minwidth=minwidth,
@@ -1201,24 +1208,65 @@ class ScMonitorApp:
         self.medal_like_btn = ttk.Button(
             bottom, text="点赞（选中房间）", command=self._on_complete_medal_like)
         self.medal_like_btn.pack(side="left", padx=(6, 0))
-        self.medal_auto_var = tk.BooleanVar(value=False)
-        self.medal_auto_check = ttk.Checkbutton(
-            bottom, text="自动完成选中房间（两项都做）", variable=self.medal_auto_var,
-            command=self._on_medal_auto_toggle)
-        self.medal_auto_check.pack(side="left", padx=(10, 0))
+        self.medal_auto_danmaku_var = tk.BooleanVar(value=False)
+        self.medal_auto_danmaku_check = ttk.Checkbutton(
+            bottom, text="自动发弹幕（选中房间）", variable=self.medal_auto_danmaku_var,
+            command=self._on_medal_auto_danmaku_toggle)
+        self.medal_auto_danmaku_check.pack(side="left", padx=(10, 0))
+        self.medal_auto_danmaku_live_var = tk.BooleanVar(value=False)
+        self.medal_auto_danmaku_live_check = ttk.Checkbutton(
+            bottom, text="开播时也自动发弹幕", variable=self.medal_auto_danmaku_live_var,
+            command=self._on_medal_auto_danmaku_live_toggle)
+        self.medal_auto_danmaku_live_check.pack(side="left", padx=(6, 0))
+        self.medal_auto_like_var = tk.BooleanVar(value=False)
+        self.medal_auto_like_check = ttk.Checkbutton(
+            bottom, text="自动点赞（选中房间）", variable=self.medal_auto_like_var,
+            command=self._on_medal_auto_like_toggle)
+        self.medal_auto_like_check.pack(side="left", padx=(6, 0))
         self._update_medal_buttons()
 
     def _on_tab_changed(self, _event=None) -> None:
-        """切到「粉丝牌」页签时同步房间行；尚未拉取粉丝牌则自动拉一次。"""
+        """切到「粉丝牌」页签：同步房间行并启动自动刷新；切走则停止。"""
         try:
-            if self._notebook.select() != str(self._medal_tab):
-                return
+            active = self._notebook.select() == str(self._medal_tab)
         except Exception:
+            return
+        if not active:
+            self._stop_medal_tab_refresh()
             return
         self._sync_medal_task_rows()
         self._update_medal_buttons()
+        self._start_medal_tab_refresh()
         if not self._medals and self.hub.ready.is_set():
             self._on_refresh_medals()
+
+    def _start_medal_tab_refresh(self) -> None:
+        if self._medal_tab_refresh_id is None:
+            self._medal_tab_refresh_id = self.root.after(
+                MEDAL_TAB_REFRESH_MS, self._medal_tab_refresh_tick)
+
+    def _stop_medal_tab_refresh(self) -> None:
+        if self._medal_tab_refresh_id is not None:
+            try:
+                self.root.after_cancel(self._medal_tab_refresh_id)
+            except Exception:
+                pass
+            self._medal_tab_refresh_id = None
+
+    def _medal_tab_refresh_tick(self) -> None:
+        """停留期间定时刷新粉丝牌列表与各房间任务（静默，不覆盖用户可见提示）。"""
+        self._medal_tab_refresh_id = None
+        try:
+            if not self.hub.ready.is_set():
+                return
+            if self._notebook.select() != str(self._medal_tab):
+                return
+            self.hub.submit(self._async_refresh_medals())
+            if self.entries:
+                self.hub.submit(self._async_refresh_medal_tasks(
+                    list(self.entries.keys()), announce=False))
+        finally:
+            self._start_medal_tab_refresh()
 
     def _medal_master_text(self) -> str:
         return (f"写操作：{'启用' if self.app_config.allow_write_operations else '关闭'}"
@@ -1303,12 +1351,20 @@ class ScMonitorApp:
             cells = (self._format_medal_task(tasks, TASK_WATCH_LIVE),
                      self._format_medal_task(tasks, TASK_SEND_DANMAKU),
                      self._format_medal_task(tasks, TASK_LIKE))
+        if entry and entry.auto_like and entry.auto_danmaku:
+            auto = "赞+弹"
+        elif entry and entry.auto_like:
+            auto = "赞"
+        elif entry and entry.auto_danmaku:
+            auto = "弹"
+        else:
+            auto = "关"
         tree.item(str(room_id), values=(
             room_id,
             self.anchor_names.get(room_id, ""),
             level or "—",
             cells[0], cells[1], cells[2],
-            "开" if (entry and entry.auto_medal_tasks) else "关",
+            auto,
         ))
 
     @staticmethod
@@ -1335,9 +1391,15 @@ class ScMonitorApp:
         state = "normal" if (has and not running) else "disabled"
         self.medal_like_btn.configure(state=state)
         self.medal_danmaku_btn.configure(state=state)
-        self.medal_auto_check.configure(state="normal" if has else "disabled")
+        auto_state = "normal" if has else "disabled"
+        self.medal_auto_danmaku_check.configure(state=auto_state)
+        self.medal_auto_like_check.configure(state=auto_state)
+        self.medal_auto_danmaku_live_check.configure(state=auto_state)
         if has:
-            self.medal_auto_var.set(bool(self.entries[room_id].auto_medal_tasks))
+            entry = self.entries[room_id]
+            self.medal_auto_danmaku_var.set(bool(entry.auto_danmaku))
+            self.medal_auto_like_var.set(bool(entry.auto_like))
+            self.medal_auto_danmaku_live_var.set(bool(entry.auto_danmaku_when_live))
 
     def _on_medal_press(self, event) -> None:
         """按下粉丝牌两张表的跳转列：记录待跳转单元格并**阻止改变选中行**（点击保护）。
@@ -1505,15 +1567,18 @@ class ScMonitorApp:
 
     async def _async_refresh_medal_tasks(
             self, room_ids: List[int],
-            medals: Optional[List[dict]] = None) -> None:
+            medals: Optional[List[dict]] = None,
+            announce: bool = True) -> None:
         """逐个房间刷新任务并节流；结束后上报一次汇总（用于清除「刷新中」提示）。
 
         ``medals`` 为已拉取的粉丝牌列表（None 时用界面上缓存的），用于跳过
         **未持有粉丝牌** 的直播间——这些房间直接标记为「无粉丝牌」，不再请求接口。
+        ``announce=False`` 时不更新提示文案（供定时静默刷新使用）。
         """
         api = self.hub.api
         if api is None:
-            self.ui_queue.put(("medal_tasks_done", {"total": len(room_ids), "api": False}))
+            if announce:
+                self.ui_queue.put(("medal_tasks_done", {"total": len(room_ids), "api": False}))
             return
         source = self._medals if medals is None else medals
         known_uids = {int(m.get("target_id") or 0) for m in (source or [])}
@@ -1550,7 +1615,8 @@ class ScMonitorApp:
                     stats["ok"] += 1
             if index + 1 < len(room_ids):
                 await asyncio.sleep(MEDAL_TASK_REFRESH_GAP_S)
-        self.ui_queue.put(("medal_tasks_done", stats))
+        if announce:
+            self.ui_queue.put(("medal_tasks_done", stats))
 
     def _on_medal_tasks_done(self, payload: dict) -> None:
         """一次批量刷新结束：更新提示，避免一直停留在「正在刷新任务…」。"""
@@ -1610,10 +1676,11 @@ class ScMonitorApp:
         self._start_medal_room(room_id, only=only)
 
     def _start_medal_room(self, room_id: int, *, manual: bool = True,
-                          only: Optional[str] = None) -> None:
+                          only: Optional[Union[str, List[str]]] = None) -> None:
         """对**单个房间**触发一次任务执行（按钮与自动均走这里，互不串房间）。
 
-        ``only`` 为任务类型（点赞 / 发弹幕），``None`` 表示两项都做（自动模式）。
+        ``only`` 为任务类型：单个字符串（点赞 / 发弹幕）或类型列表（两项都做）；
+        ``None`` 表示全部可执行写任务。
         """
         if room_id in self._medal_running:
             self.medal_hint_var.set("该房间任务正在执行中")
@@ -1633,7 +1700,12 @@ class ScMonitorApp:
         self._medal_running.add(room_id)
         self._update_medal_buttons()
         if manual:
-            what = task_label(only) if only else "粉丝牌"
+            if isinstance(only, str):
+                what = task_label(only)
+            elif only:
+                what = "、".join(task_label(t) for t in only)
+            else:
+                what = "粉丝牌"
             self.medal_hint_var.set(f"正在执行房间 {room_id}（{label}）的{what}任务…")
         self.hub.submit(self._async_complete_medal_room(
             runner, room_id, real_room, uid, live, label, manual, only))
@@ -1641,7 +1713,7 @@ class ScMonitorApp:
     async def _async_complete_medal_room(self, runner: MedalTaskRunner, room_id: int,
                                          real_room: int, uid: int, live: int,
                                          label: str, manual: bool = True,
-                                         only: Optional[str] = None) -> None:
+                                         only: Optional[Union[str, List[str]]] = None) -> None:
         try:
             result = await runner.complete_room(real_room, uid, live,
                                                 room_label=label, only=only)
@@ -1672,40 +1744,84 @@ class ScMonitorApp:
         else:
             logger.info("粉丝牌任务%s：%s%s", prefix, message, suffix)
         self._update_medal_buttons()
-        if room_id is not None and self.hub.ready.is_set():
-            self.hub.submit(self._async_refresh_medal_tasks([int(room_id)]))
+        if self.hub.ready.is_set():
+            # 任务完成会改变亲密度/经验，顺带刷新粉丝牌列表，无需手动点刷新
+            self.hub.submit(self._async_refresh_medals())
+            if room_id is not None:
+                self.hub.submit(self._async_refresh_medal_tasks([int(room_id)]))
 
-    def _on_medal_auto_toggle(self) -> None:
+    def _on_medal_auto_danmaku_toggle(self) -> None:
+        self._set_room_auto(TASK_SEND_DANMAKU, bool(self.medal_auto_danmaku_var.get()))
+
+    def _on_medal_auto_like_toggle(self) -> None:
+        self._set_room_auto(TASK_LIKE, bool(self.medal_auto_like_var.get()))
+
+    def _on_medal_auto_danmaku_live_toggle(self) -> None:
+        """「开播时也自动发弹幕」：默认关（仅未开播时自动发弹幕）。"""
         room_id = self._get_selected_medal_room()
         if room_id is None or room_id not in self.entries:
             return
-        enabled = bool(self.medal_auto_var.get())
-        self.entries[room_id].auto_medal_tasks = enabled
+        enabled = bool(self.medal_auto_danmaku_live_var.get())
+        self.entries[room_id].auto_danmaku_when_live = enabled
         self._save_config()
         self._update_medal_task_row(room_id)
+        self.medal_hint_var.set(
+            "已为该房间" + ("允许" if enabled else "禁止") + "在开播时自动发弹幕"
+            + ("" if enabled else "（仅在未开播时执行）"))
+
+    def _set_room_auto(self, jump_type: str, enabled: bool) -> None:
+        """设置选中房间某一任务的自动开关（两项各自独立）。"""
+        room_id = self._get_selected_medal_room()
+        if room_id is None or room_id not in self.entries:
+            return
+        entry = self.entries[room_id]
+        if jump_type == TASK_LIKE:
+            entry.auto_like = enabled
+        else:
+            entry.auto_danmaku = enabled
+        self._save_config()
+        self._update_medal_task_row(room_id)
+        name = f"自动{task_label(jump_type)}"
         if enabled and not self.app_config.auto_medal_tasks:
             self.medal_hint_var.set(
-                "已为该房间开启自动，但 config.json 的 medal_tasks.auto 为 false，暂不会自动执行")
+                f"已为该房间开启{name}，但 config.json 的 medal_tasks.auto 为 false，暂不会自动执行")
         elif enabled and not self.app_config.allow_write_operations:
             self.medal_hint_var.set(
-                "已为该房间开启自动，但 allow_write_operations 为 false，暂不会自动执行")
+                f"已为该房间开启{name}，但 allow_write_operations 为 false，暂不会自动执行")
         else:
-            self.medal_hint_var.set("已为该房间" + ("开启" if enabled else "关闭") + "自动完成")
+            self.medal_hint_var.set(f"已为该房间{'开启' if enabled else '关闭'}{name}")
 
     def _medal_auto_tick(self) -> None:
-        """周期性为「开启自动」的房间补做未完成任务（完成即停由执行引擎保证）。"""
+        """周期性为「开启自动」的房间补做未完成任务（完成即停由执行引擎保证）。
+
+        发弹幕 / 点赞的自动开关**各自独立**：本房间只执行它开启的那一项；两项都开
+        时在同一次执行里依次完成。
+        """
         self._medal_auto_after_id = None
         try:
             if (self.app_config.auto_medal_tasks and self.app_config.allow_write_operations
                     and self.hub.ready.is_set()):
                 for room_id, entry in list(self.entries.items()):
-                    if not entry.auto_medal_tasks or not entry.enabled:
-                        continue
-                    if room_id in self._medal_running:
+                    if not entry.enabled or room_id in self._medal_running:
                         continue
                     if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
                         continue
-                    self._start_medal_room(room_id, manual=False)
+                    live = 1 if self.live_state.get(room_id) == "直播中" else 0
+                    types: List[str] = []
+                    if entry.auto_danmaku:
+                        if should_auto_danmaku(live, entry.auto_danmaku_when_live):
+                            types.append(TASK_SEND_DANMAKU)
+                        else:
+                            logger.debug(
+                                "房间 %s 正在直播且未开启「开播时也自动发弹幕」，本轮跳过发弹幕",
+                                room_id)
+                    if entry.auto_like:
+                        types.append(TASK_LIKE)
+                    if not types:
+                        continue
+                    self._start_medal_room(
+                        room_id, manual=False,
+                        only=types if len(types) > 1 else types[0])
         finally:
             self._medal_auto_after_id = self.root.after(
                 MEDAL_AUTO_INTERVAL_MS, self._medal_auto_tick)
@@ -1726,6 +1842,25 @@ class ScMonitorApp:
             logger.info("房间 %s %s：%s%s", label,
                         task_label(str(payload.get("jump_type") or "")),
                         outcome.get("message") or "", tail)
+        elif event_type == "medal_task_progress":
+            self._apply_medal_task_progress(payload)
+
+    def _apply_medal_task_progress(self, payload: dict) -> None:
+        """执行期间的实时进度：就地更新该房间任务行对应单元格（无需整轮结束再刷新）。"""
+        room_id = payload.get("room_id")
+        jump_type = payload.get("jump_type")
+        if room_id is None or not jump_type:
+            return
+        info = self._medal_tasks.get(int(room_id))
+        if not info:
+            return
+        task = find_task(info.get("tasks") or [], str(jump_type))
+        if task is None:
+            return
+        task["current"] = int(payload.get("current") or 0)
+        task["limit"] = int(payload.get("limit") or 0)
+        task["is_done"] = bool(payload.get("is_done"))
+        self._update_medal_task_row(int(room_id))
 
     # ---------- 日志 ----------
 
@@ -4170,6 +4305,7 @@ class ScMonitorApp:
             except Exception:
                 pass
             self._medal_auto_after_id = None
+        self._stop_medal_tab_refresh()
         try:
             # 兜底：任何退出路径都把当前表情包落盘（无变化时内部会跳过写盘）
             self._remember_emoticon_page()

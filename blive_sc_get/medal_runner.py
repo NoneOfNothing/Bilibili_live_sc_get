@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Union
 
 import aiohttp
 
@@ -77,11 +77,12 @@ class MedalTaskRunner:
 
     async def complete_room(self, room_id: int, anchor_uid: int,
                             live_status: int, *, room_label: str = "",
-                            only: Optional[str] = None) -> Dict[str, Any]:
+                            only: Optional[Union[str, Iterable[str]]] = None) -> Dict[str, Any]:
         """执行一个房间的写任务，返回结果摘要（完成即停）。
 
-        ``only`` 指定时只执行该类型的任务（如 ``"like"`` / ``"sendDanmu"``），
-        用于界面上的「点赞」「发弹幕」独立按钮；为 ``None`` 时执行全部可执行写任务。
+        ``only`` 指定时只执行该类型的任务：可为单个类型字符串（如 ``"like"``）
+        或类型集合（如 ``["like", "sendDanmu"]``），用于界面上分离的自动开关与
+        独立按钮；为 ``None`` 时执行全部可执行写任务。
 
         结果 ``status``：
 
@@ -141,10 +142,16 @@ class MedalTaskRunner:
             return self._result(room_id, "done",
                                 "已达储蓄亲密度上限：投喂一个粉丝灯牌即可领取，暂不执行")
         pending_all = pending_write_tasks(tasks)
+        only_types: Optional[Set[str]] = None
         if only is not None:
-            pending = [t for t in pending_all if t.get("jump_type") == only]
+            only_types = {only} if isinstance(only, str) else {str(x) for x in only}
+            if not only_types:
+                only_types = None
+        if only_types is not None:
+            pending = [t for t in pending_all if t.get("jump_type") in only_types]
             if not pending:
-                return self._result(room_id, "done", self._skip_reason(tasks, only))
+                reasons = [self._skip_reason(tasks, t) for t in sorted(only_types)]
+                return self._result(room_id, "done", "；".join(reasons))
         else:
             pending = pending_all
             if not pending:
@@ -227,6 +234,10 @@ class MedalTaskRunner:
                 return _done(True, "任务不适用（未点亮），跳过点赞")
             limit = int(task.get("limit") or 0)
             current = int(task.get("current") or 0)
+            # 每轮复核后即上报最新进度，供界面实时更新该行（无需等整轮结束）
+            self._emit("medal_task_progress", {
+                "room_id": room_id, "jump_type": TASK_LIKE,
+                "current": current, "limit": limit, "is_done": False})
             if first_progress < 0:
                 first_progress = current
             if progress >= 0 and current <= progress:
@@ -311,6 +322,10 @@ class MedalTaskRunner:
                 return _done(True, "任务不适用（未点亮），跳过发弹幕")
             limit = int(task.get("limit") or 0)
             current = int(task.get("current") or 0)
+            # 每轮复核后即上报最新进度，供界面实时更新该行（无需等整轮结束）
+            self._emit("medal_task_progress", {
+                "room_id": room_id, "jump_type": TASK_SEND_DANMAKU,
+                "current": current, "limit": limit, "is_done": False})
             if progress >= 0 and current <= progress:
                 stalled += 1
                 if stalled > max_stall:
