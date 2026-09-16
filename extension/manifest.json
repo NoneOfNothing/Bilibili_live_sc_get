@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "B 站 Cookie 助手（blive_sc_get）",
+  "version": "1.0.0",
+  "description": "为 blive_sc_get 程序一键提供 bilibili.com 的登录 Cookie（仅发送到本机 127.0.0.1，不上传网络）。",
+  "permissions": ["cookies"],
+  "host_permissions": [
+    "*://*.bilibili.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "action": {
+    "default_title": "B 站 Cookie 助手",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

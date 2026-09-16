@@ -39,6 +39,7 @@ except ImportError:
 from .api import ApiError, BilibiliLiveAPI, describe_send_error
 from .app_config import load_app_config
 from .browser_cookie import get_bilibili_cookie
+from .cookie_server import DEFAULT_COOKIE_PORT, wait_for_extension_cookie
 from .browser_rooms import is_room_being_recorded
 from .cli import COOKIE_FILE_NAME, _pending_flush_loop, parse_room_id, resolve_cookie
 from .client import LIVE_STATUS_TEXT, RoomClient
@@ -946,6 +947,9 @@ class ScMonitorApp:
         self.refresh_btn.pack(side="left")
         self.cookie_btn = ttk.Button(bottom, text="获取Cookie", command=self._on_fetch_cookie)
         self.cookie_btn.pack(side="left", padx=(8, 0))
+        self.cookie_plugin_btn = ttk.Button(
+            bottom, text="从插件获取", command=self._on_fetch_cookie_plugin)
+        self.cookie_plugin_btn.pack(side="left", padx=(6, 0))
 
         self.sc_frame = ttk.LabelFrame(self.paned, text="醒目留言")
         self.paned.add(self.sc_frame, weight=PANE_WEIGHTS[1])
@@ -3594,6 +3598,74 @@ class ScMonitorApp:
         messagebox.showinfo("获取 Cookie 成功",
                             f"来源：{source}\n已保存到 cookie.txt 并应用到当前会话。{suffix}")
 
+    def _on_fetch_cookie_plugin(self) -> None:
+        """通过自带的浏览器扩展接收 B 站 Cookie（无需关闭浏览器）。
+
+        程序在回环地址临时开启 127.0.0.1:port 等待，用户在浏览器插件里点
+        「获取并发送」后即可收到并应用。仅绑定本机、校验 Origin 为扩展来源。
+        """
+        if not messagebox.askyesno(
+            "从插件获取 Cookie",
+            "将通过自带的浏览器扩展接收登录 Cookie：\n\n"
+            f"· 程序将在本机 127.0.0.1:{DEFAULT_COOKIE_PORT} 临时开启一个端口等待\n"
+            "· 请在浏览器（Edge/Chrome）中先加载本项目 extension/ 目录的扩展，"
+            "再点扩展里的「获取并发送」按钮\n"
+            "· 仅写入本地 cookie.txt 并立即应用到当前会话，不会上传\n"
+            "· 若约 90 秒内未收到将自动关闭并停止等待\n\n"
+            "注意：\n"
+            "· Cookie 等同你的登录凭证，仅向本机端口发送，请勿在不可信环境使用\n"
+            "· 需先安装并启用扩展（edge://extensions → 开发者模式 → 加载已解压的扩展）\n\n是否开始等待？",
+        ):
+            return
+        if self.hub.api is None:
+            messagebox.showwarning("请稍候", "后台网络初始化中，请稍后再试")
+            return
+        self.cookie_plugin_btn.configure(state="disabled")
+        logger.info("开始等待浏览器扩展发送 B 站 Cookie（端口 %s）…", DEFAULT_COOKIE_PORT)
+        threading.Thread(target=self._fetch_cookie_plugin_worker,
+                         name="fetch-cookie-plugin", daemon=True).start()
+
+    def _fetch_cookie_plugin_worker(self) -> None:
+        try:
+            cookie = wait_for_extension_cookie(port=DEFAULT_COOKIE_PORT)
+        except OSError as exc:
+            logger.warning("cookie server 无法启动: %s", exc)
+            self.ui_queue.put(("cookie_plugin_result",
+                               {"cookie": None, "error": f"本地端口无法开启：{exc}"}))
+            return
+        except Exception as exc:
+            logger.exception("等待扩展 Cookie 异常")
+            self.ui_queue.put(("cookie_plugin_result",
+                               {"cookie": None, "error": f"获取过程异常：{exc}"}))
+            return
+        self.ui_queue.put(("cookie_plugin_result", {"cookie": cookie, "error": None}))
+
+    def _on_cookie_from_plugin_result(self, payload: dict) -> None:
+        self.cookie_plugin_btn.configure(state="normal")
+        cookie = payload.get("cookie")
+        error = payload.get("error")
+        if not cookie:
+            detail = error or "约 90 秒内未收到插件发送的 Cookie（可能插件未安装/未点发送，或浏览器未打开）"
+            messagebox.showerror(
+                "从插件获取失败",
+                f"未获取到 Cookie：\n\n{detail}\n\n"
+                "请确认：\n"
+                "· 已在 edge://extensions 开启开发者模式并加载本项目的 extension/ 目录\n"
+                "· 打开了插件弹窗并勾选确认后点击「获取并发送」\n"
+                "· 也可改用「获取Cookie」按钮从浏览器数据库读取（需完全退出浏览器）")
+            return
+        try:
+            Path(COOKIE_FILE_PATH).write_text(cookie, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("从插件获取失败", f"写入 cookie.txt 失败：{exc}")
+            return
+        self.hub.submit(self._async_apply_cookie(cookie))
+        logger.info("已通过浏览器扩展获取 B 站 Cookie（长度 %d），已保存并应用到当前会话",
+                    len(cookie))
+        messagebox.showinfo("从插件获取成功",
+                            "已通过浏览器扩展获取到 B 站登录 Cookie\n"
+                            "已保存到 cookie.txt 并应用到当前会话。")
+
     async def _async_apply_cookie(self, cookie: str) -> None:
         if self.hub.api is None:
             return
@@ -4262,6 +4334,8 @@ class ScMonitorApp:
                     self._on_uid_result(item[1])
                 elif kind == "cookie_result":
                     self._on_cookie_result(item[1])
+                elif kind == "cookie_plugin_result":
+                    self._on_cookie_from_plugin_result(item[1])
                 elif kind == "dm_send_result":
                     self._on_dm_send_result(item[1])
                 elif kind == "dm_state":

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { width: 320px; margin: 0; padding: 14px 16px; font-family: "Microsoft YaHei UI", system-ui, sans-serif; }
+    h1 { font-size: 15px; margin: 0 0 6px; color: #fb7299; }
+    .warn { background: #fff7e6; border: 1px solid #ffd591; color: #873800; border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.6; }
+    .warn b { color: #d4380d; }
+    .field { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; font-size: 13px; line-height: 1.5; }
+    .field input { margin-top: 3px; }
+    button { width: 100%; padding: 9px 0; font-size: 14px; border: none; border-radius: 6px; cursor: pointer; }
+    #sendBtn { background: #fb7299; color: #fff; }
+    #sendBtn:disabled { background: #cccccc; cursor: not-allowed; }
+    #status { margin-top: 8px; font-size: 12px; color: #555; line-height: 1.5; }
+    .hint { margin-top: 10px; font-size: 11px; color: #999; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>B 站 Cookie 助手</h1>
+  <div class="warn">
+    <b>风险提示（请务必阅读）：</b>本操作会把你在 <b>bilibili.com</b> 的登录 Cookie（含
+    <b>SESSDATA</b>、<b>bili_jct</b> 等，<b>等同于你的登录凭证</b>）读取出来，并发送到
+    <b>本机 127.0.0.1:64321</b>，仅供 blive_sc_get 程序使用，<b>不会上传到任何网络</b>。<br /><br />
+    请勿在不可信环境使用；Cookie 一旦泄露即可能被盗用账号。仅在你信任的场景下开启。
+  </div>
+
+  <label class="field">
+    <input type="checkbox" id="agree" />
+    <span>我了解以上风险，并确认要把 bilibili.com 的登录 Cookie 发送到本机程序。</span>
+  </label>
+
+  <button id="sendBtn" disabled>获取并发送</button>
+  <div id="status"></div>
+  <div class="hint">使用前提：已在本程序里点击「从插件获取」。安装方法：edge://extensions（或 chrome://extensions）→
+    打开「开发者模式」→「加载已解压的扩展」→ 选择本项目 extension/ 目录。</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
