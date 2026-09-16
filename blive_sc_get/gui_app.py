@@ -1791,11 +1791,35 @@ class ScMonitorApp:
         else:
             self.medal_hint_var.set(f"已为该房间{'开启' if enabled else '关闭'}{name}")
 
+    def _try_auto_like(self, room_id: int) -> None:
+        """为某房间触发一次自动点赞（开播信号与周期轮询**共用**，ROADMAP 54/55）。
+
+        前置条件：总开关（``medal_tasks.auto``）、写操作开关、该房间「自动点赞」
+        开关、监听启用、后台就绪、未持有粉丝牌排除、且该房间当前未在执行任务。
+        任一条不满足就静默跳过——自动触发不做可见提示，避免覆盖用户提示。
+
+        点赞任务本就要求在「直播中」才能执行，故开播信号一到达即可触发，无需等
+        下一个周期轮询，这也是自动点赞能即时生效的关键。
+        """
+        if room_id in self._medal_running:
+            return
+        entry = self.entries.get(room_id)
+        if entry is None or not entry.enabled or not entry.auto_like:
+            return
+        if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
+            return
+        if not (self.app_config.auto_medal_tasks and self.app_config.allow_write_operations
+                and self.hub.ready.is_set()):
+            return
+        logger.info("房间 %s 开播/轮询触发自动点赞", room_id)
+        self._start_medal_room(room_id, manual=False, only=TASK_LIKE)
+
     def _medal_auto_tick(self) -> None:
         """周期性为「开启自动」的房间补做未完成任务（完成即停由执行引擎保证）。
 
         发弹幕 / 点赞的自动开关**各自独立**：本房间只执行它开启的那一项；两项都开
-        时在同一次执行里依次完成。
+        时在同一次执行里依次完成。点赞分支复用 ``_try_auto_like``，与开播信号的
+        即时触发保持一致判断；发弹幕仍走周期轮询（默认仅未开播时执行）。
         """
         self._medal_auto_after_id = None
         try:
@@ -1804,24 +1828,17 @@ class ScMonitorApp:
                 for room_id, entry in list(self.entries.items()):
                     if not entry.enabled or room_id in self._medal_running:
                         continue
-                    if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
-                        continue
-                    live = 1 if self.live_state.get(room_id) == "直播中" else 0
-                    types: List[str] = []
                     if entry.auto_danmaku:
+                        live = 1 if self.live_state.get(room_id) == "直播中" else 0
                         if should_auto_danmaku(live, entry.auto_danmaku_when_live):
-                            types.append(TASK_SEND_DANMAKU)
+                            self._start_medal_room(
+                                room_id, manual=False, only=TASK_SEND_DANMAKU)
                         else:
                             logger.debug(
                                 "房间 %s 正在直播且未开启「开播时也自动发弹幕」，本轮跳过发弹幕",
                                 room_id)
                     if entry.auto_like:
-                        types.append(TASK_LIKE)
-                    if not types:
-                        continue
-                    self._start_medal_room(
-                        room_id, manual=False,
-                        only=types if len(types) > 1 else types[0])
+                        self._try_auto_like(room_id)
         finally:
             self._medal_auto_after_id = self.root.after(
                 MEDAL_AUTO_INTERVAL_MS, self._medal_auto_tick)
@@ -4092,6 +4109,9 @@ class ScMonitorApp:
                     # 悬浮窗提醒：全局主开关控制这一通道，房间级开关上面已判过
                     if self.ui_prefs.get("notify_overlay", True):
                         self._notify_overlay(room_id, title)
+                # 开播信号直接触发自动点赞（ROADMAP 55）：点赞只在直播中才推进，
+                # 开播瞬间即触发，不必等下一个周期轮询
+                self._try_auto_like(room_id)
             if self.client_states.get(room_id) == "starting":
                 self.client_states[room_id] = "running"
             if self.tree.exists(str(room_id)):
