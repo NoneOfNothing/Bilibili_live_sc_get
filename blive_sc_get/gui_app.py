@@ -40,7 +40,7 @@ from .api import ApiError, BilibiliLiveAPI, describe_send_error
 from .app_config import load_app_config
 from .browser_cookie import get_bilibili_cookie
 from .cookie_server import DEFAULT_COOKIE_PORT, wait_for_extension_cookie
-from .browser_rooms import is_room_being_recorded
+from .browser_rooms import is_room_being_recorded, read_room_lock_holder
 from .cli import COOKIE_FILE_NAME, _pending_flush_loop, parse_room_id, resolve_cookie
 from .client import LIVE_STATUS_TEXT, RoomClient
 from .medal_runner import MedalTaskRunner
@@ -48,9 +48,9 @@ from .medal_tasks import (
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     TASK_WATCH_LIVE,
+    auto_task_types,
     find_task,
     is_task_complete,
-    should_auto_danmaku,
     task_label,
 )
 from .gui_config import (
@@ -193,6 +193,12 @@ MEDAL_LINK_COLUMNS = {"#3": "space", "#4": "room"}
 
 MEDAL_TASK_LINK_COLUMNS = {"#1": "room", "#2": "space"}
 """「监听房间 · 任务」表的跳转列：#1 房间 → 直播间、#2 主播 → 个人空间。"""
+
+ROOM_INFO_REFRESH_MS = 60 * 1000
+"""没有弹幕连接的房间（被其它实例占用 / 已停用监听）刷新主播名与直播标题的间隔。
+
+这些房间收不到弹幕推送的 status 事件，只能靠只读 HTTP 查询填充列表信息。
+"""
 
 MEDAL_TAB_REFRESH_MS = 90 * 1000
 """停留在「粉丝牌」页签时的自动刷新间隔（毫秒）：刷新粉丝牌列表与各房间任务，
@@ -763,6 +769,7 @@ class ScMonitorApp:
         self._medal_running: set = set()              # 正在执行任务的输入房间号
         self._medal_runner: Optional[MedalTaskRunner] = None
         self._medal_auto_after_id: Optional[str] = None
+        self._room_info_after_id: Optional[str] = None  # 无连接房间的信息刷新循环
 
         self._setup_logging()
         logger.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
@@ -778,6 +785,9 @@ class ScMonitorApp:
         self._poll_queue()
         self._medal_auto_after_id = self.root.after(
             MEDAL_AUTO_INTERVAL_MS, self._medal_auto_tick)
+        # 被占用 / 已停用监听的房间没有弹幕连接，靠只读查询刷新主播名与直播标题
+        self._room_info_after_id = self.root.after(
+            ROOM_INFO_REFRESH_MS, self._room_info_tick)
         self.hub.start()
 
     # ---------- UI 构建 ----------
@@ -1218,8 +1228,9 @@ class ScMonitorApp:
             command=self._on_medal_auto_danmaku_toggle)
         self.medal_auto_danmaku_check.pack(side="left", padx=(10, 0))
         self.medal_auto_danmaku_live_var = tk.BooleanVar(value=False)
+        # 该项是**附加许可**（默认关 = 仅未开播时自动发弹幕），文案别写成「仅开播时」
         self.medal_auto_danmaku_live_check = ttk.Checkbutton(
-            bottom, text="开播时也自动发弹幕", variable=self.medal_auto_danmaku_live_var,
+            bottom, text="允许开播时自动发弹幕", variable=self.medal_auto_danmaku_live_var,
             command=self._on_medal_auto_danmaku_live_toggle)
         self.medal_auto_danmaku_live_check.pack(side="left", padx=(6, 0))
         self.medal_auto_like_var = tk.BooleanVar(value=False)
@@ -1761,7 +1772,7 @@ class ScMonitorApp:
         self._set_room_auto(TASK_LIKE, bool(self.medal_auto_like_var.get()))
 
     def _on_medal_auto_danmaku_live_toggle(self) -> None:
-        """「开播时也自动发弹幕」：默认关（仅未开播时自动发弹幕）。"""
+        """「允许开播时自动发弹幕」：默认关（仅未开播时自动发弹幕）。"""
         room_id = self._get_selected_medal_room()
         if room_id is None or room_id not in self.entries:
             return
@@ -1821,9 +1832,11 @@ class ScMonitorApp:
     def _medal_auto_tick(self) -> None:
         """周期性为「开启自动」的房间补做未完成任务（完成即停由执行引擎保证）。
 
-        发弹幕 / 点赞的自动开关**各自独立**：本房间只执行它开启的那一项；两项都开
-        时在同一次执行里依次完成。点赞分支复用 ``_try_auto_like``，与开播信号的
-        即时触发保持一致判断；发弹幕仍走周期轮询（默认仅未开播时执行）。
+        发弹幕 / 点赞的自动开关**各自独立**，但同一房间本轮该执行的项由
+        ``auto_task_types`` 汇总成**一次提交**——一项一提交时，先提交的那一项会让
+        房间进入「执行中」，后一项被长期挡住（发弹幕可执行时点赞永远轮不到）。
+        发弹幕受「允许开播时自动发弹幕」约束（默认仅未开播时发）；点赞只在直播中
+        提交（点赞本就只能在直播中推进），开播瞬间另有 ``_try_auto_like`` 即时触发。
         """
         self._medal_auto_after_id = None
         try:
@@ -1832,17 +1845,21 @@ class ScMonitorApp:
                 for room_id, entry in list(self.entries.items()):
                     if not entry.enabled or room_id in self._medal_running:
                         continue
-                    if entry.auto_danmaku:
-                        live = 1 if self.live_state.get(room_id) == "直播中" else 0
-                        if should_auto_danmaku(live, entry.auto_danmaku_when_live):
-                            self._start_medal_room(
-                                room_id, manual=False, only=TASK_SEND_DANMAKU)
-                        else:
-                            logger.debug(
-                                "房间 %s 正在直播且未开启「开播时也自动发弹幕」，本轮跳过发弹幕",
-                                room_id)
-                    if entry.auto_like:
-                        self._try_auto_like(room_id)
+                    if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
+                        continue  # 未持有该主播粉丝牌：无任务可做（与 _try_auto_like 一致）
+                    live = 1 if self.live_state.get(room_id) == "直播中" else 0
+                    only = auto_task_types(
+                        auto_danmaku=entry.auto_danmaku, auto_like=entry.auto_like,
+                        auto_danmaku_when_live=entry.auto_danmaku_when_live,
+                        live_status=live)
+                    if not only:
+                        logger.debug(
+                            "房间 %s 本轮无自动任务可执行（直播状态=%s；自动发弹幕=%s，"
+                            "允许开播时发=%s；自动点赞=%s）",
+                            room_id, live, entry.auto_danmaku,
+                            entry.auto_danmaku_when_live, entry.auto_like)
+                        continue
+                    self._start_medal_room(room_id, manual=False, only=only)
         finally:
             self._medal_auto_after_id = self.root.after(
                 MEDAL_AUTO_INTERVAL_MS, self._medal_auto_tick)
@@ -4108,7 +4125,14 @@ class ScMonitorApp:
         if self.hub.api is None or self.hub.storage is None:
             return
         if is_room_being_recorded(self.output_dir, room_id):
+            # 一并读出锁文件里的持有者信息，便于用户判断是哪个实例在监听
+            holder = read_room_lock_holder(self.output_dir, room_id)
+            logger.warning("房间 %s 已被其它实例监听%s，本程序不重复监听"
+                           "（关闭对应窗口/进程后重启即可恢复）",
+                           room_id, f"（持有者 {holder}）" if holder else "")
             self.ui_queue.put(("client", "occupied", {"room_id": room_id}))
+            # 不建立连接就收不到 status 事件：补一次只读查询，列表仍显示主播与标题
+            self.hub.submit(self._async_fetch_uid(room_id))
             return
         client = RoomClient(self.hub.api, room_id, self.hub.storage,
                             event_callback=self._client_event)
@@ -4132,6 +4156,9 @@ class ScMonitorApp:
             if self.entries[room_id].enabled:
                 self.client_states[room_id] = "starting"
                 self.hub.submit(self._async_start_room(room_id))
+            else:
+                # 停用监听的房间不建立连接：补一次只读查询填主播名与直播标题
+                self.hub.submit(self._async_fetch_uid(room_id))
         self._refresh_all_rows()
         children = self.tree.get_children()
         if children and self._selected_room_id is None:
@@ -4236,27 +4263,76 @@ class ScMonitorApp:
                         room_id, int(payload.get("attempt") or 0))
 
     async def _async_fetch_uid(self, room_id: int) -> None:
-        """后台查询房间对应主播的 uid（点击主播名跳转个人空间用）。"""
+        """只读查询房间信息（主播 uid/昵称、直播标题、直播状态）。
+
+        两类场景共用：① 点击「主播」列而 uid 未知时补 uid；
+        ② 被其它实例占用、或已停用监听的房间**没有弹幕连接**、收不到 status
+        事件，靠它把主播名与直播标题填进列表。
+        """
+        api = self.hub.api
+        if api is None:
+            return
         try:
-            info = await self.hub.api.get_room_info(room_id)
+            info = await api.get_full_room_info(room_id)
+            uid = int(info.get("uid") or 0)
+            anchor = await api.get_anchor_name(uid) if uid else ""
         except Exception as exc:
             logger.warning("获取房间 %s 的主播信息失败：%s", room_id, exc)
             return
-        self.ui_queue.put(("uid_result", {
+        self.ui_queue.put(("room_info", {
             "room_id": room_id,
-            "uid": int(info.get("uid") or 0),
+            "uid": uid,
+            "anchor_name": anchor,
+            "title": info.get("title") or "",
+            "live_status": int(info.get("live_status") or 0),
         }))
 
-    def _on_uid_result(self, payload: dict) -> None:
+    def _on_room_info(self, payload: dict) -> None:
+        """只读房间信息到达：补主播名/直播标题，并在没有连接时采用其直播状态。
+
+        有弹幕连接时直播状态以弹幕推送为准（客户端对「关播瞬间接口缓存旧状态」
+        有专门处理），故此时不覆盖。
+        """
         room_id = int(payload.get("room_id") or 0)
-        uid = int(payload.get("uid") or 0)
         entry = self.entries.get(room_id)
-        if entry is None or not uid:
+        if entry is None:
             return
-        entry.uid = uid
-        self._save_config()
-        logger.info("已获取房间 %s 的主播 uid=%s，再次点击主播名可打开个人空间",
-                    room_id, uid)
+        uid = int(payload.get("uid") or 0)
+        if uid and entry.uid != uid:
+            entry.uid = uid
+            self._save_config()
+            logger.info("已获取房间 %s 的主播 uid=%s，再次点击主播名可打开个人空间",
+                        room_id, uid)
+        anchor = str(payload.get("anchor_name") or "")
+        if anchor:
+            self.anchor_names[room_id] = anchor
+        if self.client_states.get(room_id) not in ("running", "starting"):
+            self.live_state[room_id] = LIVE_STATUS_TEXT.get(
+                int(payload.get("live_status") or 0), "未知")
+        if self.tree.exists(str(room_id)):
+            self.tree.set(str(room_id), "title", payload.get("title") or "")
+            if anchor:
+                self.tree.set(str(room_id), "anchor", anchor)
+            self._refresh_row(room_id)
+        if room_id == self._selected_room_id:
+            self._update_sc_header(room_id)
+
+    def _rooms_without_client(self) -> List[int]:
+        """当前没有本程序弹幕连接的房间号（被占用 / 已停用 / 已停止）。"""
+        active = {rid for rid, (_client, task) in self.room_tasks.items()
+                  if not task.done()}
+        return [rid for rid in self.entries if rid not in active]
+
+    def _room_info_tick(self) -> None:
+        """周期为「没有弹幕连接」的房间刷新主播名与直播标题。"""
+        self._room_info_after_id = None
+        try:
+            if self.hub.ready.is_set():
+                for room_id in self._rooms_without_client():
+                    self.hub.submit(self._async_fetch_uid(room_id))
+        finally:
+            self._room_info_after_id = self.root.after(
+                ROOM_INFO_REFRESH_MS, self._room_info_tick)
 
     def _on_room_done(self, room_id: int) -> None:
         # 任务结束（非用户主动停用）时更新状态；已停用的保持不变
@@ -4330,8 +4406,8 @@ class ScMonitorApp:
                     self._on_history_loaded(item[1])
                 elif kind == "add_result":
                     self._on_add_result(item[1])
-                elif kind == "uid_result":
-                    self._on_uid_result(item[1])
+                elif kind == "room_info":
+                    self._on_room_info(item[1])
                 elif kind == "cookie_result":
                     self._on_cookie_result(item[1])
                 elif kind == "cookie_plugin_result":
@@ -4399,6 +4475,12 @@ class ScMonitorApp:
             except Exception:
                 pass
             self._medal_auto_after_id = None
+        if self._room_info_after_id is not None:
+            try:
+                self.root.after_cancel(self._room_info_after_id)
+            except Exception:
+                pass
+            self._room_info_after_id = None
         self._stop_medal_tab_refresh()
         try:
             # 兜底：任何退出路径都把当前表情包落盘（无变化时内部会跳过写盘）

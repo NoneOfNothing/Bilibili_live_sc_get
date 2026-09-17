@@ -16,7 +16,7 @@ from unittest import mock
 
 from blive_sc_get import protocol
 from blive_sc_get import client as client_module
-from blive_sc_get.client import NeedReconnect, RoomClient
+from blive_sc_get.client import NeedReconnect, RoomClient, compute_reconcile_delay
 from blive_sc_get.room_lock import RoomLock, RoomLockAcquireError
 from blive_sc_get.storage import SCStorage
 
@@ -575,6 +575,151 @@ class OfflineSignalTests(unittest.TestCase):
             self.assertEqual(len([p for t, p in events if t == "status"]), 2)
 
         asyncio.run(scenario())
+
+
+class _CachedOfflineAPI:
+    """模拟开播瞬间接口缓存：get_full_room_info 永远返回 live_status=0。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def get_full_room_info(self, room_id):
+        self.calls += 1
+        return {"room_id": room_id, "uid": 42, "title": "旧标题", "live_status": 0}
+
+
+class LiveStatusFlapTests(unittest.TestCase):
+    """高频开播（下播→几秒后又开播）时的状态更新：推送优先、过期失效、周期自愈。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._orig = (client_module.OFFLINE_CONFIRM_DELAY,
+                      client_module.OFFLINE_CONFIRM_RETRY_DELAY,
+                      client_module.STATUS_REFRESH_DEBOUNCE)
+        client_module.OFFLINE_CONFIRM_DELAY = 0.01
+        client_module.OFFLINE_CONFIRM_RETRY_DELAY = 0.01
+        client_module.STATUS_REFRESH_DEBOUNCE = 0.05
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (client_module.OFFLINE_CONFIRM_DELAY,
+         client_module.OFFLINE_CONFIRM_RETRY_DELAY,
+         client_module.STATUS_REFRESH_DEBOUNCE) = self._orig
+
+    def _make_client(self, api, events):
+        return RoomClient(api=api, room_id=9527, storage=SCStorage(self.tmp),
+                          event_callback=lambda t, p: events.append((t, p)))
+
+    def _feed(self, client, command: dict) -> None:
+        client._handle_business_message(json.dumps(command).encode("utf-8"))
+
+    @staticmethod
+    def _statuses(events):
+        return [p["live_status"] for t, p in events if t == "status"]
+
+    def test_live_emits_immediately_despite_cached_api(self):
+        """开播推送立即置为直播中，不被接口缓存（仍返回 0）覆盖。"""
+        events = []
+        api = _CachedOfflineAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            client._emit_status(0, "旧标题", 42)  # 基线：未开播
+            self._feed(client, {"cmd": "LIVE"})
+            # 同步即刻乐观置为直播中：不等接口、也不依赖接口是否已刷新
+            self.assertEqual(self._statuses(events), [0, 1])
+            self.assertTrue(client._live_signal)
+            await asyncio.sleep(0.15)  # 等待防抖刷新执行
+            self.assertGreaterEqual(api.calls, 1)
+            # 接口缓存仍为 0，但推送在有效期内 → 状态保持直播中
+            self.assertTrue(all(s == 1 for s in self._statuses(events)[1:]),
+                            self._statuses(events))
+
+        asyncio.run(scenario())
+
+    def test_offline_confirm_does_not_override_fresh_live(self):
+        """下播后几秒内又开播：先前的「关播确认」刷新不得把状态改回未开播。"""
+        events = []
+        api = _CachedOfflineAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            client._emit_status(1, "旧标题", 42)
+            self._feed(client, {"cmd": "PREPARING"})
+            await asyncio.sleep(0)
+            self._feed(client, {"cmd": "LIVE"})
+            await asyncio.sleep(0.2)  # 关播确认与开播刷新都会在这段时间里跑完
+            self.assertFalse(client._offline_signal)
+            self.assertTrue(all(s == 1 for s in self._statuses(events)[2:]),
+                            self._statuses(events))
+
+        asyncio.run(scenario())
+
+    def test_offline_signal_expires_so_missed_live_recovers(self):
+        """开播推送丢失时，关播信号过期后以接口为准（不再永久卡在未开播）。"""
+        events = []
+        api = _CachedLiveAPI()  # 接口始终返回 live_status=1
+
+        async def scenario():
+            client = self._make_client(api, events)
+            self._feed(client, {"cmd": "PREPARING"})
+            await asyncio.sleep(0)
+            self.assertEqual(self._statuses(events), [0])  # 推送压制接口缓存的 1
+            # 模拟信号已过期（推送给出的关播状态超过有效期）
+            client._offline_signal_at -= client_module.PUSH_STATUS_TTL + 1
+            self.assertTrue(await client._refresh_room_status("周期复核"))
+            self.assertEqual(self._statuses(events)[-1], 1)  # 以接口为准恢复
+            self.assertFalse(client._offline_signal)
+
+        asyncio.run(scenario())
+
+    def test_repeated_live_push_emits_once(self):
+        """重复的开播推送不重复广播（避免重复提醒）。
+
+        屏蔽刷新，单独观察**推送**产生的广播次数（刷新广播同一状态是允许的：
+        它顺带更新标题，且界面只在状态**变化**时提醒）。
+        """
+        events = []
+        api = _CachedOfflineAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            client._emit_status(0, "t", 42)
+            with mock.patch.object(client, "_schedule_status_refresh"):
+                for _ in range(3):
+                    self._feed(client, {"cmd": "LIVE"})
+            self.assertEqual(self._statuses(events), [0, 1])
+
+        asyncio.run(scenario())
+
+    def test_reconcile_loop_refreshes_status(self):
+        """周期复核循环按间隔刷新状态（兜底修正丢失的推送）。"""
+        events = []
+        api = _CachedLiveAPI()
+
+        async def scenario():
+            client = self._make_client(api, events)
+            # 缩短复核间隔，避免测试真等 5 分钟（真实间隔由 compute_reconcile_delay 决定）
+            with mock.patch.object(client_module, "compute_reconcile_delay",
+                                   lambda **kw: 0.02):
+                task = asyncio.create_task(client._status_reconcile_loop())
+                await asyncio.sleep(0.09)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.assertGreaterEqual(api.calls, 2, f"复核次数不足：{api.calls}")
+            self.assertTrue(self._statuses(events))
+
+        asyncio.run(scenario())
+
+    def test_reconcile_delay_jitter_within_bounds(self):
+        """复核间隔带 ±jitter 抖动（多房间不同时撞点），且不短于 1 秒。"""
+        low = compute_reconcile_delay(base=300.0, jitter=0.3, rng=lambda: 0.0)
+        high = compute_reconcile_delay(base=300.0, jitter=0.3,
+                                       rng=lambda: 0.999999)
+        self.assertAlmostEqual(low, 210.0, places=3)
+        self.assertLess(high, 300.0 * 1.3)
+        self.assertGreaterEqual(compute_reconcile_delay(base=0.2, jitter=0.0), 1.0)
 
 
 class HeartbeatTimeoutTests(unittest.TestCase):

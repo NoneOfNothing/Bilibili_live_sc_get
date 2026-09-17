@@ -143,6 +143,27 @@ def should_auto_danmaku(live_status: int, when_live: bool) -> bool:
     return True
 
 
+def auto_task_types(*, auto_danmaku: bool, auto_like: bool,
+                    auto_danmaku_when_live: bool, live_status: int) -> List[str]:
+    """本轮「自动任务」该执行哪些类型（Tk / Qt 两版共用，避免各自实现漂移）。
+
+    - **发弹幕**：受「允许开播时自动发弹幕」约束（未开播恒执行；开播时需该开关为真）；
+    - **点赞**：仅在直播中有意义（执行引擎也会跳过），未开播时不提交，省掉必然被
+      跳过的请求；
+    - 两项都满足时**一起返回**：由同一次执行依次完成——若分成两次提交，先提交的
+      那一项会让房间进入「执行中」，后一项会被长期挡住（发弹幕可执行时点赞永远轮不到）。
+
+    返回空列表表示该房间本轮无事可做。自动执行的整体前置条件（总开关 / 写操作 /
+    监听启用 / 未持有粉丝牌等）由调用方负责。
+    """
+    types: List[str] = []
+    if auto_danmaku and should_auto_danmaku(live_status, auto_danmaku_when_live):
+        types.append(TASK_SEND_DANMAKU)
+    if auto_like and _int(live_status) == 1:
+        types.append(TASK_LIKE)
+    return types
+
+
 def is_task_applicable(task: Any) -> bool:
     """任务当前是否**可执行**：有正数上限且尚未完成。
 

@@ -16,6 +16,7 @@ from blive_sc_get.api import (
     describe_like_error,
 )
 from blive_sc_get.app_config import (
+    DEFAULT_CONFIG_TEMPLATE,
     DEFAULT_MEDAL_DANMAKU_INTERVAL,
     DEFAULT_MEDAL_LIKE_INTERVAL,
     DEFAULT_MEDAL_MAX_RETRY,
@@ -28,6 +29,7 @@ from blive_sc_get.medal_tasks import (
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     TASK_WATCH_LIVE,
+    auto_task_types,
     compute_action_delay,
     dedupe_medals,
     find_task,
@@ -197,6 +199,29 @@ class TaskParsingTests(unittest.TestCase):
         # 开播：默认不执行，需显式开启「开播时也自动发弹幕」
         self.assertFalse(should_auto_danmaku(1, False))
         self.assertTrue(should_auto_danmaku(1, True))
+
+    def test_auto_task_types(self):
+        def kinds(**kw):
+            args = {"auto_danmaku": False, "auto_like": False,
+                    "auto_danmaku_when_live": False, "live_status": 0}
+            args.update(kw)
+            return auto_task_types(**args)
+
+        # 未开播：发弹幕照发；点赞无意义（点赞只在直播中推进）
+        self.assertEqual(kinds(auto_danmaku=True), [TASK_SEND_DANMAKU])
+        self.assertEqual(kinds(auto_danmaku=True, auto_danmaku_when_live=True),
+                         [TASK_SEND_DANMAKU])
+        self.assertEqual(kinds(auto_like=True), [])
+        # 直播中：点赞可执行；发弹幕默认被禁，允许时**两项一起**返回
+        self.assertEqual(kinds(auto_like=True, live_status=1), [TASK_LIKE])
+        self.assertEqual(kinds(auto_danmaku=True, auto_like=True, live_status=1),
+                         [TASK_LIKE])
+        self.assertEqual(
+            kinds(auto_danmaku=True, auto_like=True, live_status=1,
+                  auto_danmaku_when_live=True),
+            [TASK_SEND_DANMAKU, TASK_LIKE])
+        # 都关 → 无事可做
+        self.assertEqual(kinds(live_status=1), [])
 
     def test_pending_write_tasks_skips_not_lit(self):
         # 未点亮（sub_title「仅点亮」）解析出的 limit 为 0，不应计入待办
@@ -441,6 +466,106 @@ class MedalConfigTests(unittest.TestCase):
         self.assertEqual(cfg.medal_like_interval, DEFAULT_MEDAL_LIKE_INTERVAL)
         self.assertEqual(cfg.medal_danmaku_interval, DEFAULT_MEDAL_DANMAKU_INTERVAL)
         self.assertEqual(cfg.medal_max_retry, DEFAULT_MEDAL_MAX_RETRY)
+
+
+class AppConfigCompletionTests(unittest.TestCase):
+    """老版本 config.json 的字段补全（只补缺失项，绝不覆盖已有值）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / "config.json"
+
+    def _load_json(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _write(self, data):
+        self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def test_old_config_gets_new_fields(self):
+        # 复现用户场景：老版本生成的文件没有 medal_tasks 段、说明也没提
+        self._write({
+            "_说明": "老版本说明（不含 medal_tasks）",
+            "allow_write_operations": True,
+            "emoticon_tooltip": {"text": True, "unique": False, "id": False},
+        })
+        cfg = load_app_config(self.path)
+        data = self._load_json()
+        self.assertIn("medal_tasks", data)
+        self.assertFalse(data["medal_tasks"]["auto"])
+        self.assertEqual(data["medal_tasks"]["like_interval_sec"], [15, 20])
+        self.assertEqual(data["medal_tasks"]["danmaku_interval_sec"], [6, 8])
+        self.assertEqual(data["medal_tasks"]["max_retry"], 3)
+        # 已有值一律保留
+        self.assertTrue(data["allow_write_operations"])
+        self.assertEqual(data["emoticon_tooltip"],
+                         {"text": True, "unique": False, "id": False})
+        # 说明刷新为最新模板（含新字段说明）
+        template_note = json.loads(DEFAULT_CONFIG_TEMPLATE)["_说明"]
+        self.assertEqual(data["_说明"], template_note)
+        self.assertIn("medal_tasks", template_note)
+        # 解析结果不受影响
+        self.assertFalse(cfg.auto_medal_tasks)
+        self.assertTrue(cfg.allow_write_operations)
+
+    def test_existing_values_not_overwritten(self):
+        self._write({
+            "medal_tasks": {"auto": True, "like_interval_sec": [3, 5],
+                            "danmaku_interval_sec": [1, 2], "max_retry": 1},
+        })
+        cfg = load_app_config(self.path)
+        data = self._load_json()
+        self.assertTrue(data["medal_tasks"]["auto"])
+        self.assertEqual(data["medal_tasks"]["like_interval_sec"], [3, 5])
+        self.assertTrue(cfg.auto_medal_tasks)
+        self.assertEqual(cfg.medal_like_interval, (3.0, 5.0))
+
+    def test_partial_section_is_filled(self):
+        # 段存在但缺子项：只补缺的那个
+        self._write({"medal_tasks": {"auto": True}})
+        load_app_config(self.path)
+        data = self._load_json()
+        self.assertTrue(data["medal_tasks"]["auto"])
+        self.assertEqual(data["medal_tasks"]["max_retry"], 3)
+        self.assertEqual(data["medal_tasks"]["like_interval_sec"], [15, 20])
+
+    def test_extra_user_keys_preserved(self):
+        self._write({"我自己的键": {"a": 1}, "allow_write_operations": False})
+        load_app_config(self.path)
+        data = self._load_json()
+        self.assertEqual(data["我自己的键"], {"a": 1})
+        self.assertFalse(data["allow_write_operations"])
+
+    def test_explicitly_disabled_tooltip_survives_completion(self):
+        # 空对象是「显式关掉」的写法：补全不得把 text: true 加回去
+        for raw in ('{"emoticon_tooltip": {}}', '{"emoticon_tooltip": []}'):
+            self.path.write_text(raw, encoding="utf-8")
+            self.assertEqual(load_app_config(self.path).emoticon_tooltip, (), raw)
+
+    def test_invalid_medal_type_not_silently_fixed(self):
+        # 类型写错（字符串）不静默改成对象：保留原样，按默认值运行并告警
+        self._write({"medal_tasks": "true", "allow_write_operations": True})
+        cfg = load_app_config(self.path)
+        self.assertFalse(cfg.auto_medal_tasks)
+        self.assertEqual(self._load_json()["medal_tasks"], "true")
+
+    def test_idempotent_and_no_rewrite_when_complete(self):
+        load_app_config(self.path)          # 首次：不存在 → 写模板
+        first = self.path.read_text(encoding="utf-8")
+        load_app_config(self.path)          # 第二次：已完整 → 不再改写
+        self.assertEqual(self.path.read_text(encoding="utf-8"), first)
+
+    def test_non_object_config_not_rewritten(self):
+        self.path.write_text("[]", encoding="utf-8")
+        cfg = load_app_config(self.path)
+        self.assertFalse(cfg.allow_write_operations)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "[]")
+
+    def test_corrupt_config_not_rewritten(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        cfg = load_app_config(self.path)
+        self.assertFalse(cfg.allow_write_operations)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{not json")
 
 
 class RoomEntryAutoMedalTests(unittest.TestCase):

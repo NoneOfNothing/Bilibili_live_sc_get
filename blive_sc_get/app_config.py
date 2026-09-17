@@ -154,6 +154,70 @@ def _parse_retry(value: Any, default: int, *, upper: int = 10) -> int:
     return min(value, upper)
 
 
+def _template_defaults() -> Dict[str, Any]:
+    """默认模板解析出的结构（去掉 ``_`` 开头的说明字段），用于补全缺失配置项。
+
+    直接解析 ``DEFAULT_CONFIG_TEMPLATE``，避免模板与补全逻辑两处维护而走偏。
+    """
+    try:
+        data = json.loads(DEFAULT_CONFIG_TEMPLATE)
+    except ValueError:  # 模板自身损坏：不做补全（不影响按默认值运行）
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if not key.startswith("_")}
+
+
+def _merge_missing(target: Dict[str, Any], defaults: Dict[str, Any]) -> bool:
+    """把 ``defaults`` 中**缺失**的键补进 ``target``（嵌套对象递归），返回是否有改动。
+
+    - 只补缺失键，**绝不覆盖已有值**（用户改过的值一律保留，含显式 ``false``）；
+    - 已有值类型不对（如把 ``medal_tasks`` 写成字符串）时保留原样，交由解析层
+      按默认值处理并告警（不静默"修好"用户的错误配置）；
+    - **空对象不递归填充**：空对象往往是「显式声明什么都不用」的写法
+      （如 ``emoticon_tooltip: {}`` 表示不显示悬浮提示），按模板补上
+      ``text: true`` 会把用户关掉的功能又打开；
+    - 用户自己加的额外键保留。
+    """
+    changed = False
+    for key, value in defaults.items():
+        if key not in target:
+            target[key] = value
+            changed = True
+        elif (isinstance(value, dict) and isinstance(target.get(key), dict)
+                and target[key]):
+            changed = _merge_missing(target[key], value) or changed
+    return changed
+
+
+def _complete_existing_config(config_path: Path, raw: Dict[str, Any]) -> None:
+    """把后来新增的配置项补进**已存在**的 ``config.json``。
+
+    只在首次运行（文件不存在）时写模板，会漏掉老版本文件：用户升级后
+    ``medal_tasks`` 之类的段根本不出现在文件里，既看不到也无从开启。这里在读取时
+    就地补全缺失键，并顺带把自动生成的 ``_说明`` 刷新为最新版本（旧说明会漏讲新项）。
+    """
+    defaults = _template_defaults()
+    if not defaults:
+        return
+    if not _merge_missing(raw, defaults):
+        return  # 没有缺失项：不动文件（也不刷新说明），避免每次启动都重写
+    try:
+        note = json.loads(DEFAULT_CONFIG_TEMPLATE).get("_说明")
+        if isinstance(note, str) and note:
+            raw["_说明"] = note
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.debug("补全应用配置失败（%s）: %s", config_path, exc)
+        return
+    except ValueError as exc:  # 模板异常：仅跳过说明刷新
+        logger.debug("刷新配置说明失败（%s）: %s", config_path, exc)
+        return
+    logger.info("已补全应用配置 %s 中缺失的字段（已有设置保持不变），"
+                "新增项见文件内的 _说明", config_path)
+
+
 def _write_default_config(config_path: Path) -> None:
     """首次运行（或文件不存在）时生成带字段说明的默认配置文件。
 
@@ -170,8 +234,10 @@ def _write_default_config(config_path: Path) -> None:
 def load_app_config(path: Optional[Union[str, Path]] = None) -> AppConfig:
     """读取应用配置；文件损坏/字段非法时回退默认（写操作关闭）。
 
-    文件不存在时视为首次运行：自动生成带字段说明的默认配置文件
-    （生成失败不影响本次运行）。
+    文件不存在时视为首次运行：自动生成带字段说明的默认配置文件；
+    文件已存在但缺少后来新增的字段（如老版本留下的 ``config.json`` 没有
+    ``medal_tasks`` 段）时，**就地补全缺失字段**后再解析（已有值不变）。
+    生成/补全失败不影响本次运行。
     """
     config_path = Path(path) if path is not None else CONFIG_FILE_PATH
     try:
@@ -187,6 +253,9 @@ def load_app_config(path: Optional[Union[str, Path]] = None) -> AppConfig:
     raw: Dict[str, Any] = data if isinstance(data, dict) else {}
     if not isinstance(data, dict):
         logger.warning("应用配置格式异常（应为 JSON 对象），使用默认（写操作关闭）")
+    else:
+        # 老版本文件不会自动获得新字段：读取时就地补全（用户已有值与自定义键保留）
+        _complete_existing_config(config_path, raw)
     medal_raw = raw.get("medal_tasks")
     medal = medal_raw if isinstance(medal_raw, dict) else {}
     if medal_raw is not None and not isinstance(medal_raw, dict):

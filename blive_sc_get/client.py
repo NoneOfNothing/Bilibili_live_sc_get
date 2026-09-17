@@ -60,7 +60,38 @@ OFFLINE_CONFIRM_DELAY = 3.0
 OFFLINE_CONFIRM_RETRY_DELAY = 5.0
 """关播确认刷新失败后的重试间隔（秒）。"""
 
+PUSH_STATUS_TTL = 30.0
+"""弹幕推送状态的有效期（秒）：窗口内接口返回**相反**状态时以推送为准。
+
+关播瞬间 `get_info` 常返回缓存的 ``live_status=1``；开播瞬间同样可能仍返回缓存的
+``0``。推送是权威信号，但**推送可能丢失**（断线期间重开播、服务端未推），因此只在
+窗口内压制接口——过期后以接口为准，否则一次丢失的开播推送会让状态永久卡在「未开播」
+（这正是高频开播时最容易踩的坑）。
+"""
+
+STATUS_RECONCILE_INTERVAL = 5 * 60.0
+"""周期性状态复核间隔（秒）：兜底修正丢失的推送。
+
+高频开播（下播→再开播只隔数秒）时推送最容易丢，纯事件驱动会漏；每房间每 5 分钟
+一次只读查询（`get_full_room_info`）开销可忽略，且能让状态自愈。
+"""
+
 LIVE_STATUS_TEXT = {0: "未开播", 1: "直播中", 2: "轮播中"}
+
+
+def compute_reconcile_delay(*, base: float = STATUS_RECONCILE_INTERVAL,
+                            jitter: float = RECONNECT_JITTER,
+                            rng: Optional[Callable[[], float]] = None) -> float:
+    """本次周期状态复核的等待秒数（纯函数，便于单测）。
+
+    默认在 ``STATUS_RECONCILE_INTERVAL`` 上叠加 ±jitter 抖动：多个房间同时启动时
+    复核时刻会撞在一起，抖动可避免周期性请求尖峰（与重连退避同一套做法）。
+    ``rng`` 可注入（返回 ``[0, 1)`` 的可调用对象）以便测试确定化。
+    """
+    if rng is None:
+        rng = random.random
+    spread = max(0.0, float(base)) * max(0.0, float(jitter))
+    return max(1.0, float(base) + (rng() * 2 - 1) * spread)
 
 
 def _as_int(value) -> int:
@@ -116,6 +147,10 @@ class RoomClient:
         self._last_status_refresh = 0.0  # monotonic 时间戳，用于状态刷新防抖
         self._status_refresh_pending = False  # 防抖窗口内已有待发的合并刷新
         self._offline_signal = False  # 收到 PREPARING/STOP_LIVE_ROOM_LIST 等确定性关播信号
+        self._offline_signal_at = 0.0  # 关播信号时间戳（超过 PUSH_STATUS_TTL 不再压制接口）
+        self._live_signal = False  # 收到 LIVE 开播信号（窗口内压制接口返回的缓存 0）
+        self._live_signal_at = 0.0
+        self._last_status: Optional[int] = None  # 最近一次广播的直播状态（推送去重用）
         self._dm_enabled = False  # 弹幕接收开关（GUI 按当前选中房间设置）
         self._title = ""  # 最近一次已知的直播标题（离线兜底 emit 用）
         self._uid = 0  # 最近一次已知的主播 uid
@@ -202,12 +237,12 @@ class RoomClient:
             self._storage.flush_pending(self._room_id)
         if self._room_id != self._room_id_input:
             self._log.info("输入的 %s 是短号，已转换为真实房间号 %s", self._room_id_input, self._room_id)
-        status_text = LIVE_STATUS_TEXT.get(int(room_info.get("live_status") or 0), "未知")
+        # 连接时拉到的数据也可能落在缓存窗口里（快速重连时尤其明显）：
+        # 与近期的推送状态取权威者（推送优先，过期后以接口为准）。
+        live_status = self._resolve_status(
+            int(room_info.get("live_status") or 0), "连接时")
+        status_text = LIVE_STATUS_TEXT.get(live_status, "未知")
         self._log.info("房间 %s（%s）标题：%s", self._room_id, status_text, room_info.get("title") or "未知")
-        live_status = int(room_info.get("live_status") or 0)
-        if live_status == 1:
-            # 连接时拉到的是新鲜数据，可清除可能残留的陈旧关播信号
-            self._offline_signal = False
         if not self._anchor_name:
             # 主播名基本不变，取一次即可；失败留空，下次重连再试
             self._anchor_name = await self._api.get_anchor_name(int(room_info.get("uid") or 0))
@@ -239,6 +274,8 @@ class RoomClient:
             await self._send_auth(ws, danmu_info.get("token") or "")
             recv_task = asyncio.create_task(self._recv_loop(ws))
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+            # 周期状态复核：兜底修正丢失的开播/关播推送（随连接创建与取消）
+            reconcile_task = asyncio.create_task(self._status_reconcile_loop())
             done = set()
             try:
                 await asyncio.wait_for(self._auth_ok.wait(), AUTH_TIMEOUT)
@@ -251,12 +288,14 @@ class RoomClient:
                         "url": url,
                     })
                 done, _pending = await asyncio.wait(
-                    {recv_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
+                    {recv_task, heartbeat_task, reconcile_task},
+                    return_when=asyncio.FIRST_COMPLETED
                 )
             finally:
-                for task in (recv_task, heartbeat_task):
+                for task in (recv_task, heartbeat_task, reconcile_task):
                     task.cancel()
-                await asyncio.gather(recv_task, heartbeat_task, return_exceptions=True)
+                await asyncio.gather(recv_task, heartbeat_task, reconcile_task,
+                                     return_exceptions=True)
             # 把先结束任务里的异常传播出去（如心跳超时）
             for task in done:
                 if not task.cancelled() and task.exception() is not None:
@@ -356,8 +395,7 @@ class RoomClient:
         elif cmd.startswith("SUPER_CHAT_MESSAGE"):
             self._on_super_chat(command)
         elif cmd == "LIVE":
-            self._offline_signal = False  # 开播信号同样权威，清除关播信号
-            self._schedule_status_refresh("开播")
+            self._on_live_signal()
         elif cmd == "PREPARING":
             self._on_offline_signal("下播/准备中")
         elif cmd == "ROOM_CHANGE":
@@ -444,11 +482,62 @@ class RoomClient:
         关播瞬间 room/v1/Room/get_info 常返回缓存的 live_status=1，因此本地状态
         以弹幕推送为准，随后延迟重拉接口复核并刷新标题等字段。
         """
+        self._offline_signal_at = time.monotonic()
         if not self._offline_signal:
             self._offline_signal = True
+            self._live_signal = False  # 关播信号权威，撤销未过期的开播保护
             self._log.info("收到关播信号（%s），状态置为未开播", reason)
             self._emit_status(0)
         self._schedule_offline_confirm()
+
+    def _on_live_signal(self) -> None:
+        """确定性开播信号处理：立即置为直播中，并安排一次状态刷新补齐标题等字段。
+
+        与关播对称——**开播瞬间接口同样可能返回缓存的 live_status=0**，若只依赖
+        「收到开播 → 拉接口」，会被缓存值覆盖成未开播（状态卡住、开播提醒不触发、
+        依赖开播的自动点赞也不动），高频开播（下播几秒后又开播）时尤其明显。
+        推送是权威信号，故先乐观置 1，再由防抖刷新补齐标题/uid/主播信息。
+        """
+        self._live_signal = True
+        self._live_signal_at = time.monotonic()
+        self._offline_signal = False  # 开播信号同样权威，清除关播信号
+        if self._last_status != 1:
+            self._log.info("收到开播信号，状态置为直播中")
+            self._emit_status(1)
+        self._schedule_status_refresh("开播")
+
+    def _push_status(self) -> Optional[int]:
+        """近期弹幕推送给出的状态（``PUSH_STATUS_TTL`` 内有效），无则 ``None``。
+
+        开播/关播推送都比接口缓存新鲜，但推送可能丢失（断线期间重开播等），
+        因此只在窗口内压制接口——过期后以接口为准，避免状态被一次丢失的推送
+        永久带偏。
+        """
+        now = time.monotonic()
+        if self._live_signal and now - self._live_signal_at <= PUSH_STATUS_TTL:
+            return 1
+        if self._offline_signal and now - self._offline_signal_at <= PUSH_STATUS_TTL:
+            return 0
+        return None
+
+    def _resolve_status(self, api_status: int, source: str) -> int:
+        """接口状态与近期推送状态取权威者（推送优先，但仅在有效期内）。
+
+        顺带清理已无用处的反向信号：接口已给出直播中说明关播信号过期/不适用，
+        反之亦然（有效期内的冲突在上面已按推送返回，不会走到清理分支）。
+        """
+        push = self._push_status()
+        if push is not None and push != api_status:
+            self._log.info("接口返回%s但近期推送为%s（%s），以推送为准",
+                           LIVE_STATUS_TEXT.get(api_status, "未知"),
+                           LIVE_STATUS_TEXT.get(push, "未知"), source)
+            return push
+        if api_status == 1 and self._offline_signal:
+            # 拉到新鲜数据证明已开播：清除陈旧的关播信号
+            self._offline_signal = False
+        elif api_status == 0 and self._live_signal:
+            self._live_signal = False
+        return api_status
 
     def _schedule_offline_confirm(self) -> None:
         if self._offline_confirm_task is not None and not self._offline_confirm_task.done():
@@ -493,20 +582,30 @@ class RoomClient:
         except (ApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             self._log.debug("刷新房间状态失败（%s）: %s", reason, exc)
             return False
-        live_status = int(info.get("live_status") or 0)
-        if self._offline_signal and live_status == 1:
-            # 关播瞬间接口常返回缓存的旧状态，以弹幕推送的关播信号为准
-            self._log.info("接口返回直播中但近期收到过关播信号，按未开播处理")
-            live_status = 0
+        live_status = self._resolve_status(
+            int(info.get("live_status") or 0), reason)
         status_text = LIVE_STATUS_TEXT.get(live_status, "未知")
         title = info.get("title") or ""
         self._log.info("房间状态更新（%s）：%s，标题：%s", reason, status_text, title or "未知")
         self._emit_status(live_status, title, int(info.get("uid") or 0))
         return True
 
+    async def _status_reconcile_loop(self) -> None:
+        """周期性复核房间状态，兜底修正丢失的开播/关播推送（高频开播时最易丢）。"""
+        while True:
+            await asyncio.sleep(compute_reconcile_delay())
+            try:
+                await self._refresh_room_status("周期复核")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # 复核失败不影响监听本身
+                self._log.debug("周期状态复核失败: %s", exc)
+
     def _emit_status(self, live_status: int, title: Optional[str] = None,
                      uid: Optional[int] = None) -> None:
         """统一构造并广播 status 事件，同时维护本地缓存（离线兜底 emit 依赖）。"""
+        live_status = int(live_status)
+        self._last_status = live_status
         if title is not None:
             self._title = title
         if uid is not None:

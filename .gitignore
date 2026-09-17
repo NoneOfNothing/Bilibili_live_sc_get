@@ -17,8 +17,11 @@ start_sc_*.bat
 # 个人 cookie，切勿提交
 cookie.txt
 
+# 个人 IDE 工作区文件（含本机路径/窗口布局），勿提交
 .zcode/
 .vscode/
 .codebuddy/
+*.code-workspace
+.trae/
 # 个人应用配置（含写操作开关与悬浮提示配置），勿提交；首次运行自动生成
 config.json

@@ -246,11 +246,15 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(data["emoticon_tooltip"], {"text": True, "unique": False,
                                                     "id": False})
 
-    def test_existing_config_not_overwritten(self):
+    def test_existing_config_values_not_overwritten(self):
+        # 已存在的配置：用户写的值一律保留；缺失的新字段会被补全
+        # （老版本留下的文件否则看不到 medal_tasks 等新项，也无从开启自动任务）
         self.path.write_text('{"allow_write_operations": true}', encoding="utf-8")
         self.assertTrue(load_app_config(self.path).allow_write_operations)
-        self.assertEqual(self.path.read_text(encoding="utf-8"),
-                         '{"allow_write_operations": true}')
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertIs(data["allow_write_operations"], True)
+        self.assertIn("medal_tasks", data)
+        self.assertIs(data["medal_tasks"]["auto"], False)
 
     def test_corrupt_config_not_overwritten(self):
         # 损坏的配置按默认处理，但不覆盖用户文件（避免吞掉可手工修复的内容）
