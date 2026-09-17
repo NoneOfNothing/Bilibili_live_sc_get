@@ -7,7 +7,11 @@ import time
 import unittest
 from pathlib import Path
 
-from blive_sc_get.browser_rooms import find_open_live_rooms, is_room_being_recorded
+from blive_sc_get.browser_rooms import (
+    find_open_live_rooms,
+    is_room_being_recorded,
+    read_room_lock_holder,
+)
 from blive_sc_get.room_lock import RoomLock
 
 
@@ -92,6 +96,20 @@ class IsRoomBeingRecordedTests(unittest.TestCase):
         finally:
             lock.release()
         self.assertFalse(is_room_being_recorded(self.tmp, 9527))
+
+    def test_read_holder_missing_file(self):
+        self.assertEqual(read_room_lock_holder(self.tmp, 9527), "")
+
+    def test_read_holder_reports_owner(self):
+        lock = RoomLock(self.tmp / "room_9527")
+        lock.acquire()
+        try:
+            holder = read_room_lock_holder(self.tmp, 9527)
+        finally:
+            lock.release()
+        self.assertIn("pid=", holder)
+        self.assertIn("started=", holder)
+        self.assertNotIn("\n", holder)  # 换行已折成空格，便于直接写进日志/提示
 
 
 if __name__ == "__main__":

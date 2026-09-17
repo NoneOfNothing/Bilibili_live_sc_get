@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 
-from .room_lock import RoomLock, RoomLockAcquireError
+from .room_lock import LOCK_FILE_NAME, RoomLock, RoomLockAcquireError
 
 logger = logging.getLogger(__name__)
 
@@ -89,3 +89,18 @@ def is_room_being_recorded(base_dir: Union[str, Path], room_id: int) -> bool:
         return True
     lock.release()
     return False
+
+
+def read_room_lock_holder(base_dir: Union[str, Path], room_id: int) -> str:
+    """读取房间锁文件里记录的持有者信息（形如 ``pid=1234 started=2026-…``）。
+
+    仅用于把「被谁占用」写进日志/界面提示，便于用户定位是哪个实例在监听
+    （例如另一个 GUI 窗口或命令行进程）。文件缺失、损坏或读取失败时返回空串；
+    读取内容不会破坏锁本身（持有者的字节范围锁在文件末尾之后的偏移上）。
+    """
+    try:
+        text = (Path(base_dir) / f"room_{room_id}" / LOCK_FILE_NAME).read_text(
+            encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+    return text.strip().replace("\n", " ")
