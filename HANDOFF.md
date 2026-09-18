@@ -30,13 +30,14 @@ SC 富文本查看、弹幕显示/发送、表情包、粉丝牌任务、开播�
 | 版本 | 入口脚本 | 入口模块 | 启动 | 说明 |
 |------|---------|---------|------|------|
 | **Tk** | `gui.py` | `blive_sc_get/gui_app.py`（~4426 行） | 双击 `start_gui.bat` | 功能最全、最久经考验 |
-| **Qt (PySide6)** | `qt_gui.py` | `blive_sc_get/qt_app.py` + `qt_dm_panel.py` + `qt_medal_tab.py` + `qt_overlay.py` | 双击 `start_gui_qt.bat` | 迁移目标，已功能对等 |
+| **Qt (PySide6)** | `qt_gui.py` | `blive_sc_get/qt_app.py` + `qt_dm_panel.py` + `qt_medal_tab.py` + `qt_overlay.py` + `qt_preview.py`（直播预览，Qt 专属） | 双击 `start_gui_qt.bat` | 迁移目标，已功能对等且带 Qt 专属增强 |
 
 - 命令行走 `main.py`（无 GUI）。
 - 业务层（复用）：`api.py`、`client.py`（WebSocket/SC）、`storage.py`（JSONL/CSV 落盘）、
   `medal_runner.py` + `medal_tasks.py`（粉丝牌任务引擎）、`cookie_server.py`（插件收 Cookie）、
   `gui_config.py`（房间条目 + 界面偏好）、`app_config.py`（应用级配置：写操作开关、粉丝牌任务、运行日志）、
-  `log_setup.py` + `log_categories.py`（运行日志：级别 / 区块过滤 / 轮转文件，Tk / Qt / CLI 共用）、`browser_cookie.py`、
+  `log_setup.py` + `log_categories.py`（运行日志：级别 / 区块过滤 / 轮转文件，Tk / Qt / CLI 共用）、
+  `live_preview.py`（直播预览回环代理：注入防盗链请求头 + m3u8 分片改写；框架无关，两版共用）、`browser_cookie.py`、
   `browser_rooms.py`（`--auto` 实验性）、`overlay.py`（Tk 悬浮窗）、`room_lock.py`、`protocol.py`。
 - Qt 迁移只重写了「渲染/交互层」，文件清单见 `QT_PORTING.md`。
 
@@ -93,13 +94,24 @@ python -m venv .venv
 
 ## 7. 已知缺口 / 后续建议（未做，非阻塞）
 
-1. **Qt 弹幕表情「原图预览」仍是文字提示**：Tk 版悬浮表情能在提示窗显示原图（懒加载 + 内存缓存），
-   Qt 版当前只显示触发词 + 配置文案。要做需新建异步图片下载/缓存基建，并用
-   `QTextImageFormat` 把表情段渲染成内嵌图 + 与弹幕 4000 行裁剪联动回收。**属新能力，无需必须做**。
-2. **`--auto` 自动跟随浏览器**是实验性实现（README 明确不推荐），磁盘快照字节扫描可靠性有限。
+1. ~~Qt 弹幕表情「原图预览」仍是文字提示~~ **已完成**：Qt 版现在把表情图**内嵌进弹幕流**（未下载完
+   先显示触发词，图片到位后按 `QTextBlock` 原地换图），并带「弹幕表情图」开关（关闭即把已显示的图片
+   还原为文字、悬浮恢复为看原图；重新开启再把已有触发词换回图片）。
+2. **直播预览（ROADMAP 63）P1~P4 全部完成**：P1 单路预览（Qt 版浮窗 `qt_preview.py` + 回环代理
+   `live_preview.py` + 定时换源 + 未登录仅 360P/720P + **断流自愈**：5 秒心跳检查「在播 + 未暂停 +
+   播放器停住」即自动重新拉流，含 15 秒起播宽限期与 3 次重试上限）；P2 观看时长上报
+   （`webHeartBeat` 心跳 + 浮窗「上报观看时长」开关 + 「已上报 mm:ss」，默认关闭、受
+   `allow_write_operations` 与登录态双重约束，只对主路、只在真正在看时上报）；P3 多路预览
+   （最多 4 路宫格、仅主路出声、副路卡顿或 CPU 偏高自动停路、每路**独立**播放器与回环代理）；
+   P4 打磨（加密房间密码——**只存内存**不落盘、清晰度记忆 `ui.preview_quality`、失败提示文案、
+   双击放大 / 双击房间行加入预览），以及后续按反馈补的**自动追边**（实测播放端固有落后约
+   0.1~0.2 秒/分钟，累计超过 `preview.max_drift_sec`（默认 3 秒）自动重载跳到最新；代理转发
+   改为 `iter_any()` 不攒块）。
+   Tk 版按双版方针只保留框架无关的拉流与代理层，未接界面。
+3. **`--auto` 自动跟随浏览器**是实验性实现（README 明确不推荐），磁盘快照字节扫描可靠性有限。
    后续方向（讨论过未实施）：把浏览器扩展升级为「常驻双向通道」以替代磁盘快照监控；弹幕/表情
    处理做成可配置；SQLite 归档去重迁移数据层；过滤日志 + 崩溃自愈的可观测性增强。
-3. Tk 版仍是「另一份完整实现」：改业务层时要两版同步；若日后只保留 Qt，可删除 `gui_app.py` 的
+4. Tk 版仍是「另一份完整实现」：改业务层时要两版同步；若日后只保留 Qt，可删除 `gui_app.py` 的
    Tk 部分但需谨慎（`CLI`、`overlay.py`、工具函数共享，先解耦再删）。
 
 ## 8. 本会话最近完成（会话 2026 批次 Qt 收尾）

@@ -1,6 +1,8 @@
 aiohttp>=3.8.6,<4
 Brotli>=1.0.9
 pycryptodome>=3.19
-PySide6>=6.6
+# 直播预览（ROADMAP 63）依赖 Qt 6.8+ 的 FFmpeg 默认多媒体后端：6.8 以下在 Windows 上
+# 走 WMF 后端，HTTP-FLV 播不了（可用 _spike_live_preview.py 复测本机内核）
+PySide6>=6.8
 
 Pillow>=10.0

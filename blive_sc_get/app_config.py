@@ -46,6 +46,60 @@ DEFAULT_MEDAL_DANMAKU_INTERVAL: Tuple[float, float] = (6.0, 8.0)
 DEFAULT_MEDAL_MAX_RETRY: int = 3
 """单个写任务**连续无进展/失败**多少次后停止本轮（等待下次或自动任务下一轮继续）。"""
 
+DEFAULT_PREVIEW_QUALITY: int = 0
+"""预览默认清晰度：``0`` = **自动**（取该房间可用最高档）。
+
+直播画质越高越好且不再额外耗流量（只有一路流），所以默认自动选最高；想固定某档
+（例如担心带宽）再写具体 ``qn``。与 ``api.PREVIEW_DEFAULT_QUALITY`` 保持一致（有测试
+防两处漂移）。
+"""
+
+PREVIEW_QUALITY_CHOICES: Tuple[int, ...] = (0, 80, 150, 250, 400, 10000, 20000, 30000)
+"""允许的清晰度取值：``0`` 自动 / 流畅 / 高清 / 超清 / 蓝光 / 原画 / 4K / 杜比。
+
+实际能拉到哪一档由**房间与账号**决定（程序会按接口返回的可用档位收缩下拉）。
+"""
+
+DEFAULT_PREVIEW_MUTE: bool = True
+"""预览是否默认静音（避免切换房间时突然出声）。"""
+
+DEFAULT_PREVIEW_VOLUME: int = 60
+"""预览音量（0-100，取消静音后生效）。"""
+
+DEFAULT_PREVIEW_ALWAYS_ON_TOP: bool = True
+"""预览浮窗是否置顶。"""
+
+DEFAULT_PREVIEW_FOLLOW_ROOM: bool = True
+"""是否让预览跟随主界面选中的直播间（**只切「主路」的声音**，不增删预览的路数）。
+
+选中的房间已在预览中 → 把它设为有声音的那一路；不在预览中 → 什么也不做（加/减哪几路
+完全由用户决定，切主界面的房间不会把预览内容换掉）。
+"""
+
+DEFAULT_PREVIEW_MAX_DRIFT: float = 3.0
+"""预览允许的**播放落后**上限（秒；``preview.max_drift_sec``，ROADMAP 63 · P4 后续）。
+
+实测（同一在播房间、经本机代理、FLV/HLS 各播 60 秒）：播放器位置增长比墙上时间慢约
+**0.16 / 0.07 秒每分钟**——「越看越落后」是播放端的固有现象（音视频同步与缓冲的微调），
+与代理转发无关。累计到 ``max_drift_sec`` 就自动重新拉流跳到最新（一次短暂重载），
+把落后压回阈值内。写 ``0`` 关闭自动追边。
+"""
+
+DEFAULT_PREVIEW_MAX_ROOMS: int = 4
+"""同时预览的路数上限（``preview.max_rooms``，ROADMAP 63 · P3）。
+
+每路都要解码 + 一条连接 + 一个本机代理，4 路是 1080p 下普通机器的舒适区；硬上限也是
+4（``qt_preview.PREVIEW_MAX_ROOMS``，配得再大也只按 4 生效）。
+"""
+
+DEFAULT_PREVIEW_WATCH_TIME: bool = False
+"""是否上报「观看时长」（``preview.watch_time``，ROADMAP 63 · P2）。
+
+**默认关闭**：这是向 B 站提交数据的**写操作**（`webHeartBeat` 心跳），用于让账号在
+预览的直播间累计观看时长 / 亲密度。它模拟网页端行为，属**高风险**操作，可能触发风控；
+开启还需要 ``allow_write_operations`` 与登录 Cookie 同时满足。
+"""
+
 DEFAULT_LOG_ENABLED: bool = False
 """默认是否把运行日志写入文件（``logging.enabled``）。
 
@@ -80,7 +134,7 @@ LOG_CATEGORY_LABELS: Dict[str, str] = CATEGORY_LABELS
 """各区块的中文说明（写入配置模板的 ``_说明``，也用于启动日志）。"""
 
 DEFAULT_CONFIG_TEMPLATE = """{
-  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，同时约束点赞与发弹幕两项；仍需在界面里对具体房间分别开启「自动点赞」/「自动发弹幕」，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。logging 控制运行日志（GUI 与命令行共用）：enabled 为是否写入文件（默认 false，静默启动时如需事后排查改为 true）；level 为启动级别 DEBUG/INFO/WARNING/ERROR/CRITICAL（默认 INFO，GUI 里勾选「显示 DEBUG 日志」可临时提升）；file 为日志文件路径（相对项目根目录，默认 logs/app.log）；max_bytes / backup_count 为单文件大小上限（字节，默认 2097152 = 2MB）与保留的历史文件数（超出自动轮转）；categories 为分区块日志开关（默认全部 true，可关闭不关心的区块以减少噪音）：room=房间与选择（切换直播间、增删、启停、排序、拖动、备注）、window=界面布局（窗口尺寸、分隔条、页签、面板显隐）、data=数据读写（接口请求、历史读取、落盘、表情包与粉丝牌刷新）、task=任务与写操作（发弹幕/表情、粉丝牌任务、Cookie 获取、开播提醒）、live=直播连接与状态（WS 连接、重连、开播下播、SC 与弹幕接收）、app=应用生命周期（启动退出、配置加载、房间锁、异常）。判定顺序：先看主开关 enabled（只决定是否落盘，关闭时日志照常进控制台/GUI 调试页），再看区块开关（关闭的区块在所有出口都不输出）。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
+  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，同时约束点赞与发弹幕两项；仍需在界面里对具体房间分别开启「自动点赞」/「自动发弹幕」，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。logging 控制运行日志（GUI 与命令行共用）：enabled 为是否写入文件（默认 false，静默启动时如需事后排查改为 true）；level 为启动级别 DEBUG/INFO/WARNING/ERROR/CRITICAL（默认 INFO，GUI 里勾选「显示 DEBUG 日志」可临时提升）；file 为日志文件路径（相对项目根目录，默认 logs/app.log）；max_bytes / backup_count 为单文件大小上限（字节，默认 2097152 = 2MB）与保留的历史文件数（超出自动轮转）；categories 为分区块日志开关（默认全部 true，可关闭不关心的区块以减少噪音）：room=房间与选择（切换直播间、增删、启停、排序、拖动、备注）、window=界面布局（窗口尺寸、分隔条、页签、面板显隐）、data=数据读写（接口请求、历史读取、落盘、表情包与粉丝牌刷新）、task=任务与写操作（发弹幕/表情、粉丝牌任务、Cookie 获取、开播提醒）、live=直播连接与状态（WS 连接、重连、开播下播、SC 与弹幕接收）、app=应用生命周期（启动退出、配置加载、房间锁、异常）。判定顺序：先看主开关 enabled（只决定是否落盘，关闭时日志照常进控制台/GUI 调试页），再看区块开关（关闭的区块在所有出口都不输出）。修改后需重启程序生效。preview 控制直播预览（浮窗播放直播流，ROADMAP 63）：quality 为清晰度，0=自动（默认，取该房间可用最高档），也可写 80 流畅/150 高清/250 超清/400 蓝光/10000 原画/20000 4K/30000 杜比（高清晰度需登录 Cookie，且以房间实际可用档位为准）；mute 为是否默认静音；volume 为音量 0-100；always_on_top 为预览窗口是否置顶；follow_room 为是否让预览跟随主界面选中的直播间（只把该房间设为「主路」= 有声音的那一路，**不会增删预览的路数**）；watch_time 为是否在预览播放时上报「观看时长」（默认 false）——这是模拟网页端心跳（webHeartBeat）的写操作，用于让账号在预览的直播间累计观看时长，需 allow_write_operations 也为 true 且已登录 Cookie，属高风险操作、可能触发风控，请自行评估；max_rooms 为同时预览的路数上限（1-4，默认 4，多路时只有主路出声、副路卡顿或 CPU 偏高会被自动停掉）；max_drift_sec 为允许的播放落后秒数（默认 3：直播播放会以每分钟约 0.1~0.2 秒的速度越看越落后于网页端，累计超过这个值就自动重新拉流跳到最新，写 0 关闭自动追边）。字段缺失/文件损坏/类型非法一律按默认值处理。",
   "allow_write_operations": false,
   "emoticon_tooltip": {
     "text": true,
@@ -107,6 +161,16 @@ DEFAULT_CONFIG_TEMPLATE = """{
       "live": true,
       "app": true
     }
+  },
+  "preview": {
+    "quality": 0,
+    "mute": true,
+    "volume": 60,
+    "always_on_top": true,
+    "follow_room": true,
+    "watch_time": false,
+    "max_rooms": 4,
+    "max_drift_sec": 3.0
   }
 }
 """
@@ -151,6 +215,45 @@ class LogConfig:
 
 
 @dataclass(frozen=True)
+class PreviewConfig:
+    """直播预览配置（``config.json`` 的 ``preview`` 段，ROADMAP 63）。
+
+    只控制**拉流与播放**的本地行为；「观看时长上报」属写操作，另行加开关约束（P2）。
+    """
+
+    quality: int = DEFAULT_PREVIEW_QUALITY
+    """拉流清晰度 ``qn``（见 ``PREVIEW_QUALITY_CHOICES``）。
+
+    ``0`` 表示自动（该房间可用最高档）；高清晰度还需要登录 Cookie，最终以房间实际
+    可用档位为准（界面会按接口返回收缩下拉）。
+    """
+
+    mute: bool = DEFAULT_PREVIEW_MUTE
+    """是否默认静音。"""
+
+    volume: int = DEFAULT_PREVIEW_VOLUME
+    """音量 0-100。"""
+
+    always_on_top: bool = DEFAULT_PREVIEW_ALWAYS_ON_TOP
+    """预览浮窗是否置顶。"""
+
+    follow_room: bool = DEFAULT_PREVIEW_FOLLOW_ROOM
+    """是否让预览跟随主界面选中的直播间（**只切主路声音**，不改变预览的路数）。"""
+
+    watch_time: bool = DEFAULT_PREVIEW_WATCH_TIME
+    """是否上报「观看时长」（写操作，默认关闭；见 ``DEFAULT_PREVIEW_WATCH_TIME``）。
+
+    还需 ``allow_write_operations`` 开启、并已登录，浮窗里那个开关才能真正生效。
+    """
+
+    max_rooms: int = DEFAULT_PREVIEW_MAX_ROOMS
+    """同时预览的路数上限（1~4，默认 4；见 ``DEFAULT_PREVIEW_MAX_ROOMS``）。"""
+
+    max_drift_sec: float = DEFAULT_PREVIEW_MAX_DRIFT
+    """允许的播放落后上限（秒，默认 3；``0`` 关闭自动追边；见 ``DEFAULT_PREVIEW_MAX_DRIFT``）。"""
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """应用级配置。默认值即「只读」：一切写操作关闭。"""
 
@@ -181,6 +284,9 @@ class AppConfig:
 
     log: LogConfig = field(default_factory=LogConfig)
     """运行日志（对应 config.json 的 ``logging`` 段，默认不写文件、区块全开）。"""
+
+    preview: PreviewConfig = field(default_factory=PreviewConfig)
+    """直播预览（对应 config.json 的 ``preview`` 段，ROADMAP 63）。"""
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -247,6 +353,20 @@ def _parse_retry(value: Any, default: int, *, upper: int = 10) -> int:
     return min(value, upper)
 
 
+def _parse_float(value: Any, default: float, *, low: float = 0.0,
+                 high: float = 1e9) -> float:
+    """解析浮点配置：只认真正的 int/float（``true``/``"3"`` 一律回退默认）。
+
+    低于 ``low`` 视为写错 → 回退默认；高于 ``high`` → 截断到上限（与 ``_parse_int`` 一致）。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = float(value)
+    if number < low:
+        return default
+    return min(number, high)
+
+
 def _parse_int(value: Any, default: int, *, low: int = 0,
                high: int = 2 ** 31 - 1) -> int:
     """解析整数配置：只认真正的 int（``true``/``"1"`` 这类一律回退默认）。
@@ -285,6 +405,36 @@ def _parse_log_categories(value: Any) -> Dict[str, bool]:
         logger.warning("配置 logging.categories 含未知区块 %s（可选：%s），已忽略",
                        "、".join(unknown), "、".join(DEFAULT_LOG_CATEGORIES))
     return result
+
+
+def _parse_preview_config(value: Any) -> PreviewConfig:
+    """解析 ``preview`` 段（逐项 fail-safe；清晰度需在白名单内）。"""
+    if value is None:
+        return PreviewConfig()
+    if not isinstance(value, dict):
+        logger.warning("配置 preview 应为对象，使用默认（自动最高画质 / 静音 / 跟随选中房间）")
+        return PreviewConfig()
+    raw_quality = value.get("quality")
+    quality = raw_quality if isinstance(raw_quality, int) and not isinstance(
+        raw_quality, bool) else None
+    if quality not in PREVIEW_QUALITY_CHOICES:
+        if raw_quality is not None:
+            logger.warning("配置 preview.quality 非法（%r），使用 %s",
+                           raw_quality, DEFAULT_PREVIEW_QUALITY)
+        quality = DEFAULT_PREVIEW_QUALITY
+    return PreviewConfig(
+        quality=quality,
+        mute=_as_bool(value.get("mute"), DEFAULT_PREVIEW_MUTE),
+        volume=_parse_int(value.get("volume"), DEFAULT_PREVIEW_VOLUME, low=0, high=100),
+        always_on_top=_as_bool(value.get("always_on_top"),
+                               DEFAULT_PREVIEW_ALWAYS_ON_TOP),
+        follow_room=_as_bool(value.get("follow_room"), DEFAULT_PREVIEW_FOLLOW_ROOM),
+        watch_time=_as_bool(value.get("watch_time"), DEFAULT_PREVIEW_WATCH_TIME),
+        max_rooms=_parse_int(value.get("max_rooms"), DEFAULT_PREVIEW_MAX_ROOMS,
+                             low=1, high=DEFAULT_PREVIEW_MAX_ROOMS),
+        max_drift_sec=_parse_float(value.get("max_drift_sec"),
+                                   DEFAULT_PREVIEW_MAX_DRIFT, low=0.0, high=600.0),
+    )
 
 
 def _parse_log_config(value: Any) -> LogConfig:
@@ -440,4 +590,5 @@ def load_app_config(path: Optional[Union[str, Path]] = None) -> AppConfig:
             medal.get("danmaku_interval_sec"), DEFAULT_MEDAL_DANMAKU_INTERVAL),
         medal_max_retry=_parse_retry(medal.get("max_retry"), DEFAULT_MEDAL_MAX_RETRY),
         log=_parse_log_config(raw.get("logging")),
+        preview=_parse_preview_config(raw.get("preview")),
     )

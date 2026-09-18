@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -606,8 +607,19 @@ class QtScMonitorApp(QMainWindow):
         sound_preview = QPushButton("试听")
         sound_preview.clicked.connect(self._on_preview_sound)
         sort_bar.addWidget(sound_preview)
+        # 直播预览（ROADMAP 63 · P1，仅 Qt 版：Tk 没有可用的视频组件）
+        self.preview_btn = QPushButton("预览")
+        self.preview_btn.setToolTip(
+            "在独立浮窗里预览所选直播间的直播流（可缩放 / 置顶 / 拖动）。\n"
+            "可同时预览多路：Ctrl 多选后点这里批量加入（上限见 config.json 的 preview.max_rooms，默认 4）。\n"
+            "多路时点某一格把它设为主路——只有主路出声，其余静音；每格右下「✕」停掉该路。\n"
+            "未登录只能看 720P：点底部「获取Cookie」登录后可看更高清晰度。\n"
+            "默认静音；清晰度等默认值见 config.json 的 preview 段。")
+        self.preview_btn.clicked.connect(self._on_preview_clicked)
+        sort_bar.addWidget(self.preview_btn)
+        self.refresh_preview_button()  # 初始：未选中房间时置灰
         sort_bar.addStretch(1)  # 提示靠右：窗口变窄时先压缩提示，而不是让控件挤成一团
-        hint = QLabel("（拖动行排序，Ctrl 多选）")
+        hint = QLabel("（拖动行排序，Ctrl 多选；双击行加入/停止预览）")
         hint.setStyleSheet("color:#888888;")
         sort_bar.addWidget(hint)
         outer.addLayout(sort_bar)
@@ -625,6 +637,8 @@ class QtScMonitorApp(QMainWindow):
         # 房间号 / 主播 / 提醒列为「跳转列」：点击不改变选中行（点击保护）
         self.table = ProtectedLinkTable(0, 6)
         self.table.link_columns = (0, 1, 3)
+        # 双击房间行 = 加入 / 停止该房间的预览（工具栏按钮之外的快捷入口）
+        self.table.cellDoubleClicked.connect(self._on_room_double_clicked)
         self.table.setHorizontalHeaderLabels(["房间号", "主播", "状态", "提醒", "直播标题", "备注"])
         # 列宽策略与 Tk 版一致：直播标题为弹性列（吸收多余空间、被拖宽时先让位），
         # 其余列可拖动；总列宽由 Qt 保证不超出可视宽度（弹性列让位，不会把列挤出窗口）
@@ -647,6 +661,9 @@ class QtScMonitorApp(QMainWindow):
         self.table.setDropIndicatorShown(True)
         self.table.setDragDropMode(QTableWidget.InternalMove)
         self.table.linkClicked.connect(self._on_tree_cell_clicked)
+        # 右键房间行：预览该房间 / 停止预览（工具栏「预览」按钮之外的第二入口）
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_room_context_menu)
         if hasattr(self.table, "rowsMoved"):
             self.table.rowsMoved.connect(self._on_tree_rows_moved)
         room_layout.addWidget(self.table, 1)
@@ -1002,7 +1019,17 @@ class QtScMonitorApp(QMainWindow):
         return QColor("#000000")
 
     def _get_selected_room_ids(self) -> List[int]:
-        rows = sorted({i.row() for i in self.table.selectedItems()})
+        """当前选中的房间号（按行序）。
+
+        表格**可能还没建出来**：``_build_rooms_tab`` 创建「预览」按钮后会立刻刷新一次按钮
+        状态，而那时 ``self.table`` 尚未创建（P3 多路改造时这里改成按「选中的房间」决定
+        文案，于是启动阶段抛 ``AttributeError: 'QtScMonitorApp' object has no attribute
+        'table'``，表现为程序一闪就退出）。这里对表格做存在性判断，没有就按「无选中」处理。
+        """
+        table = getattr(self, "table", None)
+        if table is None:
+            return []
+        rows = sorted({i.row() for i in table.selectedItems()})
         return [self._room_order[r] for r in rows if 0 <= r < len(self._room_order)]
 
     def _get_selected_room_id(self) -> Optional[int]:
@@ -1049,6 +1076,7 @@ class QtScMonitorApp(QMainWindow):
         self._refresh_dm_send_state()
         # 可用颜色/样式随直播间变化（接口按 room_id 查询），切房即重新拉取
         self._load_dm_options_for_selected()
+        self._follow_preview(room_id)  # 预览开着且开启「跟随选中房间」时切流
 
     def _clear_dm_view(self) -> None:
         if hasattr(self, "dm_panel"):
@@ -1957,6 +1985,21 @@ class QtScMonitorApp(QMainWindow):
                 elif kind == "emoticon_image":
                     if hasattr(self, "dm_panel"):
                         self.dm_panel.on_emoticon_image(item[1])
+                elif kind == "preview_ready":
+                    if hasattr(self, "preview"):
+                        self.preview.on_streams_ready(item[1])
+                elif kind == "preview_error":
+                    if hasattr(self, "preview"):
+                        self.preview.on_stream_error(item[1])
+                elif kind == "watch_reported":
+                    if hasattr(self, "preview"):
+                        self.preview.on_watch_reported(item[1])
+                elif kind == "watch_error":
+                    if hasattr(self, "preview"):
+                        self.preview.on_watch_error(item[1])
+                elif kind == "preview_unlocked":
+                    if hasattr(self, "preview"):
+                        self.preview.on_preview_unlocked(item[1])
                 elif kind == "medal_list":
                     self.medal_tab.on_medal_list(item[1])
                 elif kind == "medal_task_info":
@@ -2019,6 +2062,145 @@ class QtScMonitorApp(QMainWindow):
     def copy_to_clipboard(self, text: str) -> None:
         QApplication.clipboard().setText(text)
 
+    # ---------- 直播预览（ROADMAP 63 · P1，仅 Qt 版） ----------
+
+    def _preview_window(self):
+        """惰性创建预览浮窗（首次点「预览」才加载 QtMultimedia，不拖慢启动）。"""
+        window = getattr(self, "preview", None)
+        if window is None:
+            from .qt_preview import PreviewWindow
+
+            window = PreviewWindow(self)
+            self.preview = window
+            self.refresh_preview_button()
+        return window
+
+    def _on_preview_clicked(self) -> None:
+        """工具栏「预览」按钮：把选中的直播间加入预览（都已加入则停止它们）。
+
+        支持 Ctrl 多选**批量加入**（受 ``preview.max_rooms`` 限制，默认最多 4 路）；再次点击
+        时若选中的房间都已在预览中，就把它们一起停掉——按钮文案会跟着变（「预览」/「停止预览」）。
+        """
+        window = self._preview_window()
+        selected = [r for r in self._get_selected_room_ids() if r in self.entries]
+        if not selected:
+            QMessageBox.information(self, "直播预览", "请先在房间列表里选中一个直播间。")
+            return
+        active = set(window.room_ids())
+        if all(room_id in active for room_id in selected):
+            for room_id in selected:
+                window.remove_room(room_id)
+            self.refresh_preview_button()
+            return
+        for room_id in selected:
+            if room_id not in active:
+                window.start(room_id)
+        self.refresh_preview_button()
+
+    def _on_room_context_menu(self, pos) -> None:
+        """房间列表右键：预览该房间 / 停止预览该房间 / 设为主路（工具栏之外的入口）。
+
+        菜单只作用在**右键所在的那一行**：多路预览时「停止预览」只停这一路（不是全部），
+        「设为主路」把有声音的那一路切过去。预览一个非选中房间时会顺手把它选中——先切流再
+        选中：这样「跟随选中房间」随后发现已是同一房间就会跳过，不会把预览又切走。
+        """
+        index = self.table.indexAt(pos)
+        row = index.row() if index.isValid() else -1
+        if not (0 <= row < len(self._room_order)):
+            return
+        room_id = self._room_order[row]
+        window = self._preview_window()
+        active_here = int(room_id) in set(window.room_ids())
+        menu = QMenu(self)
+        anchor = self.anchor_names.get(room_id) or ""
+        header = menu.addAction(f"房间 {room_id}" + (f"（{anchor}）" if anchor else ""))
+        header.setEnabled(False)  # 仅作标题
+        menu.addSeparator()
+        action = menu.addAction("停止预览该房间" if active_here else "预览该房间")
+        main_action = None
+        if active_here and window.main_room_id != int(room_id):
+            main_action = menu.addAction("设为主路（有声音）")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if main_action is not None and chosen is main_action:
+            window.set_main_room(room_id)
+            self.refresh_preview_button()
+            return
+        if chosen is not action:
+            return
+        if active_here:
+            window.remove_room(room_id)
+            self.refresh_preview_button()
+            return
+        window.start(room_id)
+        self._select_room(room_id)
+
+    def refresh_preview_button(self) -> None:
+        """按预览状态更新按钮文案（浮窗在加入 / 移除 / 关闭时回调）。
+
+        文案看**当前选中的房间**是否都已在预览中：都在 → 「停止预览」（点了会把它们停掉），
+        否则 → 「预览」（点了把还没加入的加进去）。
+        """
+        if not hasattr(self, "preview_btn"):
+            return
+        window = getattr(self, "preview", None)
+        active = set(window.room_ids()) if window is not None else set()
+        selected = [r for r in self._get_selected_room_ids() if r in self.entries]
+        all_active = bool(selected) and all(r in active for r in selected)
+        self.preview_btn.setText("停止预览" if all_active else "预览")
+        self.preview_btn.setEnabled(bool(selected))
+
+    def _follow_preview(self, room_id: Optional[int]) -> None:
+        """预览跟随选中房间（``config.json`` 的 ``preview.follow_room``，默认开）。
+
+        **只切声音，绝不动预览内容**：选中的房间已在预览中 → 把它设为主路（有声音）；
+        不在预览中 → 什么也不做。加减路请用「预览」按钮 / 双击房间行 / 右键菜单。
+        （P3 早期版本在「只有一路」时会把这一路**换成**选中房间，于是在主界面点几下就把
+        预览换掉了、也没法逐个把房间加进来——那个「抢走预览」的行为已去掉。）
+        """
+        window = getattr(self, "preview", None)
+        if window is None or not window.is_active():
+            self.refresh_preview_button()  # 选中变化也会影响按钮可用状态
+            return
+        if not self.app_config.preview.follow_room or room_id is None:
+            return
+        selected = int(room_id)
+        if selected in window.room_ids() and window.main_room_id != selected:
+            window.set_main_room(selected)
+
+    def _on_room_double_clicked(self, row: int, column: int) -> None:
+        """双击房间行：加入 / 停止该房间的预览（比 Ctrl 多选逐个加入顺手）。
+
+        跳转列（房间号 / 主播 / 提醒）不参与：那里单击就会打开浏览器或切换提醒，双击会先
+        触发一次单击，再叠加预览操作会打架。双击「状态 / 直播标题 / 备注」列即可。
+        """
+        if column in self.table.link_columns:
+            return
+        if not (0 <= row < len(self._room_order)):
+            return
+        room_id = self._room_order[row]
+        window = self._preview_window()
+        if int(room_id) in set(window.room_ids()):
+            window.remove_room(room_id)
+        else:
+            window.start(room_id)
+        self.refresh_preview_button()
+
+    def save_preview_quality(self, qn: int) -> None:
+        """记住预览清晰度（``gui_rooms.json`` 的 ``ui.preview_quality``），下次启动沿用。
+
+        浮窗里改清晰度会回调这里——此前只在本次运行内有效，重启又回到 config.json 的默认值。
+        """
+        try:
+            value = int(qn)
+        except (TypeError, ValueError):
+            return
+        if self.ui_prefs.get("preview_quality") == value:
+            return
+        self.ui_prefs["preview_quality"] = value
+        self._save_config()
+
     def _on_dm_state(self, _payload) -> None:
         """登录态 / Cookie 变化后刷新门控与可用颜色/模式。"""
         # 可用表情随登录身份变化：缓存与刷新冷却一并失效
@@ -2028,6 +2210,10 @@ class QtScMonitorApp(QMainWindow):
             self.dm_panel.on_login_changed()
         self._refresh_dm_send_state()
         self._load_dm_options_for_selected()
+        # 预览清晰度档位随登录态收缩/放开（未登录只有 720P）
+        window = getattr(self, "preview", None)
+        if window is not None:
+            window.refresh_qualities()
         if hasattr(self, "medal_tab"):
             self.medal_tab._on_refresh()
 
@@ -2419,6 +2605,9 @@ class QtScMonitorApp(QMainWindow):
         self._splitter_size_log.flush()
         if hasattr(self, "dm_panel"):
             self.dm_panel.destroy_popups()
+        window = getattr(self, "preview", None)
+        if window is not None:  # 预览浮窗：停播放、回收回环代理，并把浮窗一起关掉
+            window.stop(reason="程序退出", close=True)
         self.hub.submit(self._async_shutdown())
         # 等后台收尾（flush_all_pending / close_danmaku_buffers）落盘后再退出，
         # 否则守护线程会随主进程一起消失，未刷盘的 SC 有丢失风险（Tk 版等 1500ms）。

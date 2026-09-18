@@ -91,6 +91,7 @@
 | 4.7 | 弹幕输入不硬截断（仅超长标红） | 去掉客户端长度校验 | `setMaxLength` 已移除，仅标红提示 | ✅ |
 | 4.8 | 点击弹幕正文复制到剪贴板 | `_copy_dm_content`（`clipboard_append`）+ 独立复制提示行 | `host.copy_to_clipboard()` + 独立 `dm_copy_hint` 行（不覆盖发送提示） | ✅ |
 | 4.9 | 表情条滚轮横向翻动 | `_on_emoticon_wheel` | `eventFilter` 拦 Wheel → 横向滚动条；单行自然宽度 `_sync_strip_width` | ✅ |
+| 4.10 | 直播预览（拉流 + 播放） | 无（Tk 没有可用的视频组件） | **Qt 专属增强**（ROADMAP 63 · P1~P4 全部完成）：独立浮窗（`QMediaPlayer` + `LiveStreamProxy` 回环代理注入防盗链头；HLS 优先 / 每 10 分钟无缝换源 / 出错换格式重试 / **断流自愈**（5 秒心跳 + 宽限期 + 重试上限）/ **自动追边**（落后超 `max_drift_sec` 默认 3 秒重载跳最新）；清晰度按新接口 `accept_qn` 只列该房间可用档位，未登录仅 360P·720P，**清晰度记忆**写 `ui.preview_quality`）；P3 **多路宫格**（最多 4 路 `preview.max_rooms`，仅主路出声，副路卡顿或 CPU 偏高自动停路，双击格子放大、双击房间行加入/停止）；P2 观看时长上报（`webHeartBeat`，写操作默认关闭、只对主路）；P4 加密房间密码（右键输入，**仅存内存**不落盘）；失败提示翻成人话 | ✅ |
 
 ### 粉丝牌页
 
@@ -208,5 +209,9 @@
 - 拖动窗口暂停 SC 自动换行的卡顿缓解（Tk `_on_root_configure`）：Qt 的文本重排为原生实现，
   不需要该变通（见 2.14，标 n/a）。
 - 弹幕区也支持中键快速滚动：Tk 只绑定了 SC 区与调试日志，Qt 三处一致（超集，无副作用）。
+- **直播预览是 Qt 专属**：Tk 没有可用的视频组件（内嵌播放需要 QtMultimedia / QtWebEngine 这类重依赖）。
+  按双版方针「Tk 基础、Qt 增强」，预览只做在 Qt 版；框架无关的拉流与代理层
+  （`api.get_live_stream_urls` + `live_preview.LiveStreamProxy`）两版共用，Tk 版将来若要跟进，
+  只需接一个「把本地代理地址交给外部播放器」的入口即可。
 
 

@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -43,6 +44,131 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+PLAY_URL = "https://api.live.bilibili.com/room/v1/Room/playUrl"
+"""直播推流地址（旧版接口，``platform=web`` 返回 http-flv、``h5`` 返回 hls）。"""
+
+ROOM_PLAY_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
+"""新版拉流信息接口：**只有它给出该房间真正可用的清晰度**。
+
+旧接口的 ``accept_quality`` 返回的是「清晰度编号」（实测 ''4''、只一项），不是 ``qn``，
+拿它当 qn 过滤会全部落空（表现为清晰度下拉列出 4K/杜比等根本拉不到的档位）。
+"""
+
+LIVE_STREAM_PLATFORMS: tuple = (("flv", "web"), ("hls", "h5"))
+"""拉流格式 → ``platform`` 参数：``web`` 给 http-flv，``h5`` 给 hls（m3u8）。"""
+
+VERIFY_ROOM_PWD_URL = "https://api.live.bilibili.com/room/v1/Room/verify_room_pwd"
+"""加密（密码）直播间的密码校验（ROADMAP 63 · P4）。
+
+密码房要先让**服务端**记住「本会话已解锁」，之后的拉流请求才会给出地址；所以拿到密码后
+先调它、再带 ``pwd`` 重拉一次（两条路一起走，命中率最高）。该接口来自社区资料，官方文档
+未收录，属于尽力而为的兼容实现。
+"""
+
+PREVIEW_DEFAULT_QUALITY = 0
+"""预览默认清晰度：``0`` = **自动**（取该房间可用最高档）。
+
+与 ``app_config.DEFAULT_PREVIEW_QUALITY`` 保持一致（有测试防两处漂移）。
+"""
+
+MAX_PREVIEW_QUALITY = 30000
+"""请求清晰度时用的上限（杜比），交给服务端按账号权限降级到 ``accept_qn`` 里的档位。"""
+
+LIVE_HEARTBEAT_URL = (
+    "https://live-trace.bilibili.com/xlive/rdata-interface/v1/heartbeat/webHeartBeat"
+)
+"""网页端「观看时长」心跳（ROADMAP 63 · P2，**写操作**）。
+
+GET，参数只有 ``hb`` 与 ``pf=web``：``hb`` 是 ``base64("<next_interval>|<真实房间号>|1|0")``，
+服务端用返回的 ``data.next_interval``（文档默认 60 秒）决定下一次该隔多久上报。
+"""
+
+LIVE_HEARTBEAT_DEFAULT_INTERVAL = 60
+"""首次上报（还不知道服务端间隔）用的秒数，对齐网页端默认值。"""
+
+LIVE_HEARTBEAT_MIN_INTERVAL = 15
+"""接受的服务端间隔下限：间隔过短（如 1 秒）等于脚本刷时长，夹到这里。"""
+
+LIVE_HEARTBEAT_MAX_INTERVAL = 300
+"""接受的服务端间隔上限：太长会让「已上报时长」与实际节奏偏离过大，夹到 5 分钟。"""
+
+
+def parse_accept_qn(payload: Dict[str, Any]) -> Tuple[int, ...]:
+    """从 ``getRoomPlayInfo`` 响应里取出可用清晰度（去重、降序）。纯函数，便于离线测试。
+
+    结构：``data.playurl_info.playurl.stream[].format[].codec[].accept_qn``；
+    同一房间各协议/编码的列表一致（flv / hls、avc / hevc 都一样），取并集即可。
+    """
+    playurl = (((payload.get("data") or {}).get("playurl_info") or {})
+               .get("playurl") or {})
+    found = set()
+    for stream in playurl.get("stream") or []:
+        if not isinstance(stream, dict):
+            continue
+        for fmt in stream.get("format") or []:
+            if not isinstance(fmt, dict):
+                continue
+            for codec in fmt.get("codec") or []:
+                if not isinstance(codec, dict):
+                    continue
+                for qn in codec.get("accept_qn") or []:
+                    try:
+                        value = int(qn)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        found.add(value)
+    return tuple(sorted(found, reverse=True))
+
+
+def parse_room_play_info(payload: Dict[str, Any]
+                         ) -> Tuple[Tuple[int, ...], Optional[bool], Optional[bool]]:
+    """从 ``getRoomPlayInfo`` 响应取「可用档位 + 是否加密 + 密码是否已通过」（纯函数）。
+
+    返回 ``(accept_qn, encrypted, pwd_verified)``；加密与验证状态**取不到时为 ``None``
+    （未知）**，不要当成 ``False``：官方文档明确 ``pwd_verified`` 只在 ``encrypted`` 为真
+    时才有意义，而且非加密房间下不同接口给的默认值并不一致（``room_init`` 给 ``false``、
+    ``getRoomPlayInfo`` 给 ``true``），所以这里只做原样透传，由上层配合 ``encrypted`` 判断。
+    """
+    qualities = parse_accept_qn(payload)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    data = data if isinstance(data, dict) else {}
+    encrypted = data.get("encrypted")
+    verified = data.get("pwd_verified")
+    return (qualities,
+            encrypted if isinstance(encrypted, bool) else None,
+            verified if isinstance(verified, bool) else None)
+
+
+def heartbeat_hb(room_id: int, next_interval: int) -> str:
+    """构造 ``webHeartBeat`` 的 ``hb`` 参数（纯函数，便于离线测试）。
+
+    明文为 ``"{next_interval}|{真实房间号}|1|0"``——后两段网页端固定写 ``1`` 与 ``0``
+    （官方文档标注「作用尚不明确」），再做 base64。
+    """
+    raw = f"{int(next_interval)}|{int(room_id)}|1|0"
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def parse_next_interval(payload: Dict[str, Any],
+                        fallback: int = LIVE_HEARTBEAT_DEFAULT_INTERVAL,
+                        low: int = LIVE_HEARTBEAT_MIN_INTERVAL,
+                        high: int = LIVE_HEARTBEAT_MAX_INTERVAL) -> int:
+    """取 ``data.next_interval``（下次心跳间隔秒数）并夹到 ``[low, high]``（纯函数）。
+
+    服务端异常（缺字段 / 非数字 / 0 或负数 / 超大）一律回退 ``fallback``——上报节奏宁可
+    慢一点，也不要按一个奇怪的值猛刷。
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    value = data.get("next_interval") if isinstance(data, dict) else None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if seconds <= 0:
+        return fallback
+    return max(low, min(high, seconds))
 
 ROOM_INFO_URL = "https://api.live.bilibili.com/room/v1/Room/get_info"
 ROOM_INFO_OLD_URL = "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld"
@@ -479,6 +605,130 @@ class BilibiliLiveAPI:
         if not info.get("room_id"):
             raise ApiError("获取房间信息", data.get("code"), "响应缺少 room_id")
         return info
+
+    async def get_live_stream_urls(self, room_id: int, *,
+                                   qn: int = PREVIEW_DEFAULT_QUALITY,
+                                   pwd: str = ""
+                                   ) -> Dict[str, Any]:
+        """取直播推流直链（http-flv 与 hls 各一条，供本地预览播放）。
+
+        - ``room_id`` 需为**真实房间号**（短号先经 :meth:`get_room_info` 换算）；
+        - ``qn`` 为清晰度（80 流畅 / 150 高清 / 250 超清 / 400 蓝光 / 10000 原画；高清晰度需登录）；
+        - ``pwd`` 为加密（密码）房间的密码，非空时随请求一起带上（服务端已解锁时也无害）；
+        - 直链**有时效**（``expires`` 参数），过期后需重新调用换源；
+        - 两种格式互不影响：某一格式失败只写进 ``errors``，预览可在两者间回退。
+
+        返回 ``{"flv", "hls", "qn", "accept_quality", "errors"}``。
+
+        **注意**：这里返回的 ``accept_quality`` 是该接口的「清晰度编号」（实测 ``['4']``），
+        **不是 qn**，不要拿它过滤清晰度；要判断某房间能用哪些档位请用
+        :meth:`get_stream_qualities`（新接口的 ``accept_qn``）。
+        """
+        result: Dict[str, Any] = {"flv": None, "hls": None, "qn": int(qn),
+                                  "accept_quality": [], "errors": {}}
+        for key, platform in LIVE_STREAM_PLATFORMS:
+            params = {"cid": int(room_id), "platform": platform, "qn": int(qn)}
+            if pwd:
+                params["pwd"] = str(pwd)   # 加密房间：带着密码请求（已解锁时也无害）
+            try:
+                payload = await self._get_json(PLAY_URL, params)
+            except (ApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                result["errors"][key] = str(exc)
+                continue
+            if payload.get("code") != 0:
+                result["errors"][key] = (f"code={payload.get('code')} "
+                                         f"{payload.get('message')}")
+                continue
+            data = payload.get("data") or {}
+            durl = data.get("durl") or []
+            url = durl[0].get("url") if durl and isinstance(durl[0], dict) else None
+            if not url:
+                result["errors"][key] = "响应缺少 durl[0].url"
+                continue
+            result[key] = str(url)
+            accept = data.get("accept_quality")
+            if not result["accept_quality"] and isinstance(accept, list) and accept:
+                result["accept_quality"] = accept
+        return result
+
+    async def get_stream_info(self, room_id: int, *, pwd: str = "") -> Dict[str, Any]:
+        """取拉流前置信息：可用档位 + 是否加密房间 + 密码是否已通过。
+
+        返回 ``{"qualities", "encrypted", "pwd_verified", "error"}``；失败（未开播、网络
+        异常、接口报错）时 ``qualities`` 为空、``error`` 给出原因，由调用方按兜底档位处理，
+        **不抛异常**。``pwd`` 非空时一并带上（密码房在服务端解锁前后都可能需要它）。
+        """
+        params: Dict[str, Any] = {"room_id": int(room_id), "protocol": "0,1",
+                                  "format": "0,1,2", "codec": "0,1",
+                                  "qn": MAX_PREVIEW_QUALITY, "platform": "web",
+                                  "ptype": 8}
+        if pwd:
+            params["pwd"] = str(pwd)
+        try:
+            payload = await self._get_json(ROOM_PLAY_INFO_URL, params)
+        except (ApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("获取房间 %s 拉流信息失败：%s", room_id, exc)
+            return {"qualities": (), "encrypted": None, "pwd_verified": None,
+                    "error": str(exc)}
+        if payload.get("code") != 0:
+            logger.debug("获取房间 %s 拉流信息返回 code=%s", room_id, payload.get("code"))
+            return {"qualities": (), "encrypted": None, "pwd_verified": None,
+                    "error": f"code={payload.get('code')} {payload.get('message')}"}
+        qualities, encrypted, verified = parse_room_play_info(payload)
+        return {"qualities": qualities, "encrypted": encrypted,
+                "pwd_verified": verified, "error": ""}
+
+    async def get_stream_qualities(self, room_id: int) -> Tuple[int, ...]:
+        """该房间**可用**的清晰度（``accept_qn``，降序）；拿不到时返回空元组。
+
+        等价于 :meth:`get_stream_info` 的 ``qualities``（保留这个入口便于既有调用与测试）。
+        """
+        info = await self.get_stream_info(room_id)
+        return tuple(info.get("qualities") or ())
+
+    async def verify_room_pwd(self, room_id: int, pwd: str) -> bool:
+        """在服务端校验加密（密码）直播间的密码；成功返回 True。
+
+        密码房要先让服务端记住「本会话已解锁」，之后拉流才给地址。该接口来自社区资料
+        （官方文档未收录），所以**失败不抛异常**：返回 False 由上层提示密码可能不对，
+        但**仍会带 ``pwd`` 重试拉流**——两条路一起走，命中率最高。
+        """
+        pwd = str(pwd or "").strip()
+        if not pwd:
+            return False
+        params = {"room_id": int(room_id), "pwd": pwd}
+        try:
+            payload = await self._get_json(VERIFY_ROOM_PWD_URL, params)
+        except (ApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("校验房间 %s 密码失败：%s", room_id, exc)
+            return False
+        ok = payload.get("code") == 0
+        if not ok:
+            logger.info("房间 %s 密码未通过（code=%s）", room_id, payload.get("code"))
+        return ok
+
+    async def report_watch_heartbeat(
+            self, room_id: int,
+            next_interval: int = LIVE_HEARTBEAT_DEFAULT_INTERVAL) -> int:
+        """上报一次直播**观看时长**心跳（**写操作**），返回下次该隔多少秒再上报。
+
+        对应网页端 ``webHeartBeat``：只有 ``hb``（明文 ``间隔|真实房间号|1|0`` 的 base64）
+        与 ``pf=web`` 两个参数，服务端用 ``data.next_interval`` 告知下一次的时间。
+        需要已登录 Cookie——未登录没有账号可计时长，这个请求也就没有意义。
+
+        这是**模拟网页端行为**的写操作，可能触发风控，仅供 ``preview.watch_time``
+        显式开启后使用。
+        """
+        if not self.has_cookie:
+            raise ApiError("观看时长上报", -101,
+                           "未提供 cookie，请先用「获取Cookie」获取已登录的 Cookie")
+        params = {"hb": heartbeat_hb(room_id, next_interval), "pf": "web"}
+        payload = await self._get_json(LIVE_HEARTBEAT_URL, params)
+        code = payload.get("code")
+        if code != 0:
+            raise ApiError("观看时长上报", code,
+                           payload.get("message") or payload.get("msg") or "")
+        return parse_next_interval(payload)
 
     async def get_full_room_info(self, room_id: int) -> Dict[str, Any]:
         """查询房间信息，直播标题取 get_info 与 getH5InfoByRoom 中更完整者。
