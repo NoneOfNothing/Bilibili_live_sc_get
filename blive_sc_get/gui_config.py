@@ -29,7 +29,17 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     "notify_persist": False,
     "notify_sound": DEFAULT_NOTIFY_SOUND,
     "dm_visible": False,
+    # dm_emoticon_image：弹幕流里是否直接显示表情图片（Qt 版专有，默认开启）。
+    # 关闭后只显示「[触发词]」文字，行高更矮；悬浮提示此时仍可看原图（与 Tk 版一致）。
+    "dm_emoticon_image": True,
+    # window_size：上次退出时的窗口尺寸 [宽, 高]（逻辑像素）；[0, 0] 表示尚未记忆
+    "window_size": [0, 0],
 }
+"""界面偏好默认值。
+
+``window_size`` 由 Qt 版在退出时写入、启动时恢复（Tk 版不使用，只原样写回）；
+``dm_emoticon_image`` 同理只作用于 Qt 版（Tk 版不做内嵌，恒为文字）。
+"""
 
 
 @dataclass
@@ -171,4 +181,9 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     if ui.get("notify_sound") in NOTIFY_SOUNDS:
         prefs["notify_sound"] = ui["notify_sound"]
     prefs["dm_visible"] = bool(ui.get("dm_visible", False))
+    prefs["dm_emoticon_image"] = bool(ui.get("dm_emoticon_image", True))
+    size = ui.get("window_size")
+    if (isinstance(size, list) and len(size) == 2
+            and all(isinstance(value, int) and value > 200 for value in size)):
+        prefs["window_size"] = [int(size[0]), int(size[1])]
     return prefs

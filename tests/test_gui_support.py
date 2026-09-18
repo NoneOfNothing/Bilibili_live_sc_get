@@ -190,7 +190,9 @@ class GuiConfigTests(unittest.TestCase):
         self.assertEqual(load_ui_prefs(self.path),
                          {"sort_mode": "status", "pin_live": True,
                           "notify_overlay": False, "notify_persist": True,
-                          "notify_sound": "三连音", "dm_visible": True})
+                          "notify_sound": "三连音", "dm_visible": True,
+                          "dm_emoticon_image": True,
+                          "window_size": [0, 0]})
         # 旧配置缺字段时的缺省值
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "manual", "pin_live": False})
@@ -199,6 +201,15 @@ class GuiConfigTests(unittest.TestCase):
         self.assertFalse(prefs["notify_persist"])
         self.assertEqual(prefs["notify_sound"], "上行双音")
         self.assertFalse(prefs["dm_visible"])
+
+    def test_ui_prefs_window_size_memory(self):
+        """窗口尺寸记忆（Qt 版退出时写入、启动时恢复）。"""
+        save_room_entries(self.path, [RoomEntry(1)], ui={"window_size": [1280, 900]})
+        self.assertEqual(load_ui_prefs(self.path)["window_size"], [1280, 900])
+        # 非法值（过小 / 非整数 / 长度不对 / 非列表）一律回退 [0, 0]（= 未记忆）
+        for value in ([100, 100], ["a", "b"], [1280], "1280x900", None):
+            save_room_entries(self.path, [RoomEntry(1)], ui={"window_size": value})
+            self.assertEqual(load_ui_prefs(self.path)["window_size"], [0, 0], repr(value))
 
     def test_ui_prefs_legacy_key_migrates(self):
         # 旧键名 notify_system 迁移到 notify_overlay
@@ -209,7 +220,9 @@ class GuiConfigTests(unittest.TestCase):
     def test_ui_prefs_defaults(self):
         expected = {"sort_mode": "manual", "pin_live": False,
                     "notify_overlay": True, "notify_persist": False,
-                    "notify_sound": "上行双音", "dm_visible": False}
+                    "notify_sound": "上行双音", "dm_visible": False,
+                    "dm_emoticon_image": True,
+                    "window_size": [0, 0]}
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"), expected)
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path), expected)

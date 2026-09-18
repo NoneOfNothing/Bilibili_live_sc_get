@@ -84,7 +84,7 @@
 |---|------|---------|---------|------|
 | 4.1 | 弹幕开关（显示/保存当前房间弹幕） | `dm_var`/`_on_dm_toggled`/`_apply_dm_gate` | 宿主常驻开关 `qt_app.dm_toggle` + `_apply_dm_gate()`（`set_danmaku_enabled`）+ 面板随动 | ✅ |
 | 4.2 | 弹幕富文本显示 + 行裁剪 | `_append_dm_batch`/`_trim_dm_text`（4000 行上限） | `DmPanel.append_dm_batch`/`_trim_dm_text`（行号需转 int） | ✅ |
-| 4.3 | 弹幕 Emoji 悬浮预览 + 悬浮提示 | `_EmoticonTooltip`/`_show_emoticon_tooltip`（提示窗显示原图、懒加载、缺图兜底、越界回缩） | 悬浮提示显示配置字段文案 + **原图预览**（懒加载 / 缺图兜底补 url·id / 就绪自动回填 / 虚拟桌面越界回缩） | ✅ |
+| 4.3 | 弹幕 Emoji 悬浮预览 + 悬浮提示 | `_EmoticonTooltip`/`_show_emoticon_tooltip`（提示窗显示原图、懒加载、缺图兜底、越界回缩） | 弹幕流内**直接显示表情图**（图未到位先显示触发词，下载完成后**原地换图**）+ 悬浮提示只显示配置字段文字（不再重复弹原图；懒加载 / 缺图兜底补 url·id / 虚拟桌面越界回缩）；另有「弹幕表情图」开关：关闭即把已显示的图片还原为文字（悬浮恢复为看原图），重新开启再把已有触发词换回图片 | ✅ |
 | 4.4 | 点击弹幕复制内容 + @回复 | `_on_dm_click`/`_copy_dm_content`/`_set_dm_reply_target` | 左键跳转/复制 + 右键「回复该弹幕」/「@该用户」 | ✅ |
 | 4.5 | 发送弹幕（配色/样式/分屏/门控/防连点） | `_on_send_danmaku`/`_dm_send_block_reason`/`_load_dm_options_for_selected` | Qt 同款门控 + 服务端颜色/模式按房间刷新 + `replay_dmid` 回复 | ✅ |
 | 4.6 | 表情面板（入口/分页/换包/图片/悬停） | `_on_open_emoticons`/`_build_emoticon_panel` 系列（下载图片、缩放、缓存、记忆包序号、Esc 收起） | 发送行「表情」按钮 + 分页/换包/悬停/图片限流下载与缓存/按房间记忆包序号/Esc 收起 | ✅ |
@@ -202,6 +202,9 @@
 
 - 弹幕表情提示定位：Qt 用 `QGuiApplication.screens()` 的**虚拟桌面并集**做越界回缩，
   副屏在主屏左侧/上方时也能贴光标显示（Tk 受 Windows 限制会被夹到主屏边缘，见 `tooltip_position` 注释）。
+- 弹幕表情的呈现方式：Qt 版把表情图**内嵌进弹幕流**（图未下载完先显示触发词，图片到达后按
+  `QTextBlock` **原地换图**，不影响滚动位置；点击图片同样能复制该条弹幕），悬浮提示只补触发词 /
+  唯一标识等文字信息；Tk 版受 `Text` + `PhotoImage` 的性能限制不内嵌，仍靠悬浮看原图。
 - 拖动窗口暂停 SC 自动换行的卡顿缓解（Tk `_on_root_configure`）：Qt 的文本重排为原生实现，
   不需要该变通（见 2.14，标 n/a）。
 - 弹幕区也支持中键快速滚动：Tk 只绑定了 SC 区与调试日志，Qt 三处一致（超集，无副作用）。

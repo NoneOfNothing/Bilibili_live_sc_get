@@ -152,11 +152,55 @@ QUEUE_POLL_MS = 100
 SC_AT_BOTTOM_TOLERANCE = 4
 """滚动条距底部多少像素以内视为“吸底”。"""
 
-TABLE_ROW_PADDING = 8
+TABLE_ROW_PADDING = 6
 """表格行高 = 字体行高 + 该内边距。
 
 Qt 默认的表格行内边距约 18px（实测 30px 行高 / 12px 字体行高），中文列表看起来
-很空；这里按字体行高加少量内边距，行距与 Tk 版 Treeview 接近。
+很空；这里按字体行高加少量内边距（比 Tk 版 Treeview 的 +8 再紧一点）。
+"""
+
+COMPACT_STYLE = """
+QPushButton { padding: 1px 8px; }
+QComboBox { padding: 1px 4px; }
+QLineEdit { padding: 1px 4px; }
+QCheckBox { padding: 0px; }
+"""
+"""紧凑控件样式。
+
+Qt 控件的默认内边距比 Tk（ttk）大一截，几行工具栏累积起来会吃掉大量垂直空间，
+使同一窗口高度能显示的行数明显少于 Tk 版（实测 150% 缩放下按钮/下拉普遍比 Tk 高
+约 1/3）。这里统一收紧内边距，只影响本窗口。
+
+**注意**：不要在这里写 ``QTabBar::tab`` 规则——一旦样式表涉及页签，Qt 会放弃
+Windows 原生页签绘制而改用样式表风格，选中页与未选中页几乎看不出区别（表现为
+「像是当前页**左侧**那一页被按下」）。页签外观交给系统原生绘制。
+"""
+
+MAX_WIDGET_SIZE = 16777215
+"""Qt 的「不限制最大尺寸」取值（即 C++ 的 ``QWIDGETSIZE_MAX``；PySide6 未导出该宏）。"""
+
+TABLE_MAX_VISIBLE_ROWS = 7
+"""房间列表**初始**最多撑到几行（再多就靠滚动条）。
+
+高度按行数收缩（见 ``_table_preferred_height``），但**不该无限长高**：房间多时把
+SC / 弹幕区挤成一条缝并不好用。实测 6~7 行足够扫一眼房间状态，剩下的空间留给
+下方内容区（Tk 版的窗格高度也大致只放得下 6~7 行，两版观感一致）。
+
+注意这只是**初始分配**用的上限：列表高度由分隔条决定，随时可以拖动改变（可压到
+一两行，也可以拖大）。早期版本用 ``setFixedHeight`` 设表格高度，那会连带把面板的
+**最小**高度一起钉死，用户就再也拖不小了（实测被卡在 7 行）。
+"""
+
+MIN_WINDOW_SIZE = (880, 560)
+"""最小窗口尺寸（逻辑像素）。"""
+
+DEFAULT_WINDOW_SIZE = (MIN_WINDOW_SIZE[0], 900)
+"""默认窗口尺寸（逻辑像素；未记忆过尺寸时使用，并受屏幕可用区域限制）。
+
+宽度直接取**最小许可宽度**：三区块纵向排布，宽度再大也只是让文字行更长、并不增加
+信息量，窄一点反而能让 SC / 弹幕区两侧少留空白。高度取 900：1440p（150% 缩放 ≈ 912
+逻辑可用高）一屏能放下，SC / 弹幕区都不用来回滚动；更小的屏由
+``_apply_window_geometry`` 的限制兜底。
 """
 
 
@@ -429,6 +473,10 @@ class QtScMonitorApp(QMainWindow):
         log_app.info("程序启动：数据目录 %s，直播间列表 %s（%d 个房间）",
                      self.output_dir, self.config_path, len(self.entries))
         self._build_ui()
+        # 窗口尺寸放在界面**建完**之后设置：早先在 _build_ui 开头调用时，后面继续添加
+        # 控件会把刚设好的尺寸顶回布局 sizeHint（实测只剩 880×600），默认值与记忆值
+        # 都看不出效果。
+        self._apply_window_geometry()
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_queue)
         self._poll_timer.start(QUEUE_POLL_MS)
@@ -471,8 +519,7 @@ class QtScMonitorApp(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("B站直播间 SC 监控（Qt）")
-        self.resize(1000, 680)
-        self.setMinimumSize(820, 540)
+        self.setStyleSheet(COMPACT_STYLE)  # 收紧控件内边距，一屏多显示内容
 
         tabs = QTabWidget(self)
         self.setCentralWidget(tabs)
@@ -481,15 +528,40 @@ class QtScMonitorApp(QMainWindow):
         self._build_medal_tab(tabs)
         self._build_debug_tab(tabs)
 
+    def _apply_window_geometry(self) -> None:
+        """窗口初始尺寸：优先用上次记忆的，否则取默认值并受屏幕可用区域限制。
+
+        Tk 版按 DPI 放大默认尺寸（1000×760 × scale）；Qt 的尺寸是**逻辑像素**（高 DPI
+        下会自动放大渲染），所以这里直接用逻辑像素，并按屏幕可用区域做上限，避免在
+        小屏上一开窗就超出屏幕。
+        """
+        self.setMinimumSize(*MIN_WINDOW_SIZE)
+        saved = self.ui_prefs.get("window_size")
+        if (isinstance(saved, (list, tuple)) and len(saved) == 2
+                and all(isinstance(value, int) and value > 200 for value in saved)):
+            self.resize(int(saved[0]), int(saved[1]))
+            return
+        width, height = DEFAULT_WINDOW_SIZE
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, max(MIN_WINDOW_SIZE[0], int(available.width() * 0.88)))
+            # 高度尽量用满可用区域（只留 12px 余量）：窗口矮会让 SC / 弹幕区频繁滚动
+            height = min(height, max(MIN_WINDOW_SIZE[1], available.height() - 12))
+        self.resize(width, height)
+
     def _build_rooms_tab(self, tabs: QTabWidget) -> None:
         from .qt_dm_panel import BottomHoldTextEdit, DmPanel
 
         tab = QWidget()
         tabs.addTab(tab, "直播间")
         outer = QVBoxLayout(tab)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(4)
 
         # 添加栏
         add_bar = QHBoxLayout()
+        add_bar.setSpacing(4)
         add_bar.addWidget(QLabel("直播间号 / 直播间地址 / 主播主页地址："))
         self.add_edit = QLineEdit()
         self.add_edit.returnPressed.connect(self._on_add_room)
@@ -501,6 +573,7 @@ class QtScMonitorApp(QMainWindow):
 
         # 排序 / 通知设置栏
         sort_bar = QHBoxLayout()
+        sort_bar.setSpacing(4)
         sort_bar.addWidget(QLabel("排序："))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(list(SORT_MODE_TEXTS.values()))
@@ -533,19 +606,11 @@ class QtScMonitorApp(QMainWindow):
         sound_preview = QPushButton("试听")
         sound_preview.clicked.connect(self._on_preview_sound)
         sort_bar.addWidget(sound_preview)
-        hint = QLabel("（按住行拖动可调整顺序，Ctrl 可多选）")
+        sort_bar.addStretch(1)  # 提示靠右：窗口变窄时先压缩提示，而不是让控件挤成一团
+        hint = QLabel("（拖动行排序，Ctrl 多选）")
         hint.setStyleSheet("color:#888888;")
         sort_bar.addWidget(hint)
         outer.addLayout(sort_bar)
-
-        # 弹幕区开关（常驻于此——面板自身隐藏时开关不会随之消失）
-        dm_bar = QHBoxLayout()
-        self.dm_toggle = QCheckBox("显示弹幕区")
-        self.dm_toggle.setChecked(bool(self.ui_prefs.get("dm_visible", False)))
-        self.dm_toggle.toggled.connect(self._on_dm_toggled)
-        dm_bar.addWidget(self.dm_toggle)
-        dm_bar.addStretch(1)
-        outer.addLayout(dm_bar)
 
         # 三板块垂直分割（房间列表 / SC / 弹幕占位）
         splitter = QSplitter(Qt.Vertical)
@@ -566,8 +631,11 @@ class QtScMonitorApp(QMainWindow):
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(40)
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
-        for col, width in ((0, 100), (1, 130), (2, 90), (3, 50), (5, 180)):
+        # 直播标题与备注都弹性（与 Tk 版一致）：两者分摊多余宽度，避免标题独吞、
+        # 备注列被挤到只剩几个字
+        for col in (4, 5):
+            header.setSectionResizeMode(col, QHeaderView.Stretch)
+        for col, width in ((0, 96), (1, 120), (2, 84), (3, 46)):
             self.table.setColumnWidth(col, width)
             header.setSectionResizeMode(col, QHeaderView.Interactive)
         self.table.verticalHeader().setDefaultSectionSize(compact_row_height(self.table))
@@ -602,13 +670,16 @@ class QtScMonitorApp(QMainWindow):
         sc_panel = QWidget()
         sc_layout = QVBoxLayout(sc_panel)
         sc_layout.setContentsMargins(0, 0, 0, 0)
-        # 头部：直播标题 + 同接 / 舰长 / 粉丝牌
+        # 头部：左侧直播标题 + 同接/舰长/粉丝牌，右侧累计 SC（同一行，省一行高度）
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
         self.sc_header = QLabel("")
-        self.sc_header.setWordWrap(True)
-        sc_layout.addWidget(self.sc_header)
+        self.sc_header.setWordWrap(False)  # 单行显示；过长与 Tk 版一样裁掉，完整内容见悬浮提示
+        header_row.addWidget(self.sc_header, 1)
         self.sc_total_label = QLabel("")
         self.sc_total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        sc_layout.addWidget(self.sc_total_label)
+        header_row.addWidget(self.sc_total_label, 0)
+        sc_layout.addLayout(header_row)
         self.sc_text = BottomHoldTextEdit()
         self.sc_text.setReadOnly(True)
         self.sc_text.setFont(QFont("Microsoft YaHei UI", 10))
@@ -629,8 +700,24 @@ class QtScMonitorApp(QMainWindow):
         # 初始占比按 Tk 的 PANE_RATIO（2 : 3.5 : 4.5）
         self._apply_pane_ratio(initial=True)
 
-        # 底部全局操作条
+        # 底部全局操作条（弹幕区开关也放这里：与排序栏共用一行会太挤，合并到此处省一整行）
         bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        self.dm_toggle = QCheckBox("显示弹幕区")
+        self.dm_toggle.setChecked(bool(self.ui_prefs.get("dm_visible", False)))
+        self.dm_toggle.toggled.connect(self._on_dm_toggled)
+        self.dm_toggle.setToolTip("开启后显示并保存当前选中房间的弹幕（与 Tk 版一致）")
+        bottom.addWidget(self.dm_toggle)
+        # 弹幕流里是否直接显示表情图片（Qt 版专有：内嵌图片更直观但更占行高）
+        self.dm_emoticon_check = QCheckBox("弹幕表情图")
+        self.dm_emoticon_check.setChecked(
+            bool(self.ui_prefs.get("dm_emoticon_image", True)))
+        self.dm_emoticon_check.toggled.connect(self._on_dm_emoticon_image_toggled)
+        self.dm_emoticon_check.setToolTip(
+            "开启：表情弹幕在弹幕流里直接显示图片（更直观，但行更高、占更多高度）。\n"
+            "关闭：只显示「[触发词]」文字（行更紧凑），鼠标悬浮仍可看原图。")
+        bottom.addWidget(self.dm_emoticon_check)
+        bottom.addSpacing(10)
         refresh_btn = QPushButton("刷新历史")
         refresh_btn.clicked.connect(self._on_refresh_history)
         bottom.addWidget(refresh_btn)
@@ -775,6 +862,8 @@ class QtScMonitorApp(QMainWindow):
         tab = QWidget()
         tabs.addTab(tab, "调试")
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         # 调试日志同样支持中键快速滚动（与 Tk 版 _bind_autoscroll(debug_text) 一致）
         self.log_view = BottomHoldTextEdit()
         self.log_view.setReadOnly(True)
@@ -794,6 +883,35 @@ class QtScMonitorApp(QMainWindow):
 
     # ---------- 房间列表 ----------
 
+    def _table_preferred_height(self) -> int:
+        """列表期望高度：表头 + 行数 × 行高（最多 ``TABLE_MAX_VISIBLE_ROWS`` 行）+ 边框余量。
+
+        只算「想要多高」，不直接设到控件上——高度最终由分隔条分配（见
+        ``_apply_pane_ratio``），这样用户随时能拖动改变，不会被钉死。
+        """
+        table = getattr(self, "table", None)
+        if table is None:
+            return 0
+        row_h = table.verticalHeader().defaultSectionSize()
+        rows = max(1, min(table.rowCount(), TABLE_MAX_VISIBLE_ROWS))
+        # 表头 + 行 + 边框 + 4px 余量：余量不足时最后一行会被挤出视口（出现半行）
+        return (table.horizontalHeader().height() + rows * row_h
+                + 2 * table.frameWidth() + 4)
+
+    def _fit_table_height(self) -> None:
+        """行数变化后重排板块高度（列表按行数收缩，多余空间留给 SC / 弹幕区）。
+
+        仅重排**分配**，不锁死表格高度：早期用 ``setFixedHeight`` 会让面板的最小
+        高度也被固定，分隔条就再也拖不动了（表现为「列表被锁定至少 7 行」）。
+        """
+        table = getattr(self, "table", None)
+        if table is not None and (table.minimumHeight() != 0
+                                  or table.maximumHeight() != MAX_WIDGET_SIZE):
+            # 清掉可能残留的固定高度（旧版本设过），恢复可伸缩
+            table.setMinimumHeight(0)
+            table.setMaximumHeight(MAX_WIDGET_SIZE)
+        self._apply_pane_ratio()
+
     def _populate_rows(self) -> None:
         self.table.setRowCount(0)
         for room_id in self._room_order:
@@ -804,6 +922,7 @@ class QtScMonitorApp(QMainWindow):
             self._insert_row(room_id)
         # 粉丝牌页任务列表跟随直播间列表顺序
         self.medal_tab.sync_task_rows()
+        self._fit_table_height()
 
     def _insert_row(self, room_id: int) -> None:
         if room_id not in self._room_order:
@@ -811,6 +930,7 @@ class QtScMonitorApp(QMainWindow):
         row = self._room_order.index(room_id)
         self.table.insertRow(row)
         self._refresh_row(room_id)
+        self._fit_table_height()
 
     def _refresh_row(self, room_id: int) -> None:
         if room_id not in self._room_order:
@@ -1232,6 +1352,7 @@ class QtScMonitorApp(QMainWindow):
                 self._room_order.remove(room_id)
         self._save_config()
         self.medal_tab.sync_task_rows()  # 粉丝牌页同步移除行
+        self._fit_table_height()         # 行数减少：列表高度随之收缩
         self._on_room_selected()
         self._apply_dm_gate()
 
@@ -1315,6 +1436,18 @@ class QtScMonitorApp(QMainWindow):
         self._save_config()
         log_window.info("弹幕区%s", "显示" if self.dm_var else "隐藏")
         self._apply_dm_gate()
+
+    def _on_dm_emoticon_image_toggled(self, checked: bool) -> None:
+        """弹幕表情图开关：内嵌图片／只显示触发词（立即生效并落盘偏好）。
+
+        关闭时会把弹幕里**已经显示**的表情图还原成「[触发词]」文字，所以行高立刻降下来，
+        不必等新弹幕；重新开启只影响后续新弹幕（历史行保持文字）。
+        """
+        self.ui_prefs["dm_emoticon_image"] = bool(checked)
+        if hasattr(self, "dm_panel"):
+            self.dm_panel.set_emoticon_image_enabled(bool(checked))
+        self._save_config()
+        log_window.info("弹幕表情图：%s", "显示" if checked else "只显示触发词")
         self._refresh_dm_send_state()
         self._load_dm_options_for_selected()
         # 板块增减会打乱占比，重新按默认占比分配（与 Tk 版 _on_dm_toggled 一致）
@@ -1330,6 +1463,7 @@ class QtScMonitorApp(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         """窗口尺寸变化：由节流器合并成一条日志（与 Tk 版 _on_root_configure 一致）。"""
         super().resizeEvent(event)
+        self._fit_table_height()  # 窗口变矮/变高时重新约束列表高度
         debounced = getattr(self, "_window_size_log", None)
         if debounced is not None:
             size = self.size()
@@ -1342,10 +1476,26 @@ class QtScMonitorApp(QMainWindow):
             return
         self._splitter_size_log.note("、".join(str(s) for s in sizes.sizes()))
 
-    def _apply_pane_ratio(self, *, initial: bool = False) -> None:
-        """按 Tk 的 PANE_RATIO（2 : 3.5 : 4.5）分配板块高度。
+    def _room_pane_preferred_height(self, panel) -> int:
+        """房间面板的期望高度 = 列表期望高度 + 面板内其它控件（备注框 / 按钮行）。
 
-        弹幕区隐藏时只剩两个板块，取占比前两项（与 Tk 版 _apply_default_pane_ratio 一致）。
+        表格以外的部分直接用 ``sizeHint`` 差值推出来，免得再维护一份间距常量。
+        """
+        table = getattr(self, "table", None)
+        if table is None:
+            return panel.sizeHint().height()
+        others = panel.sizeHint().height() - table.sizeHint().height()
+        return self._table_preferred_height() + max(0, others)
+
+    def _apply_pane_ratio(self, *, initial: bool = False) -> None:
+        """分配三个板块的高度。
+
+        房间列表按**内容高度**（表格 + 操作行）收缩，剩余空间再按 Tk 的 PANE_RATIO
+        余项（3.5 : 4.5）分给 SC / 弹幕区——房间少时列表区不会白出一大片；弹幕区
+        隐藏时只剩两块，剩余空间全部给 SC 区。
+
+        这里只是**初始分配**：列表高度由分隔条决定，用户随时可以拖动改变（含压到
+        一两行），不会被锁死。
         """
         splitter = getattr(self, "splitter", None)
         if splitter is None:
@@ -1354,19 +1504,27 @@ class QtScMonitorApp(QMainWindow):
         visible = [w for w in panes if not w.isHidden()]
         if len(visible) < 2:
             return
-        ratios = PANE_RATIO[:len(visible)]
         total = max(self.height(), 400) if initial else splitter.height()
         if total <= 1:
             total = 680
+        ratios = PANE_RATIO[:len(visible)]
         span = sum(ratios)
+        room_h = min(self._room_pane_preferred_height(visible[0]),
+                     max(120, int(total * ratios[0] / span)))
+        rest = max(0, total - room_h)
+        rest_ratios = ratios[1:]
+        rest_span = sum(rest_ratios) or 1
         sizes: List[int] = []
         index = 0
         for widget in panes:
             if widget.isHidden():
                 sizes.append(0)
+                continue
+            if index == 0:
+                sizes.append(room_h)
             else:
-                sizes.append(max(1, int(total * ratios[index] / span)))
-                index += 1
+                sizes.append(max(1, int(rest * rest_ratios[index - 1] / rest_span)))
+            index += 1
         splitter.setSizes(sizes)
 
     def _on_preview_sound(self) -> None:
@@ -1687,7 +1845,9 @@ class QtScMonitorApp(QMainWindow):
         medal_name, medal_level = self._fan_medal_for(room_id)
         if medal_name:
             parts.append(f"粉丝牌 {medal_name} Lv{medal_level}")
-        self.sc_header.setText(" · ".join(parts))
+        text = " · ".join(parts)
+        self.sc_header.setText(text)
+        self.sc_header.setToolTip(text)  # 单行显示：过长时靠悬浮查看完整内容
 
     def _update_sc_total_label(self) -> None:
         room_id = self._selected_room_id
@@ -2251,6 +2411,9 @@ class QtScMonitorApp(QMainWindow):
                                     QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             event.ignore()
             return
+        # 记住窗口尺寸：下次启动恢复（Tk 版不使用该键，只原样写回）
+        self.ui_prefs["window_size"] = [self.width(), self.height()]
+        self._save_config()
         log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self._room_order))
         self._window_size_log.flush()    # 退出前把待写的窗口尺寸变化补上
         self._splitter_size_log.flush()

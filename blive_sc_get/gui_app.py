@@ -831,7 +831,15 @@ class ScMonitorApp:
             scale = max(dpi / 96.0, 1.0)
         except Exception:
             scale = 1.0
-        self._default_window_size = (int(1000 * scale), int(680 * scale))
+        self._default_window_size = (int(1000 * scale), int(760 * scale))
+        # 屏幕兜底：默认高度不要顶到屏幕上沿/任务栏之外（小屏上按屏高留出余量）
+        try:
+            self._default_window_size = (
+                self._default_window_size[0],
+                min(self._default_window_size[1],
+                    max(int(540 * scale), self.root.winfo_screenheight() - int(80 * scale))))
+        except tk.TclError:
+            pass
         self.root.geometry(f"{self._default_window_size[0]}x{self._default_window_size[1]}")
         self.root.minsize(int(820 * scale), int(540 * scale))
 

@@ -12,7 +12,7 @@ import time
 import webbrowser
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QCursor,
     QColor,
@@ -24,6 +24,8 @@ from PySide6.QtGui import (
     QShortcut,
     QTextCharFormat,
     QTextCursor,
+    QTextDocument,
+    QTextImageFormat,
 )
 from PySide6.QtWidgets import (
     QComboBox,
@@ -174,11 +176,13 @@ _DM_BODY_COLOR = "#1f1f1f"
 
 # QTextCharFormat 自定义属性键：供点击弹幕精确定位（uid 跳转 / 正文复制 / 表情悬浮）
 _DM_UID_KEY = 0x301     # 用户名段用户 uid
-_DM_MID_KEY = 0x302     # 正文段弹幕 dmid
+_DM_MID_KEY = 0x302     # 正文段弹幕 dmid（取不到 dmid 的弹幕没有该键）
 _DM_EMOJI_KEY = 0x303   # 正文段表情 unique（悬浮时显示提示/原图）
+_DM_BODY_KEY = 0x304    # 正文段标记（与 dmid 无关）：点击即复制，缺 dmid 也能复制
 DM_META_MAX = 2000      # dmid 元数据缓存上限（超限丢最早一半）
 EMOJI_TOOLTIP_DELAY_MS = 300   # 表情悬浮延迟（扫过时不弹，避免乱闪）
 COPY_HINT_MS = 1800     # 「已复制」提示停留时长
+DM_IMAGE_BLOCK_MAX = 400  # 「等图片下载好再替换成图」的待补行记录上限（超限丢最早一半）
 
 
 def _remember_meta(cache: dict, dmid: str, uid: int,
@@ -219,6 +223,11 @@ class DmPanel(QWidget):
         self._dm_meta: Dict[str, Tuple[int, str, str]] = {}
         # emoticon_unique -> {"text","unique","id","room_id","url"}（有上限保护）
         self._dm_emoticon_info: Dict[str, dict] = {}
+        # 弹幕流里是否直接显示表情图片（Qt 版专有，来自界面偏好；关闭时只显示触发词）
+        self._dm_emoticon_image = bool(host.ui_prefs.get("dm_emoticon_image", True))
+        # 表情弹幕：图还没下载好时先显示触发词，等图到了再**原地**换成图片
+        # （emoticon_unique -> 待替换的 QTextBlock 列表，见 _fill_dm_emoticon_blocks）
+        self._dm_image_blocks: Dict[str, List] = {}
         self._emoji_hover_key: str = ""
         self._emoji_tip_timer: Optional[QTimer] = None
         self._pending_emoji_tip: Optional[dict] = None
@@ -272,6 +281,7 @@ class DmPanel(QWidget):
 
         # 发送区
         send = QHBoxLayout()
+        send.setSpacing(4)
         self.dm_modes = QComboBox()
         for name, _mode in self._dm_modes:
             self.dm_modes.addItem(name)
@@ -421,17 +431,27 @@ class DmPanel(QWidget):
             if uid:
                 fmt.setProperty(_DM_UID_KEY, uid)
             cursor.insertText(f"{uname}：", fmt)
-            # 正文段：带 dmid → 点击复制 / 右键回复；带表情 unique → 悬浮提示
+            # 正文段：带 dmid → 点击复制 / 右键回复；带表情 unique → 弹幕流内直接显示图片
             fmt = QTextCharFormat()
             fmt.setForeground(QColor(_DM_BODY_COLOR))
+            fmt.setProperty(_DM_BODY_KEY, True)  # 正文标记：缺 dmid 也要能点复制
             if dmid:
                 fmt.setProperty(_DM_MID_KEY, dmid)
             unique = str(emoticon.get("unique") or "")
             if unique:
-                # 表情弹幕：打标记记录，供悬浮时看原图（弹幕流内不内嵌图片）
                 fmt.setProperty(_DM_EMOJI_KEY, unique)
                 self._remember_dm_emoticon(unique, info, text)
-            cursor.insertText(text if text else " ", fmt)
+            cached = self._dm_emoticon_pixmap(unique) if self._dm_emoticon_image else None
+            if cached is not None:
+                # 图片已缓存：直接内嵌进弹幕流（Qt 富文本原生支持；Tk 版受性能限制只能悬浮看）
+                url, pixmap = cached
+                self._insert_dm_emoticon_image(
+                    cursor, self._dm_image_format(dmid, unique, url, pixmap), url, pixmap)
+            else:
+                # 图还没下载好：先显示触发词，图片到达后由 _fill_dm_emoticon_blocks 原地换图
+                cursor.insertText(text if text else " ", fmt)
+                if unique:
+                    self._remember_dm_image_block(unique, cursor.block())
             cursor.insertText("\n")
         if follow:
             bar = self.dm_text.verticalScrollBar()
@@ -470,30 +490,69 @@ class DmPanel(QWidget):
     def _install_wheel_filter(self, widget) -> None:
         widget.installEventFilter(self)
 
-    def _clicked_fmt(self, event) -> Optional[QTextCharFormat]:
-        """取光标所在字符的格式；点在空白/行尾换行处返回 None，避免误触。"""
-        pos = event.position().toPoint()
-        cursor = self.dm_text.cursorForPosition(pos)
-        char = self.dm_text.document().characterAt(cursor.position())
-        if char in (" ", "\n", "\t", ""):
+    def _clicked_char(self, pos) -> Optional[Tuple[int, str]]:
+        """把坐标映射到**真正被点中的字符**（返回 ``(字符位置, 字符)``）；点空白返回 ``None``。
+
+        ``cursorForPosition`` 会把坐标吸附到最近的字符：行尾右侧与文本区下方的空白也会
+        被吸附到最近的字符上，所以仅凭 ``characterAt`` 判断「字符是不是空白」并不足以
+        区分——这正是「点空白也会复制」的来源。这里补两层几何约束：
+
+        - 垂直：坐标要落在该行的行高范围内（排除文本区下方的大片空白）；
+        - 水平：不得超出该行文本的右边界（排除行尾右侧的大片空白）。
+
+        另外，点在字符右半边时 ``cursorForPosition`` 指向的是**下一个**字符，越到行尾
+        就拿到换行符——此时回退一个字符，否则「点弹幕的最后几个字复制不出来」。
+        """
+        view = self.dm_text
+        doc = view.document()
+        cursor = view.cursorForPosition(pos)
+        rect = view.cursorRect(cursor)  # 光标竖线矩形：宽度极小、高度即行高
+        if rect.height() <= 0 or not rect.top() - 1 <= pos.y() <= rect.bottom() + 1:
             return None
+        block = cursor.block()
+        text = block.text()
+        if not text:
+            return None
+        start = block.position()
+        end_cursor = QTextCursor(doc)
+        end_cursor.setPosition(start + len(text))
+        if pos.x() > view.cursorRect(end_cursor).left() + 1:
+            return None  # 行尾右侧空白：没有文字可点
+        index = cursor.position()
+        if index >= start + len(text):
+            index = start + len(text) - 1  # 吸附到行尾（换行符）→ 用最后一个字符
+        return index, str(doc.characterAt(index))
+
+    def _clicked_fmt(self, pos) -> Optional[QTextCharFormat]:
+        """取点击坐标处**字符**的格式；点在空白/行尾换行处返回 ``None``（避免误触）。"""
+        hit = self._clicked_char(pos)
+        if hit is None:
+            return None
+        index, char = hit
+        if not char or char in " \t\r\n":
+            return None  # 空白字符（含行尾换行）不算命中
+        cursor = QTextCursor(self.dm_text.document())
+        cursor.setPosition(index)
+        cursor.setPosition(index + 1, QTextCursor.KeepAnchor)
         return cursor.charFormat()
 
     def _on_dm_press(self, event) -> None:
         if event.button() != Qt.LeftButton:
             return
         self._hide_emoji_tooltip()
-        fmt = self._clicked_fmt(event)
+        pos = event.position().toPoint()
+        fmt = self._clicked_fmt(pos)
         if fmt is None:
             return
-        mid = str(fmt.property(_DM_MID_KEY) or "")
         uid = int(fmt.property(_DM_UID_KEY) or 0)
-        if mid:
+        if fmt.property(_DM_BODY_KEY):
+            # 正文段：优先用 dmid 元数据（原文），取不到再从整行文本兜底还原
+            mid = str(fmt.property(_DM_MID_KEY) or "")
             meta = self._dm_meta.get(mid)
             content = str(meta[2]) if meta else ""
             if not content:
-                cursor = self.dm_text.cursorForPosition(event.position().toPoint())
-                content = danmaku_content_from_line(cursor.block().text())
+                content = danmaku_content_from_line(
+                    self.dm_text.cursorForPosition(pos).block().text())
             if content:
                 self._copy_dm_content(content)
         elif uid:
@@ -517,7 +576,7 @@ class DmPanel(QWidget):
     def _on_dm_context_menu(self, event) -> bool:
         """右键弹幕：回复该弹幕（需 dmid）/ @该用户（需 uid）。"""
         self._hide_emoji_tooltip()
-        fmt = self._clicked_fmt(event)
+        fmt = self._clicked_fmt(event.position().toPoint())
         mid = str(fmt.property(_DM_MID_KEY) or "") if fmt else ""
         uid = int(fmt.property(_DM_UID_KEY) or 0) if fmt else 0
         meta = self._dm_meta.get(mid)
@@ -589,9 +648,8 @@ class DmPanel(QWidget):
 
     def _on_dm_motion(self, event) -> None:
         pos = event.position().toPoint()
-        cursor = self.dm_text.cursorForPosition(pos)
-        fmt = cursor.charFormat()
-        key = str(fmt.property(_DM_EMOJI_KEY) or "")
+        fmt = self._clicked_fmt(pos)  # 与点击同一套命中判定：空白处不弹提示
+        key = str(fmt.property(_DM_EMOJI_KEY) or "") if fmt is not None else ""
         if key == self._emoji_hover_key:
             return  # 仍停留在同一表情：不重排也不闪
         self._emoji_hover_key = key
@@ -601,7 +659,7 @@ class DmPanel(QWidget):
         info = self._dm_emoticon_info.get(key)
         if info is None:
             return
-        # 悬浮要看原图：缺地址先兜底，图片未缓存就先懒加载（就绪后提示窗自动补上）
+        # 缺地址/数字 id 时用已加载的表情包兜底补齐（弹幕流里的图也依赖这里的 url）
         url = self._ensure_dm_emoticon(info)
         if url:
             self._request_dm_emoticon_image(url)
@@ -613,14 +671,34 @@ class DmPanel(QWidget):
         self._pending_emoji_tip = None
         if not info:
             return
-        url = self._ensure_dm_emoticon(info)
-        pixmap = self._emoticon_images.get(url) if url else None
-        if url and pixmap is None:
-            self._request_dm_emoticon_image(url)
-        self._show_emoji_tip(info, pixmap)
+        self._show_emoji_tip(info)
 
-    def _show_emoji_tip(self, info: dict, pixmap: Optional[QPixmap]) -> None:
-        """显示提示：有原图就只显示图（触发词与弹幕内容重复），否则显示配置文案。"""
+    def _show_emoji_tip(self, info: dict) -> None:
+        """显示悬浮提示。
+
+        - **「弹幕表情图」开关开启**（默认）：图片已直接显示在弹幕流里，提示只按
+          ``config.json`` 的 ``emoticon_tooltip`` 补触发词 / 唯一标识 / 数字 id，不重复弹大图；
+        - **开关关闭**：弹幕里只剩「[触发词]」文字，此时悬浮仍可看原图（与 Tk 版一致）；
+          原图未就绪则先显示配置文字，图片到达后由 ``on_emoticon_image`` 回填。
+
+        两种情况都没有内容可显示（配置字段全关且无图）时不弹提示。
+        """
+        pixmap = None
+        if not self._dm_emoticon_image:
+            url = self._ensure_dm_emoticon(info)
+            pixmap = self._emoticon_images.get(url) if url else None
+            if url and pixmap is None:
+                self._request_dm_emoticon_image(url)
+        text = ""
+        if pixmap is None:
+            try:
+                text = emoticon_tooltip_text(
+                    info, self.host.app_config.emoticon_tooltip) or ""
+            except Exception:
+                text = ""
+            if not text:
+                self._hide_emoji_tooltip()
+                return
         label = self._emoji_tip_label
         if label is None:
             label = QLabel(None, Qt.Tool | Qt.FramelessWindowHint
@@ -630,23 +708,12 @@ class DmPanel(QWidget):
                 " border:1px solid #666666; font-size:11px;")
             label.hide()
             self._emoji_tip_label = label
-        text = ""
-        if pixmap is None:
-            # 无原图时用配置字段拼文案（触发词属于 "text" 字段，勿另行重复拼接）
-            try:
-                text = emoticon_tooltip_text(
-                    info, self.host.app_config.emoticon_tooltip) or ""
-            except Exception:
-                text = ""
-            if not text:
-                self._hide_emoji_tooltip()
-                return
         self._emoji_tip_info = info
         if pixmap is not None:
             label.setText("")
             label.setPixmap(pixmap)
         else:
-            label.setPixmap(QPixmap())  # 清掉旧图，避免残留上一次的原图
+            label.setPixmap(QPixmap())  # 清掉可能残留的原图，避免图文叠加
             label.setText(text)
         label.adjustSize()
         label.move(self._tooltip_pos(label))
@@ -712,11 +779,190 @@ class DmPanel(QWidget):
         cursor.setPosition(block_to.position(), QTextCursor.KeepAnchor)
         cursor.removeSelectedText()
 
+    # ---------- 弹幕流内的表情图片 ----------
+
+    def set_emoticon_image_enabled(self, enabled: bool) -> None:
+        """切换「弹幕流内显示表情图片」（界面上的「弹幕表情图」开关）。
+
+        **两个方向都作用于已有弹幕**：关闭时把已显示的图片立刻还原成「[触发词]」文字
+        （行高马上降下来），重新开启时再把弹幕流里的触发词换回图片（图未缓存则先触发
+        下载，到达后自动补上）——都只处理**登记过**的表情行（最近约
+        ``DM_IMAGE_BLOCK_MAX`` 条），不必等新弹幕、也无需切房重载。
+        """
+        enabled = bool(enabled)
+        if enabled == self._dm_emoticon_image:
+            return
+        self._dm_emoticon_image = enabled
+        if enabled:
+            self._refill_dm_emoticon_images()
+            return
+        self._strip_dm_emoticon_images()
+
+    def _strip_dm_emoticon_images(self) -> None:
+        """把弹幕流里已显示的表情图还原为触发词文字（关闭开关时调用）。
+
+        还原时顺手把该行登记进 ``_dm_image_blocks``，这样重新开启开关时还能换回图片。
+        """
+        doc = self.dm_text.document()
+        follow = self._dm_scrolled_to_bottom
+        cursor = QTextCursor(doc)
+        for _ in range(DM_IMAGE_BLOCK_MAX * 5):  # 上限保护：异常情况下也不至于死循环
+            found = doc.find("\ufffc", cursor)
+            if found.isNull():
+                break
+            unique = str(found.charFormat().property(_DM_EMOJI_KEY) or "")
+            if not unique:
+                cursor.setPosition(found.selectionEnd())
+                continue
+            text = str((self._dm_emoticon_info.get(unique) or {}).get("text")
+                       or "[表情]")
+            self._remember_dm_image_block(unique, found.block())  # 供重新开启时换回图片
+            found.insertText(text)   # 替换掉这个内嵌对象字符
+            cursor = found           # insertText 后光标已落在新文本之后
+        if follow:  # 图片行变矮：原本吸底就继续吸底
+            bar = self.dm_text.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def _refill_dm_emoticon_images(self) -> None:
+        """把弹幕流里已有的「表情触发词」换回图片（重新开启开关时调用）。
+
+        只处理**登记过**的表情行（渲染文字占位时、或关闭开关还原图片时登记，上限
+        ``DM_IMAGE_BLOCK_MAX`` 行）：图片已缓存就直接原地换图，未缓存则触发下载，
+        到达后由 ``_fill_dm_emoticon_blocks`` 自动补上。
+        """
+        if not self._dm_image_blocks:
+            return
+        for unique in list(self._dm_image_blocks):
+            info = self._dm_emoticon_info.get(unique) or {}
+            url = str(info.get("url") or "")
+            if not url:
+                continue
+            pixmap = self._emoticon_images.get(url)
+            if pixmap is None:
+                self._request_dm_emoticon_image(url)  # 图到了会自动换（on_emoticon_image）
+                continue
+            self._fill_dm_emoticon_blocks(url, pixmap)
+
+    def _dm_emoticon_pixmap(self, unique: str) -> Optional[Tuple[str, QPixmap]]:
+        """该表情在弹幕流里要用的图（``(url, pixmap)``）；还没下载好时返回 ``None``。
+
+        未缓存时顺带触发一次下载（同一 url 去重，重复调用无副作用），图片到达后由
+        ``_fill_dm_emoticon_blocks`` 把先前只显示触发词的那些行换成图片。
+        """
+        if not unique:
+            return None
+        info = self._dm_emoticon_info.get(unique) or {}
+        url = str(info.get("url") or "")
+        if not url:
+            return None
+        pixmap = self._emoticon_images.get(url)
+        if pixmap is None:
+            self._request_dm_emoticon_image(url)
+            return None
+        return url, pixmap
+
+    @staticmethod
+    def _dm_image_format(dmid: str, unique: str, url: str,
+                         pixmap: QPixmap) -> QTextImageFormat:
+        """构造弹幕流内的表情图格式。
+
+        自定义属性（正文标记 / dmid / 表情 unique）一并挂到图片上，这样**点图片**照样
+        能复制该条弹幕、右键照样能回复、悬浮照样出提示，与文字段行为完全一致。
+        """
+        fmt = QTextImageFormat()
+        fmt.setName(url)  # 资源名 = 图片地址（文档资源表按此查找）
+        fmt.setWidth(max(1, pixmap.width()))
+        fmt.setHeight(max(1, pixmap.height()))
+        fmt.setProperty(_DM_BODY_KEY, True)
+        if dmid:
+            fmt.setProperty(_DM_MID_KEY, dmid)
+        if unique:
+            fmt.setProperty(_DM_EMOJI_KEY, unique)
+        return fmt
+
+    def _insert_dm_emoticon_image(self, cursor: QTextCursor, fmt: QTextImageFormat,
+                                  url: str, pixmap: QPixmap) -> None:
+        """把图片登记为文档资源（``QTextImageFormat.name`` 即资源地址）后插入。"""
+        self.dm_text.document().addResource(
+            QTextDocument.ImageResource, QUrl(url), pixmap)
+        cursor.insertImage(fmt)
+
+    def _remember_dm_image_block(self, unique: str, block) -> None:
+        """记下这条弹幕所在的行，等图片下载完成后原地换图（超限丢最早的一半）。"""
+        blocks = self._dm_image_blocks.setdefault(unique, [])
+        blocks.append(block)
+        if len(self._dm_image_blocks) > DM_IMAGE_BLOCK_MAX:
+            for key in list(self._dm_image_blocks)[:DM_IMAGE_BLOCK_MAX // 2]:
+                self._dm_image_blocks.pop(key, None)
+
+    def _fill_dm_emoticon_blocks(self, url: str, pixmap: QPixmap) -> None:
+        """图片就绪：把此前只显示触发词的弹幕行**原地**换成图片。
+
+        只改这些行内的那一段（不重建整个弹幕区），滚动位置、其它行与未读计数都不受
+        影响；已被裁剪（``DM_TEXT_MAX_LINES``）丢弃的行会因 ``isValid()`` 为假跳过。
+        """
+        if not self._dm_emoticon_image:
+            return  # 开关关闭：不再把触发词换成图
+        unique = ""
+        for key, info in self._dm_emoticon_info.items():
+            if str(info.get("url") or "") == url:
+                unique = key
+                break
+        blocks = self._dm_image_blocks.pop(unique, []) if unique else []
+        if not blocks:
+            return
+        self.dm_text.document().addResource(
+            QTextDocument.ImageResource, QUrl(url), pixmap)
+        follow = self._dm_scrolled_to_bottom
+        for block in blocks:
+            if block.isValid():
+                self._replace_block_emoticon(block, unique, url, pixmap)
+        if follow:  # 换图会改变行高：原本吸底就继续吸底
+            bar = self.dm_text.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def _char_format_at(self, cursor: QTextCursor, index: int) -> QTextCharFormat:
+        """取文档中第 ``index`` 个字符的格式。
+
+        注意：``setPosition(i)`` 后直接调 ``charFormat()`` 拿到的是**前一个**字符的格式
+        （光标位于字符之间时 Qt 取左侧字符）——必须用「选中该字符」的方式取，否则整段
+        替换会从第二个字符开始，行首多留一个残字。
+        """
+        cursor.setPosition(index)
+        cursor.setPosition(index + 1, QTextCursor.KeepAnchor)
+        return cursor.charFormat()
+
+    def _replace_block_emoticon(self, block, unique: str, url: str,
+                                pixmap: QPixmap) -> None:
+        """把某一行里带该表情标记的那一段文字替换成图片（保留原 dmid）。"""
+        doc = self.dm_text.document()
+        start = block.position()
+        end = start + len(block.text())
+        cursor = QTextCursor(doc)
+        for index in range(start, end):
+            fmt = self._char_format_at(cursor, index)
+            if str(fmt.property(_DM_EMOJI_KEY) or "") != unique:
+                continue
+            mid = str(fmt.property(_DM_MID_KEY) or "")
+            last = index
+            for probe in range(index + 1, end):
+                if str(self._char_format_at(cursor, probe)
+                       .property(_DM_EMOJI_KEY) or "") == unique:
+                    last = probe
+                else:
+                    break
+            cursor.setPosition(index)
+            cursor.setPosition(last + 1, QTextCursor.KeepAnchor)
+            self._insert_dm_emoticon_image(
+                cursor, self._dm_image_format(mid, unique, url, pixmap), url, pixmap)
+            return
+
     # ---------- 清空 / 生命周期 ----------
 
     def clear_view(self) -> None:
         """清空弹幕显示区（切换直播间时调用，避免不同房间的弹幕混在一起）。"""
         self.dm_text.clear()
+        self._dm_image_blocks.clear()  # 待换图的行随文档一起丢弃
         self._dm_unseen = 0
         self._hide_emoji_tooltip()
         self._sync_unseen_badge()
@@ -1127,7 +1373,7 @@ class DmPanel(QWidget):
         button.setFixedSize(width + 12, height + 12)
 
     def on_emoticon_image(self, payload: dict) -> None:
-        """后台下载完成：解码为 QPixmap，更新按钮与缓存。"""
+        """后台下载完成：解码为 QPixmap，更新按钮与缓存，并把弹幕流里的触发词换成图。"""
         url = str(payload.get("url") or "")
         data = str(payload.get("data") or "")
         self._emoticon_pending.discard(url)
@@ -1154,12 +1400,15 @@ class DmPanel(QWidget):
         if btn is not None:
             self._apply_emoticon_pixmap(btn, pixmap)
             self._sync_strip_width()  # 图标变大后重算自然宽度（横向滚动范围）
-        # 悬浮提示正展示这个表情且此前没有图：立即补上原图（懒加载的就绪回填）
-        info = self._emoji_tip_info
-        label = self._emoji_tip_label
-        if (info is not None and label is not None and not label.isHidden()
-                and self._ensure_dm_emoticon(info) == url):
-            self._show_emoji_tip(info, pixmap)
+        # 弹幕流里此前只显示触发词的那些行：图片到了就原地换成图
+        self._fill_dm_emoticon_blocks(url, pixmap)
+        # 开关关闭时弹幕里没有图：正显示的提示窗若在等这张原图，补上
+        if not self._dm_emoticon_image:
+            info = self._emoji_tip_info
+            label = self._emoji_tip_label
+            if (info is not None and label is not None and not label.isHidden()
+                    and self._ensure_dm_emoticon(info) == url):
+                self._show_emoji_tip(info)
 
     def _on_emoticon_prev_page(self) -> None:
         if self._emoticon_packages:

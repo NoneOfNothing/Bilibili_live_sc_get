@@ -84,6 +84,8 @@ class MedalTab(QWidget):
         from .qt_app import ProtectedLinkTable, compact_row_height
 
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)  # 紧凑布局：Qt 默认边距比 Tk 大一截
+        outer.setSpacing(4)
 
         self.medal_status = QLabel("")
         self.medal_status.setStyleSheet("color:#666;")
@@ -127,6 +129,7 @@ class MedalTab(QWidget):
         outer.addWidget(self.medal_hint)
 
         btns = QHBoxLayout()
+        btns.setSpacing(4)
         self.medal_danmaku_btn = QPushButton("发弹幕")
         self.medal_danmaku_btn.clicked.connect(
             lambda: self._complete_selected(TASK_SEND_DANMAKU))
@@ -142,6 +145,7 @@ class MedalTab(QWidget):
         outer.addLayout(btns)
 
         auto = QHBoxLayout()
+        auto.setSpacing(4)
         self.auto_danmaku_check = QCheckBox("自动发弹幕（选中房间）")
         self.auto_danmaku_check.toggled.connect(
             lambda v: self._on_auto_toggle(v, "danmaku"))
