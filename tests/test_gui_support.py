@@ -1,5 +1,6 @@
 """GUI 支撑逻辑的单元测试（不启动 tkinter 界面）。"""
 
+import ast
 import asyncio
 import json
 import shutil
@@ -1117,6 +1118,66 @@ class EmoticonPackagesSignatureTests(unittest.TestCase):
         self.assertEqual(emoticon_packages_signature(["bad", 1]), empty)
         self.assertEqual(emoticon_packages_signature([{"name": "x"}]),
                          ((None, "x", ()),))
+
+
+class LiveSignalInterruptWiringTests(unittest.TestCase):
+    """开播信号打断「自动发弹幕」（ROADMAP 64）的接线检查（静态 AST，不启动界面）。
+
+    接入点漏掉一处只会表现为「某一版不生效」，静态检查即可在测试阶段发现
+    （与 ``test_qt_wiring`` 同一思路，但这里同时覆盖 Tk 版）。
+    """
+
+    PKG = Path(__file__).resolve().parent.parent / "blive_sc_get"
+
+    def _tree(self, module: str) -> ast.Module:
+        return ast.parse((self.PKG / module).read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _method(tree: ast.Module, name: str):
+        for node in ast.walk(tree):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == name):
+                return node
+        return None
+
+    @staticmethod
+    def _called_names(node) -> set:
+        found = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                if isinstance(func, ast.Attribute):
+                    found.add(func.attr)
+                elif isinstance(func, ast.Name):
+                    found.add(func.id)
+        return found
+
+    @staticmethod
+    def _keyword_names(node) -> set:
+        return {kw.arg for sub in ast.walk(node) if isinstance(sub, ast.Call)
+                for kw in sub.keywords}
+
+    def test_both_versions_interrupt_on_live_signal(self):
+        """两版都必须在收到开播信号时调用房间级打断（否则该版等于没实现）。"""
+        for module in ("gui_app.py", "qt_app.py"):
+            with self.subTest(module=module):
+                tree = self._tree(module)
+                self.assertIsNotNone(self._method(tree, "_interrupt_auto_danmaku"),
+                                     f"{module} 缺少 _interrupt_auto_danmaku")
+                handler = self._method(tree, "_on_client_event")
+                self.assertIsNotNone(handler, f"{module} 缺少 _on_client_event")
+                self.assertIn("_interrupt_auto_danmaku", self._called_names(handler),
+                              f"{module} 未在开播信号处调用 _interrupt_auto_danmaku")
+
+    def test_both_versions_mark_auto_submissions(self):
+        """执行器靠 ``auto`` 区分自动 / 手动，两版的提交点都必须带上该标记。"""
+        for module, method in (("gui_app.py", "_async_complete_medal_room"),
+                               ("qt_medal_tab.py", "_start_medal_room")):
+            with self.subTest(module=module, method=method):
+                node = self._method(self._tree(module), method)
+                self.assertIsNotNone(node, f"{module}.{method} 不存在")
+                self.assertIn("auto", self._keyword_names(node),
+                              f"{module}.{method} 未向 complete_room 传 auto= 标记")
 
 
 if __name__ == "__main__":

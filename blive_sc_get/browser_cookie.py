@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import base64
 import json
-import logging
 import os
 import shutil
 import sqlite3
@@ -30,7 +29,9 @@ try:
 except ImportError:
     AES = None
 
-logger = logging.getLogger(__name__)
+from .log_categories import CATEGORY_TASK, get_logger
+
+logger = get_logger(CATEGORY_TASK, __name__)
 
 BILIBILI_DOMAIN_PATTERN = "%bilibili.com"
 
@@ -273,6 +274,8 @@ def get_bilibili_cookie():
     errors = []
     key_cache: Dict[Path, Optional[bytes]] = {}
     running = running_browser_names()
+    logger.debug("开始扫描浏览器 Cookie（运行中：%s）",
+                 "、".join(sorted(running)) or "无")
     sources = [("Firefox", _FIREFOX_PROFILES_DIR)]
     for name, base in _CHROMIUM_BASES:
         sources.append((name, base))

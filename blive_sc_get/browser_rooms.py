@@ -7,16 +7,16 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import time
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 
+from .log_categories import CATEGORY_DATA, get_logger
 from .room_lock import LOCK_FILE_NAME, RoomLock, RoomLockAcquireError
 
-logger = logging.getLogger(__name__)
+logger = get_logger(CATEGORY_DATA, __name__)
 
 # 只扫描近期更新过的快照，排除早已关闭的标签页残留
 MAX_SESSION_AGE = 24 * 3600
@@ -77,6 +77,9 @@ def find_open_live_rooms(bases: Optional[List[Tuple[str, Path]]] = None) -> Dict
                 continue
             for match in ROOM_URL_RE.finditer(data):
                 found.setdefault(int(match.group(1)), set()).add(browser)
+    logger.debug("浏览器会话扫描完成：命中 %d 个直播间（%s）", len(found),
+                 "、".join(f"{room}={','.join(sorted(names))}"
+                          for room, names in sorted(found.items())) or "无")
     return found
 
 

@@ -14,8 +14,13 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import tkinter as tk
 from typing import List
+
+from .log_categories import CATEGORY_WINDOW, get_logger
+
+logger = get_logger(CATEGORY_WINDOW, "gui.overlay")
 
 SHOW_DURATION_MS = 6000  # 单条悬浮窗显示时长
 WIDTH = 320              # 悬浮窗宽度（像素）

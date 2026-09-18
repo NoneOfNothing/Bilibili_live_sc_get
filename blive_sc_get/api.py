@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import re
 import time
 import urllib.parse
@@ -16,13 +15,29 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from .log_categories import CATEGORY_DATA, get_logger
 from .medal_tasks import (
     dedupe_medals,
     parse_medal_panel,
     parse_task_info_list,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(CATEGORY_DATA, __name__)
+
+_API_LOG_PARAM_KEYS = ("room_id", "roomid", "target_id", "uid", "page", "page_size",
+                       "type", "dm_type", "mode", "color", "limit", "offset")
+"""接口日志里允许打印的参数键（房间号 / uid / 分页等）。
+
+**不含 cookie、csrf（bili_jct）与 WBI 签名**——日志会落盘与长期保留，不打印凭据。
+"""
+
+
+def api_log_label(url: str, params: Optional[Dict[str, Any]] = None) -> str:
+    """接口请求的日志标签：路径 + 少量关键参数（见 ``_API_LOG_PARAM_KEYS``）。"""
+    path = urllib.parse.urlparse(url).path or url
+    picked = [f"{key}={params[key]}" for key in _API_LOG_PARAM_KEYS
+              if params and params.get(key) not in (None, "")]
+    return f"{path}?{'&'.join(picked)}" if picked else path
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -319,12 +334,32 @@ class BilibiliLiveAPI:
                 "Referer": "https://live.bilibili.com/",
                 "Origin": "https://live.bilibili.com"}
 
+    @staticmethod
+    def _log_api_result(label: str, started: float, payload: Dict[str, Any]) -> None:
+        """成功拿到 JSON 后记一条（含 B 站业务 code 与耗时，便于监测接口是否变慢/变错）。"""
+        code = payload.get("code")
+        elapsed = (time.monotonic() - started) * 1000
+        if code in (None, 0):
+            logger.info("接口 %s 返回（code=%s，%.0fms）", label, code, elapsed)
+        else:
+            logger.warning("接口 %s 返回异常（code=%s，message=%s，%.0fms）",
+                           label, code, payload.get("message"), elapsed)
+
     async def _get_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        async with self.session.get(url, params=params, headers=self._headers()) as resp:
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
+        label = api_log_label(url, params)
+        started = time.monotonic()
+        try:
+            async with self.session.get(url, params=params,
+                                        headers=self._headers()) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning("接口 %s 请求失败（%.0fms）：%s", label,
+                           (time.monotonic() - started) * 1000, exc)
+            raise
         if not isinstance(data, dict):
             raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(data)[:120]}")
+        self._log_api_result(label, started, data)
         return data
 
     async def _post_form_json(self, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -332,11 +367,20 @@ class BilibiliLiveAPI:
 
         aiohttp 在 data 传 dict 时会自动设置表单 Content-Type。
         """
-        async with self.session.post(url, data=data, headers=self._headers()) as resp:
-            resp.raise_for_status()
-            payload = await resp.json(content_type=None)
+        label = api_log_label(url, data)
+        started = time.monotonic()
+        try:
+            async with self.session.post(url, data=data,
+                                         headers=self._headers()) as resp:
+                resp.raise_for_status()
+                payload = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning("接口 %s 请求失败（%.0fms）：%s", label,
+                           (time.monotonic() - started) * 1000, exc)
+            raise
         if not isinstance(payload, dict):
             raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(payload)[:120]}")
+        self._log_api_result(label, started, payload)
         return payload
 
     async def _post_query_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -345,11 +389,20 @@ class BilibiliLiveAPI:
         点赞 likeReportV3 等接口把业务参数（含 WBI 签名）放在 query、body 为空，
         与 :meth:`_post_form_json`（表单 body）区分开。
         """
-        async with self.session.post(url, params=params, headers=self._headers()) as resp:
-            resp.raise_for_status()
-            payload = await resp.json(content_type=None)
+        label = api_log_label(url, params)
+        started = time.monotonic()
+        try:
+            async with self.session.post(url, params=params,
+                                         headers=self._headers()) as resp:
+                resp.raise_for_status()
+                payload = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning("接口 %s 请求失败（%.0fms）：%s", label,
+                           (time.monotonic() - started) * 1000, exc)
+            raise
         if not isinstance(payload, dict):
             raise ApiError(f"请求 {url}", "格式异常", f"响应不是 JSON 对象: {str(payload)[:120]}")
+        self._log_api_result(label, started, payload)
         return payload
 
     async def init_session_info(self) -> None:

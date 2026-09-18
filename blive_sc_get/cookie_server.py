@@ -18,12 +18,13 @@
 from __future__ import annotations
 
 import json
-import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from .log_categories import CATEGORY_TASK, get_logger
+
+logger = get_logger(CATEGORY_TASK, __name__)
 
 DEFAULT_COOKIE_PORT = 64321
 """与扩展 ``background.js`` 里约定的固定回环端口。"""

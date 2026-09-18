@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Union
 
-logger = logging.getLogger(__name__)
+from .log_categories import CATEGORY_DATA, get_logger
+
+logger = get_logger(CATEGORY_DATA, __name__)
 
 SORT_MODES = ("manual", "room", "anchor", "status")
 
@@ -94,6 +95,8 @@ def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
             auto_danmaku=bool(item.get("auto_danmaku", auto_default)),
             auto_danmaku_when_live=bool(item.get("auto_danmaku_when_live", False)),
         ))
+    logger.debug("读取直播间列表 %s：%d 个房间（其中 %d 个启用）",
+                 path, len(entries), sum(1 for e in entries if e.enabled))
     return entries
 
 
@@ -118,6 +121,8 @@ def save_room_entries(path: Union[str, Path], entries: Iterable[RoomEntry],
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+    logger.info("已保存直播间列表 %s：%d 个房间%s", path, len(payload["rooms"]),
+                "（含界面偏好）" if ui is not None else "")
 
 
 def load_emoticon_memory(path: Union[str, Path]) -> Dict[int, Dict[str, object]]:

@@ -24,7 +24,8 @@ SC 富文本查看、弹幕显示/发送、表情包、粉丝牌任务、开播�
 - 命令行走 `main.py`（无 GUI）。
 - 业务层（复用）：`api.py`、`client.py`（WebSocket/SC）、`storage.py`（JSONL/CSV 落盘）、
   `medal_runner.py` + `medal_tasks.py`（粉丝牌任务引擎）、`cookie_server.py`（插件收 Cookie）、
-  `gui_config.py`（房间条目 + 界面偏好）、`app_config.py`（写操作开关）、`browser_cookie.py`、
+  `gui_config.py`（房间条目 + 界面偏好）、`app_config.py`（应用级配置：写操作开关、粉丝牌任务、运行日志）、
+  `log_setup.py` + `log_categories.py`（运行日志：级别 / 区块过滤 / 轮转文件，Tk / Qt / CLI 共用）、`browser_cookie.py`、
   `browser_rooms.py`（`--auto` 实验性）、`overlay.py`（Tk 悬浮窗）、`room_lock.py`、`protocol.py`。
 - Qt 迁移只重写了「渲染/交互层」，文件清单见 `QT_PORTING.md`。
 

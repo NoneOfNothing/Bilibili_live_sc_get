@@ -8,10 +8,15 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 from typing import List
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+
+from .log_categories import CATEGORY_WINDOW, get_logger
+
+logger = get_logger(CATEGORY_WINDOW, "gui_qt.overlay")
 
 SHOW_DURATION_MS = 6000
 WIDTH = 320

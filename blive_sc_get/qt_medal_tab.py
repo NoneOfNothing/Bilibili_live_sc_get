@@ -35,7 +35,10 @@ from .medal_tasks import (
     task_label,
 )
 
+from .log_categories import CATEGORY_TASK, get_logger
+
 logger = logging.getLogger("gui_qt.medal")
+log_task = get_logger(CATEGORY_TASK, "gui_qt.medal.task")
 
 # 跳转列映射（列索引 → 目标类型）
 MEDAL_LINK_COLUMNS = {2: "space", 3: "room"}        # 粉丝牌表：主播/房间
@@ -510,6 +513,7 @@ class MedalTab(QWidget):
         entry = self.host.entries.get(room_id)
         live = self.host.live_state.get(room_id)
         live_status = 1 if live == "直播中" else 0
+        log_task.info("手动触发粉丝牌任务：房间 %s，类型 %s", room_id, task_label(task_type))
         run = self.runner()
         if run is None:
             self.medal_hint.setText("后台初始化中，请稍候…")
@@ -530,6 +534,8 @@ class MedalTab(QWidget):
         """触发一次任务执行。``only`` 为单个类型或类型列表（自动任务两项一起传，
         由同一次执行依次完成，避免后一项被「该房间正在执行中」挡住）。
         """
+        log_task.debug("提交粉丝牌任务：房间 %s，类型 %s，来源 %s", room_id,
+                       only or "全部", "手动" if manual else "自动")
         run = self.runner()
         if run is None:
             self.ui_queue().put(("medal_result", {
@@ -543,7 +549,8 @@ class MedalTab(QWidget):
             # 短号场景要用真实房间号调接口（与 Tk 版 _room_id_map 一致）
             result = await run.complete_room(
                 self.host.real_room_id(room_id), anchor_uid, live_status,
-                room_label=self.host.anchor_names.get(room_id, ""), only=only)
+                room_label=self.host.anchor_names.get(room_id, ""), only=only,
+                auto=not manual)
         except Exception as exc:
             result = {"status": "risk", "message": str(exc)}
         result = dict(result, elapsed=time.time() - t0, manual=manual,
@@ -568,6 +575,8 @@ class MedalTab(QWidget):
             name = "自动点赞"
         self.host._save_config()
         self._update_task_row(room_id)
+        log_task.info("房间 %s 的「%s」自动开关：%s", room_id, name,
+                      "开" if checked else "关")
         app_config = self.host.app_config
         if kind == "danmaku_when_live":
             self.medal_hint.setText(
@@ -618,7 +627,7 @@ class MedalTab(QWidget):
                 runner = self.runner()
                 running = bool(runner and runner.is_running(room_id))
             except Exception:  # 执行器构造/查询异常不应连带冻结界面（调试页可见）
-                logger.warning("查询房间 %s 的粉丝牌任务执行状态失败", room_id,
+                log_task.warning("查询房间 %s 的粉丝牌任务执行状态失败", room_id,
                                exc_info=True)
         for w in (self.medal_like_btn, self.medal_danmaku_btn):
             w.setEnabled(has and not running)

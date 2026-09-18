@@ -14,12 +14,14 @@ from typing import Dict, Optional, Sequence, Set
 import aiohttp
 
 from .api import ApiError, BilibiliLiveAPI
-from .app_config import load_app_config
+from .app_config import AppConfig, load_app_config
 from .browser_rooms import find_open_live_rooms, is_room_being_recorded
 from .client import RoomClient
+from .log_categories import CATEGORY_APP, get_logger
+from .log_setup import attach, configure, describe, install_file_handler, make_formatter
 from .storage import SCStorage
 
-logger = logging.getLogger("blive_sc_get")
+logger = get_logger(CATEGORY_APP, "blive_sc_get")
 
 COOKIE_FILE_NAME = "cookie.txt"
 COOKIE_FILE_HINT = (
@@ -57,17 +59,31 @@ def resolve_cookie(explicit: Optional[str]) -> Optional[str]:
     return cookie
 
 
-def setup_logging(verbose: bool, log_file: Optional[Path]) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+def setup_logging(verbose: bool, log_file: Optional[Path],
+                  config: Optional[AppConfig] = None) -> None:
+    """初始化日志：控制台 +（可选）文件；级别与区块开关来自 config.json。
+
+    - **区块**：``logging.categories``（默认全开）——关闭的区块在控制台与文件里都不输出；
+    - **落盘**：优先用 ``--log-file``（显式指定即覆盖配置）；未指定时看
+      ``logging.enabled``（默认关闭），开启后按 ``max_bytes`` × ``backup_count`` 轮转；
+    - **级别**：``logging.level``，``--verbose`` 临时提升为 DEBUG。
+    与 GUI 走同一套实现（``log_setup``），两处行为一致。
+    """
+    config = config if config is not None else load_app_config()
+    switches = configure(config.log)
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    # 控制台带完整日期（CLI 常被重定向到文件，跨天时便于区分）
+    fmt = make_formatter(with_date=True)
+    attach(logging.StreamHandler(sys.stdout), formatter=fmt)
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=handlers,
-    )
+        attach(logging.FileHandler(log_file, encoding="utf-8"), formatter=fmt)
+        logger.info("日志写入 %s（--log-file 指定）", log_file)
+    else:
+        install_file_handler(config.log, formatter=fmt)
+        logger.info("%s", describe(config.log))
+    logger.info("%s", switches.describe())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -225,7 +241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     # 任意入口（GUI/CLI）运行时确保 config.json 存在：缺失即生成默认模板
-    load_app_config()
+    app_config = load_app_config()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.gui:
@@ -235,7 +251,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--auto 与手动指定的房间号不能同时使用")
     if not args.auto and not args.rooms:
         parser.error("需要提供房间号，或使用 --auto 自动检测浏览器里的直播间")
-    setup_logging(args.verbose, Path(args.log_file) if args.log_file else None)
+    setup_logging(args.verbose, Path(args.log_file) if args.log_file else None, app_config)
     try:
         all_ok = asyncio.run(run(args))
     except KeyboardInterrupt:

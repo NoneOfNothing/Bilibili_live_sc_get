@@ -12,14 +12,19 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from .log_categories import CATEGORY_LABELS, CATEGORY_NAMES
+
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+"""项目根目录：``config.json``、``cookie.txt`` 与**相对日志路径**的解析基准。"""
+
 CONFIG_FILE_NAME = "config.json"
-CONFIG_FILE_PATH = Path(__file__).resolve().parent.parent / CONFIG_FILE_NAME
+CONFIG_FILE_PATH = PROJECT_ROOT / CONFIG_FILE_NAME
 
 EMOTICON_TOOLTIP_FIELDS = ("text", "unique", "id")
 """悬浮提示可显示的表情字段（元组顺序即拼接顺序）：
@@ -41,8 +46,41 @@ DEFAULT_MEDAL_DANMAKU_INTERVAL: Tuple[float, float] = (6.0, 8.0)
 DEFAULT_MEDAL_MAX_RETRY: int = 3
 """单个写任务**连续无进展/失败**多少次后停止本轮（等待下次或自动任务下一轮继续）。"""
 
+DEFAULT_LOG_ENABLED: bool = False
+"""默认是否把运行日志写入文件（``logging.enabled``）。
+
+默认**关闭**：控制台 / GUI 调试页照常输出，只是不额外落盘。需要长期监测运行状态时
+在 config.json 里改为 ``true``——GUI 常用 ``pythonw`` / ``start_gui_silent.vbs``
+静默启动（没有控制台），那种场景下只有文件日志能回溯历史。
+"""
+
+DEFAULT_LOG_LEVEL: str = "INFO"
+"""默认启动日志级别（``logging.level``；GUI 里勾选「显示 DEBUG 日志」可临时提升）。"""
+
+DEFAULT_LOG_FILE: str = "logs/app.log"
+"""默认日志文件（``logging.file``；相对路径按项目根目录解析）。"""
+
+DEFAULT_LOG_MAX_BYTES: int = 2 * 1024 * 1024
+"""单个日志文件大小上限（``logging.max_bytes``，默认 2 MB），超出自动轮转。"""
+
+DEFAULT_LOG_BACKUP_COUNT: int = 3
+"""保留的历史日志文件数（``logging.backup_count``，默认 3 个）。"""
+
+LOG_LEVEL_NAMES: Tuple[str, ...] = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+"""允许的日志级别名（``logging.level``，大小写不敏感，非法值回退 INFO）。"""
+
+DEFAULT_LOG_CATEGORIES: Tuple[str, ...] = CATEGORY_NAMES
+"""日志区块（``logging.categories`` 的键，定义见 ``log_categories``），**默认全部启用**。
+
+判定顺序：先看主开关 ``logging.enabled``（只决定是否**落盘**——关闭时日志照常进
+控制台 / GUI 调试页），再看区块开关（关闭的区块在**所有出口**都不输出）。
+"""
+
+LOG_CATEGORY_LABELS: Dict[str, str] = CATEGORY_LABELS
+"""各区块的中文说明（写入配置模板的 ``_说明``，也用于启动日志）。"""
+
 DEFAULT_CONFIG_TEMPLATE = """{
-  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，同时约束点赞与发弹幕两项；仍需在界面里对具体房间分别开启「自动点赞」/「自动发弹幕」，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
+  "_说明": "应用级配置（首次运行自动生成，可随时删除，下次运行会按需重建）。allow_write_operations 是写操作总开关（发送弹幕、自动点赞等会向 B 站提交数据的操作），出于安全考虑默认关闭；确认了解风险后改为 true 才会启用。emoticon_tooltip 控制鼠标悬浮表情时提示哪些字段：text=触发词、unique=表情唯一标识、id=数字 id，默认仅 text，写 [] 或全部 false 表示不显示提示。medal_tasks 控制粉丝牌自动任务：auto 为「全自动」总开关（默认 false，同时约束点赞与发弹幕两项；仍需在界面里对具体房间分别开启「自动点赞」/「自动发弹幕」，且受 allow_write_operations 约束）；like_interval_sec / danmaku_interval_sec 为两次点赞/发弹幕之间的随机间隔秒数（数组 [最小, 最大]）；max_retry 为单任务连续无进展/失败上限（达到后停止本轮，等下轮继续，不做失败重试风暴）。自动任务属于违反平台常规使用方式的高风险操作，可能触发风控，请自行评估后再开启。logging 控制运行日志（GUI 与命令行共用）：enabled 为是否写入文件（默认 false，静默启动时如需事后排查改为 true）；level 为启动级别 DEBUG/INFO/WARNING/ERROR/CRITICAL（默认 INFO，GUI 里勾选「显示 DEBUG 日志」可临时提升）；file 为日志文件路径（相对项目根目录，默认 logs/app.log）；max_bytes / backup_count 为单文件大小上限（字节，默认 2097152 = 2MB）与保留的历史文件数（超出自动轮转）；categories 为分区块日志开关（默认全部 true，可关闭不关心的区块以减少噪音）：room=房间与选择（切换直播间、增删、启停、排序、拖动、备注）、window=界面布局（窗口尺寸、分隔条、页签、面板显隐）、data=数据读写（接口请求、历史读取、落盘、表情包与粉丝牌刷新）、task=任务与写操作（发弹幕/表情、粉丝牌任务、Cookie 获取、开播提醒）、live=直播连接与状态（WS 连接、重连、开播下播、SC 与弹幕接收）、app=应用生命周期（启动退出、配置加载、房间锁、异常）。判定顺序：先看主开关 enabled（只决定是否落盘，关闭时日志照常进控制台/GUI 调试页），再看区块开关（关闭的区块在所有出口都不输出）。修改后需重启程序生效。字段缺失/文件损坏/类型非法一律按默认值处理。",
   "allow_write_operations": false,
   "emoticon_tooltip": {
     "text": true,
@@ -54,10 +92,62 @@ DEFAULT_CONFIG_TEMPLATE = """{
     "like_interval_sec": [15, 20],
     "danmaku_interval_sec": [6, 8],
     "max_retry": 3
+  },
+  "logging": {
+    "enabled": false,
+    "level": "INFO",
+    "file": "logs/app.log",
+    "max_bytes": 2097152,
+    "backup_count": 3,
+    "categories": {
+      "room": true,
+      "window": true,
+      "data": true,
+      "task": true,
+      "live": true,
+      "app": true
+    }
   }
 }
 """
 """首次运行自动生成的默认 ``config.json`` 模板（带字段说明）。"""
+
+
+@dataclass(frozen=True)
+class LogConfig:
+    """运行日志配置（``config.json`` 的 ``logging`` 段）。
+
+    作用于 **GUI（Tk / Qt）与命令行两套入口**：启动级别与文件输出都由这里决定，
+    两版共用 ``log_setup`` 里的同一实现，避免各写一份而行为漂移。
+    """
+
+    enabled: bool = DEFAULT_LOG_ENABLED
+    """是否把日志写入文件（默认关；开启后写入 ``file`` 指定的轮转文件）。"""
+
+    level: str = DEFAULT_LOG_LEVEL
+    """启动日志级别（``LOG_LEVEL_NAMES`` 之一，解析时已规范化为大写）。"""
+
+    file: str = DEFAULT_LOG_FILE
+    """日志文件路径；相对路径按项目根目录解析。"""
+
+    max_bytes: int = DEFAULT_LOG_MAX_BYTES
+    """单个日志文件大小上限（字节），超出即轮转。"""
+
+    backup_count: int = DEFAULT_LOG_BACKUP_COUNT
+    """保留的历史日志文件数。"""
+
+    categories: Dict[str, bool] = field(
+        default_factory=lambda: {name: True for name in DEFAULT_LOG_CATEGORIES})
+    """区块日志开关（``DEFAULT_LOG_CATEGORIES`` 的键，**默认全部启用**）。
+
+    关闭某区块后，该类日志在控制台 / GUI 调试页 / 文件里**都不再输出**；未标记区块的
+    第三方库日志不受影响（照常输出）。
+    """
+
+    @property
+    def level_value(self) -> int:
+        """``logging`` 模块用的级别数值（级别名已在解析时校验）。"""
+        return getattr(logging, self.level, logging.INFO)
 
 
 @dataclass(frozen=True)
@@ -88,6 +178,9 @@ class AppConfig:
 
     medal_max_retry: int = DEFAULT_MEDAL_MAX_RETRY
     """单个写任务**连续无进展/失败**多少次后停止本轮。"""
+
+    log: LogConfig = field(default_factory=LogConfig)
+    """运行日志（对应 config.json 的 ``logging`` 段，默认不写文件、区块全开）。"""
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -152,6 +245,83 @@ def _parse_retry(value: Any, default: int, *, upper: int = 10) -> int:
     if value < 0:
         return default
     return min(value, upper)
+
+
+def _parse_int(value: Any, default: int, *, low: int = 0,
+               high: int = 2 ** 31 - 1) -> int:
+    """解析整数配置：只认真正的 int（``true``/``"1"`` 这类一律回退默认）。
+
+    低于 ``low``（含负数）视为写错 → 回退默认；高于 ``high``（过大）→ 截断到上限。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    if value < low:
+        return default
+    return min(value, high)
+
+
+def _parse_log_categories(value: Any) -> Dict[str, bool]:
+    """解析 ``logging.categories``：只认 JSON 布尔，缺失/非法 → 该区块按默认（启用）。
+
+    未知区块名忽略并告警（避免把拼错的键当成"关闭某个区块"）；整段类型非法 → 全默认。
+    """
+    result = {name: True for name in DEFAULT_LOG_CATEGORIES}
+    if value is None:
+        return result
+    if not isinstance(value, dict):
+        logger.warning("配置 logging.categories 应为对象，使用默认（区块全部启用）")
+        return result
+    for name in DEFAULT_LOG_CATEGORIES:
+        raw = value.get(name)
+        if raw is None:
+            continue
+        if isinstance(raw, bool):
+            result[name] = raw
+        else:
+            logger.warning("配置 logging.categories.%s 应为 true/false（收到 %r），按默认启用",
+                           name, raw)
+    unknown = [str(key) for key in value if key not in DEFAULT_LOG_CATEGORIES]
+    if unknown:
+        logger.warning("配置 logging.categories 含未知区块 %s（可选：%s），已忽略",
+                       "、".join(unknown), "、".join(DEFAULT_LOG_CATEGORIES))
+    return result
+
+
+def _parse_log_config(value: Any) -> LogConfig:
+    """解析 ``logging`` 段（纯函数，便于离线测试）。
+
+    fail-safe：整段类型非法→全默认；单项非法（级别名拼错、路径非字符串、大小非整数）
+    →该项回退默认并告警，其余项照常生效——日志是辅助功能，不该因配置错误影响运行。
+    """
+    if value is None:
+        return LogConfig()
+    if not isinstance(value, dict):
+        logger.warning("配置 logging 应为对象，使用默认（日志写入 %s）", DEFAULT_LOG_FILE)
+        return LogConfig()
+    level_raw = value.get("level")
+    level = str(level_raw).strip().upper() if isinstance(level_raw, str) else ""
+    if level not in LOG_LEVEL_NAMES:
+        if level_raw is not None:
+            logger.warning("配置 logging.level 非法（%r），使用 %s",
+                           level_raw, DEFAULT_LOG_LEVEL)
+        level = DEFAULT_LOG_LEVEL
+    file_raw = value.get("file")
+    file_name = str(file_raw).strip() if isinstance(file_raw, str) else ""
+    if not file_name:
+        if file_raw is not None:
+            logger.warning("配置 logging.file 非法（%r），使用 %s",
+                           file_raw, DEFAULT_LOG_FILE)
+        file_name = DEFAULT_LOG_FILE
+    return LogConfig(
+        enabled=_as_bool(value.get("enabled"), DEFAULT_LOG_ENABLED),
+        level=level,
+        file=file_name,
+        max_bytes=_parse_int(value.get("max_bytes"), DEFAULT_LOG_MAX_BYTES,
+                             low=1024, high=64 * 1024 * 1024),
+        backup_count=_parse_int(value.get("backup_count"), DEFAULT_LOG_BACKUP_COUNT,
+                                low=0, high=20),
+        categories=_parse_log_categories(value.get("categories")),
+    )
 
 
 def _template_defaults() -> Dict[str, Any]:
@@ -269,4 +439,5 @@ def load_app_config(path: Optional[Union[str, Path]] = None) -> AppConfig:
         medal_danmaku_interval=_parse_interval(
             medal.get("danmaku_interval_sec"), DEFAULT_MEDAL_DANMAKU_INTERVAL),
         medal_max_retry=_parse_retry(medal.get("max_retry"), DEFAULT_MEDAL_MAX_RETRY),
+        log=_parse_log_config(raw.get("logging")),
     )

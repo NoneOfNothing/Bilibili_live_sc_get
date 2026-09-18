@@ -10,6 +10,9 @@
 - **写操作门控**：仅当 ``allow_write_operations`` 为真且已登录（csrf 就绪）才执行。
 - **发弹幕内容**：优先轮次循环该直播间**专属表情**；无专属表情包时回退发送
   **纯数字文本**（1、2、3……递增）。
+- **可打断**：房间级打断标记（``interrupt_auto_danmaku``）供 GUI 在**开播信号**到达时
+  立即停止「自动发弹幕」任务（默认只在未开播时自动发，开播即不该继续刷屏）；
+  等待间隔可被打断提前唤醒，无需等下一次发送后再退出。
 
 引擎只负责「按房间执行一次完整任务」，是否自动/何时触发由 GUI 决定。
 """
@@ -17,7 +20,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any, Callable, Dict, Iterable, Optional, Set, Union
 
@@ -31,6 +33,7 @@ from .api import (
     describe_send_error,
 )
 from .app_config import AppConfig
+from .log_categories import CATEGORY_TASK, get_logger
 from .medal_tasks import (
     TASK_LIKE,
     TASK_SEND_DANMAKU,
@@ -47,7 +50,7 @@ from .medal_tasks import (
     task_label,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(CATEGORY_TASK, __name__)
 
 DEFAULT_LIKE_CLICK_CAP = 30
 """单次点赞请求的最大 ``click_time``（接口未给出次数时的兜底）。"""
@@ -62,6 +65,10 @@ class MedalTaskRunner:
         self._config = config
         self._emit_fn = emit
         self._running: Set[int] = set()
+        # 以下三项按房间记录「本次执行」的上下文，供打断判断（见 interrupt_auto_danmaku）
+        self._running_auto: Dict[int, bool] = {}      # 是否由自动任务提交
+        self._running_types: Dict[int, Set[str]] = {}  # 本次执行包含的任务类型
+        self._interrupts: Dict[int, asyncio.Event] = {}  # 房间级打断标记
 
     def is_running(self, room_id: int) -> bool:
         """该房间是否正在执行（供 GUI 禁用重复触发）。"""
@@ -77,21 +84,28 @@ class MedalTaskRunner:
 
     async def complete_room(self, room_id: int, anchor_uid: int,
                             live_status: int, *, room_label: str = "",
-                            only: Optional[Union[str, Iterable[str]]] = None) -> Dict[str, Any]:
+                            only: Optional[Union[str, Iterable[str]]] = None,
+                            auto: bool = False) -> Dict[str, Any]:
         """执行一个房间的写任务，返回结果摘要（完成即停）。
 
         ``only`` 指定时只执行该类型的任务：可为单个类型字符串（如 ``"like"``）
         或类型集合（如 ``["like", "sendDanmu"]``），用于界面上分离的自动开关与
         独立按钮；为 ``None`` 时执行全部可执行写任务。
 
+        ``auto`` 标记本次提交是否来自**自动任务**（周期轮询 / 开播触发）；手动按钮
+        传 ``False``。该标记只用于打断判断：``interrupt_auto_danmaku`` 只打断自动
+        提交的发弹幕任务，手动按钮不受开播信号影响。
+
         结果 ``status``：
 
         - ``blocked``：未满足前置条件（写操作关闭 / 未登录 / 缺主播 uid / 已在执行）；
         - ``done``：本轮任务均已达成或无需执行；
+        - ``interrupted``：自动发弹幕任务被开播信号打断（已发出的弹幕保留）；
         - ``partial``：部分任务完成、部分未完成；
         - ``risk``：命中风控中止；
         - ``error``：全部失败。
         """
+
         room_id = int(room_id)
         if room_id in self._running:
             return self._result(room_id, "blocked", "该房间任务正在执行中")
@@ -108,17 +122,86 @@ class MedalTaskRunner:
             return self._result(room_id, "blocked", "缺少主播 uid，无法查询粉丝牌任务")
 
         self._running.add(room_id)
+        self._running_auto[room_id] = bool(auto)
+        self._running_types[room_id] = self._normalize_types(only)
+        self._interrupts[room_id] = asyncio.Event()
         label = room_label or str(room_id)
         started = time.monotonic()
         try:
             self._emit("medal_start", {"room_id": room_id, "room_label": label,
-                                       "only": only})
+                                       "only": only, "auto": bool(auto)})
+            logger.info("粉丝牌任务开始：房间 %s（%s），类型 %s，来源 %s",
+                        room_id, label,
+                        "、".join(task_label(t) for t in sorted(
+                            self._running_types.get(room_id, ()))),
+                        "自动" if auto else "手动")
             result = await self._complete_locked(room_id, int(anchor_uid),
                                                  int(live_status or 0), label, only)
         finally:
             self._running.discard(room_id)
+            self._running_auto.pop(room_id, None)
+            self._running_types.pop(room_id, None)
+            self._interrupts.pop(room_id, None)
         result["elapsed"] = round(time.monotonic() - started, 1)
+        logger.info("粉丝牌任务结束：房间 %s（%s），状态 %s：%s（用时 %ss）",
+                    room_id, label, result.get("status"), result.get("message"),
+                    result.get("elapsed"))
         return result
+
+    @staticmethod
+    def _normalize_types(only: Optional[Union[str, Iterable[str]]]) -> Set[str]:
+        """把 ``only`` 归一化成类型集合（``None`` = 全部写任务类型）。"""
+        if only is None:
+            return set(WRITE_TASK_TYPES)
+        if isinstance(only, str):
+            return {only}
+        return {str(item) for item in only}
+
+    async def interrupt_auto_danmaku(self, room_id: int) -> bool:
+        """打断该房间正在执行的**自动**发弹幕任务（开播信号触发，ROADMAP 64）。
+
+        仅当三条同时满足才置位打断标记并返回 ``True``：① 该房间有任务在执行；
+        ② 本次执行由自动触发（``auto=True``，手动按钮不受开播信号影响）；
+        ③ 本次执行包含发弹幕。置位后执行体在**下一个检查点**立即停止（等待间隔会被
+        提前唤醒，已发出的弹幕不撤回），点赞等其它任务类型不受影响。
+
+        该方法由 GUI 提交到 asyncio 事件循环内执行（``hub.submit``），因此可以安全
+        地从界面线程调用 ``asyncio.Event``。
+        """
+        room_id = int(room_id)
+        event = self._interrupts.get(room_id)
+        if event is None or not self._running_auto.get(room_id, False):
+            return False
+        if TASK_SEND_DANMAKU not in self._running_types.get(room_id, set()):
+            return False
+        if event.is_set():
+            return False
+        event.set()
+        logger.info("已打断自动发弹幕：房间 %s（收到开播信号，已发出的弹幕保留）", room_id)
+        self._emit("medal_interrupt", {
+            "room_id": room_id,
+            "message": "直播间已开播，已打断自动发弹幕任务（默认仅未开播时自动发弹幕）",
+        })
+        return True
+
+    def _interrupted(self, room_id: int) -> bool:
+        """该房间是否已被置位打断标记（执行体检查点使用）。"""
+        event = self._interrupts.get(int(room_id))
+        return bool(event is not None and event.is_set())
+
+    async def _sleep_or_interrupt(self, room_id: int, seconds: float) -> bool:
+        """等待间隔，被开播打断则提前返回 ``True``（不必等本次等待走完）。"""
+        event = self._interrupts.get(int(room_id))
+        if event is None:
+            await asyncio.sleep(seconds)
+            return False
+        if event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, float(seconds)))
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     @staticmethod
     def _skip_reason(tasks: List[dict], jump_type: str) -> str:
@@ -302,8 +385,10 @@ class MedalTaskRunner:
         fallback_text = ""
         last_error = ""
 
-        def _done(ok: bool, message: str, *, risk: bool = False) -> Dict[str, Any]:
-            return {"ok": ok, "message": message, "risk": risk, "sent": sent,
+        def _done(ok: bool, message: str, *, risk: bool = False,
+                  interrupted: bool = False) -> Dict[str, Any]:
+            return {"ok": ok, "message": message, "risk": risk,
+                    "interrupted": interrupted, "sent": sent,
                     "used_emoticon": used_emoticon, "used_text": used_text,
                     "elapsed": round(time.monotonic() - started, 1)}
 
@@ -312,6 +397,10 @@ class MedalTaskRunner:
         progress = -1
         rounds = 0
         while True:
+            if self._interrupted(room_id):
+                # 开播信号已到达（默认仅未开播时自动发弹幕）：立即停止后续发送
+                return _done(False, "直播间已开播，已打断自动发弹幕任务",
+                             interrupted=True)
             task = await self._refetch_task(anchor_uid, TASK_SEND_DANMAKU)
             if task is None:
                 return _done(False, "接口未返回发弹幕任务")
@@ -336,6 +425,10 @@ class MedalTaskRunner:
             rounds += 1
             if rounds > limit * 3 + 5:
                 return _done(False, f"发弹幕任务未完成（{current}/{limit}），稍后重试")
+            if self._interrupted(room_id):
+                # 复核（await）期间到达的开播信号：发送前再确认一次，不再多发一条
+                return _done(False, "直播间已开播，已打断自动发弹幕任务",
+                             interrupted=True)
             emoticon, index = select_emoticon_cycle(emoticons, index)
             try:
                 if emoticon:
@@ -355,7 +448,11 @@ class MedalTaskRunner:
                 if stalled > max_stall:
                     return _done(False, last_error)
                 # 频率过快等可恢复错误：等待一个更长的间隔再试
-                await asyncio.sleep(compute_action_delay(*self._config.medal_danmaku_interval))
+                if await self._sleep_or_interrupt(
+                        room_id,
+                        compute_action_delay(*self._config.medal_danmaku_interval)):
+                    return _done(False, "直播间已开播，已打断自动发弹幕任务",
+                                 interrupted=True)
                 continue
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = f"网络异常：{exc}"
@@ -368,7 +465,9 @@ class MedalTaskRunner:
                 "耗时 %.1fs，%.1fs 后复核",
                 room_id, sent, used_emoticon, used_text, current, limit,
                 time.monotonic() - started, wait)
-            await asyncio.sleep(wait)
+            if await self._sleep_or_interrupt(room_id, wait):
+                return _done(False, "直播间已开播，已打断自动发弹幕任务",
+                             interrupted=True)
 
     async def _refetch_task(self, anchor_uid: int, jump_type: str) -> Optional[dict]:
         """重新拉取任务信息并按 jump_type 取任务（完成即停的复核来源）。"""
@@ -400,6 +499,7 @@ class MedalTaskRunner:
     def _summarize(self, room_id: int, details: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         parts = []
         has_risk = False
+        has_interrupt = False
         any_ok = False
         any_fail = False
         for key, label in (("like", "点赞"), ("danmaku", "发弹幕")):
@@ -408,10 +508,12 @@ class MedalTaskRunner:
                 continue
             if outcome.get("risk"):
                 has_risk = True
+            if outcome.get("interrupted"):
+                has_interrupt = True
             if outcome.get("ok"):
                 any_ok = True
-            elif outcome.get("skipped"):
-                # 跳过（如未开播暂无点赞）不算失败，也不计入完成
+            elif outcome.get("skipped") or outcome.get("interrupted"):
+                # 跳过（如未开播暂无点赞）/ 被开播打断，均不算失败，也不计入完成
                 pass
             else:
                 any_fail = True
@@ -421,6 +523,9 @@ class MedalTaskRunner:
         message = "；".join(parts) if parts else "今日粉丝牌任务已完成"
         if has_risk:
             status = "risk"
+        elif has_interrupt and not any_fail:
+            # 打断是「开播后本就不该继续」的正常收尾（已发送的弹幕保留），单独状态
+            status = "interrupted"
         elif any_fail and any_ok:
             status = "partial"
         elif any_fail:

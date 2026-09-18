@@ -828,6 +828,107 @@ class MedalRunnerTests(unittest.TestCase):
             "danmaku", {"sent": 3, "used_emoticon": 2, "used_text": 1, "elapsed": 14.0}))
         self.assertEqual(MedalTaskRunner._format_metrics("danmaku", {"sent": 0}), "")
 
+    def test_interrupt_stops_auto_danmaku(self):
+        """开播信号打断自动发弹幕（ROADMAP 64）：等待间隔被提前唤醒，不再继续发送。"""
+        tasks = [{"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
+                  "limit": 50, "is_done": False, "raw": {}}]
+        api = _StubApi(tasks)
+        cfg = AppConfig(allow_write_operations=True, medal_max_retry=2,
+                        medal_like_interval=(0.0, 0.0),
+                        medal_danmaku_interval=(30.0, 30.0))
+        events = []
+        runner = MedalTaskRunner(api, cfg, emit=lambda t, p: events.append((t, p)))
+
+        async def scenario():
+            task = asyncio.create_task(runner.complete_room(
+                100, 200, 0, only=TASK_SEND_DANMAKU, auto=True))
+            for _ in range(300):  # 等第一条发出（此后进入 30s 的长等待）
+                if api.danmaku_calls:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(await runner.interrupt_auto_danmaku(100))
+            # 重复打断不再上报（幂等）
+            self.assertFalse(await runner.interrupt_auto_danmaku(100))
+            return await asyncio.wait_for(task, 5.0)
+
+        result = asyncio.run(scenario())
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(len(api.danmaku_calls), 1)  # 打断后不再发送
+        self.assertIn("已打断", result["message"])
+        self.assertTrue(result["details"]["danmaku"]["interrupted"])
+        self.assertEqual([t for t, _ in events].count("medal_interrupt"), 1)
+        self.assertFalse(runner.is_running(100))  # 上下文本轮已清理
+
+    def test_interrupt_ignores_manual_and_like_tasks(self):
+        """只有「自动提交 + 含发弹幕」会被打断：手动按钮与点赞任务不受开播信号影响。"""
+        tasks = [
+            {"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
+             "limit": 2, "is_done": False, "raw": {}},
+            {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
+             "limit": 2, "is_done": False, "raw": {}},
+        ]
+        api = _StubApi(tasks, like_step=1)
+        cfg = AppConfig(allow_write_operations=True, medal_max_retry=2,
+                        medal_like_interval=(0.2, 0.2),
+                        medal_danmaku_interval=(0.2, 0.2))
+        runner = MedalTaskRunner(api, cfg)
+
+        async def wait_until(pred) -> bool:
+            for _ in range(300):
+                if pred():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+
+        async def scenario():
+            # ① 手动提交（auto=False）：打断标记置不上，任务照常完成
+            manual = asyncio.create_task(runner.complete_room(
+                100, 200, 0, only=TASK_SEND_DANMAKU, auto=False))
+            self.assertTrue(await wait_until(lambda: bool(api.danmaku_calls)))
+            self.assertFalse(await runner.interrupt_auto_danmaku(100))
+            manual_result = await asyncio.wait_for(manual, 5.0)
+            # ② 自动提交但只含点赞：同样不打断（点赞本就只在直播中才有意义）
+            like = asyncio.create_task(runner.complete_room(
+                200, 300, 1, only=TASK_LIKE, auto=True))
+            self.assertTrue(await wait_until(lambda: bool(api.like_calls)))
+            self.assertFalse(await runner.interrupt_auto_danmaku(200))
+            like_result = await asyncio.wait_for(like, 5.0)
+            # ③ 没有正在执行的房间：直接返回 False
+            self.assertFalse(await runner.interrupt_auto_danmaku(999))
+            return manual_result, like_result
+
+        manual_result, like_result = asyncio.run(scenario())
+        self.assertEqual(manual_result["status"], "done")
+        self.assertEqual(len(api.danmaku_calls), 2)  # 手动任务完整跑完
+        self.assertEqual(like_result["status"], "done")
+        self.assertEqual(len(api.like_calls), 2)
+
+    def test_interrupt_only_emitted_when_danmaku_was_sent(self):
+        """打断结果里保留已发送条数（用于界面提示「已打断」，不当作失败）。"""
+        tasks = [{"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
+                  "limit": 20, "is_done": False, "raw": {}}]
+        api = _StubApi(tasks, danmaku_step=2)
+        cfg = AppConfig(allow_write_operations=True, medal_max_retry=2,
+                        medal_like_interval=(0.0, 0.0),
+                        medal_danmaku_interval=(30.0, 30.0))
+        runner = MedalTaskRunner(api, cfg)
+
+        async def scenario():
+            task = asyncio.create_task(runner.complete_room(
+                100, 200, 0, only=[TASK_SEND_DANMAKU], auto=True))
+            for _ in range(300):
+                if api.danmaku_calls:
+                    break
+                await asyncio.sleep(0.01)
+            await runner.interrupt_auto_danmaku(100)
+            return await asyncio.wait_for(task, 5.0)
+
+        result = asyncio.run(scenario())
+        danmaku = result["details"]["danmaku"]
+        self.assertEqual((danmaku["sent"], danmaku["ok"]), (1, False))
+        self.assertNotIn("like", result["details"])  # only 限定：不连带点赞
+        self.assertIn("1 条：表情 0 / 文本 1", result["message"])  # 保留已发送条数
+
 
 if __name__ == "__main__":
     unittest.main()

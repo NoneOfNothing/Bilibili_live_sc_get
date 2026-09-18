@@ -63,8 +63,31 @@ from .gui_config import (
 )
 from .storage import SCStorage
 from .overlay import ToastOverlayManager, apply_noactivate
+from .log_setup import (
+    CATEGORY_APP,
+    CATEGORY_DATA,
+    CATEGORY_LIVE,
+    CATEGORY_ROOM,
+    CATEGORY_TASK,
+    CATEGORY_WINDOW,
+    DebouncedValueLogger,
+    attach,
+    configure,
+    describe,
+    get_logger,
+    install_file_handler,
+    make_formatter,
+)
 
 logger = logging.getLogger("gui")
+
+# 按区块分类的 logger：每个区块可在 config.json 的 logging.categories 里单独关闭
+log_room = get_logger(CATEGORY_ROOM, "gui.room")
+log_window = get_logger(CATEGORY_WINDOW, "gui.window")
+log_data = get_logger(CATEGORY_DATA, "gui.data")
+log_task = get_logger(CATEGORY_TASK, "gui.task")
+log_live = get_logger(CATEGORY_LIVE, "gui.live")
+log_app = get_logger(CATEGORY_APP, "gui.app")
 
 COOKIE_FILE_PATH = Path(__file__).resolve().parent.parent / COOKIE_FILE_NAME
 
@@ -770,10 +793,18 @@ class ScMonitorApp:
         self._medal_runner: Optional[MedalTaskRunner] = None
         self._medal_auto_after_id: Optional[str] = None
         self._room_info_after_id: Optional[str] = None  # 无连接房间的信息刷新循环
+        self._base_log_level = logging.INFO  # 由 _setup_logging 按 config.json 覆盖
+        self._log_switches = None            # 同上：区块开关（configure 的返回值）
+        # 窗口尺寸变化会连续触发几十上百次：合并成「首次 → 最后」一条日志
+        self._window_size_log = DebouncedValueLogger(
+            log_window, delay=0.6, template="窗口尺寸 {first} → {last}")
 
         self._setup_logging()
-        logger.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
+        log_app.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
                     "启用" if self.app_config.allow_write_operations else "禁用")
+        log_app.info("程序启动：数据目录 %s，直播间列表 %s（%d 个房间，%d 个启用）",
+                     self.output_dir, self.config_path, len(self.entries),
+                     sum(1 for e in self.entries.values() if e.enabled))
         self._build_ui()
         self._refresh_dm_send_state()  # 初始化发送控件的可用状态
         # 拖动窗口大小时暂停 SC 文本 word 换行，停止后恢复（见 _on_root_configure）
@@ -1121,7 +1152,8 @@ class ScMonitorApp:
         notebook.add(tab, text="调试")
         bar = ttk.Frame(tab)
         bar.pack(side="top", fill="x", padx=6, pady=(6, 2))
-        self.debug_var = tk.BooleanVar(value=False)
+        # 初始勾选状态跟随 config.json 的 logging.level（DEBUG 时即为勾选）
+        self.debug_var = tk.BooleanVar(value=self._base_log_level <= logging.DEBUG)
         ttk.Checkbutton(bar, text="显示 DEBUG 日志", variable=self.debug_var,
                         command=self._on_debug_toggle).pack(side="left")
         ttk.Button(bar, text="清空", command=self._clear_debug).pack(side="right")
@@ -1246,6 +1278,7 @@ class ScMonitorApp:
             active = self._notebook.select() == str(self._medal_tab)
         except Exception:
             return
+        log_window.info("页签切换：%s", "「粉丝牌」页" if active else "其它页")
         if not active:
             self._stop_medal_tab_refresh()
             return
@@ -1472,7 +1505,7 @@ class ScMonitorApp:
                 if self.hub.ready.is_set():
                     # uid 未知：后台查询一次，成功后再点即可跳转（与房间列表页一致）
                     self.hub.submit(self._async_fetch_uid(room_id))
-                    logger.info("正在获取房间 %s 的主播信息，稍后再次点击主播名即可打开个人空间",
+                    log_data.info("正在获取房间 %s 的主播信息，稍后再次点击主播名即可打开个人空间",
                                 room_id)
                 return
         else:
@@ -1487,6 +1520,7 @@ class ScMonitorApp:
             if hasattr(self, "medal_status_var"):
                 self.medal_status_var.set("后台初始化中，请稍候…")
             return
+        log_data.info("手动刷新粉丝牌列表")
         self.medal_status_var.set("正在获取粉丝牌…")
         self.hub.submit(self._async_refresh_medals())
 
@@ -1521,7 +1555,7 @@ class ScMonitorApp:
         if not payload.get("ok"):
             error = payload.get("error") or "未知错误"
             self.medal_status_var.set(f"获取粉丝牌失败：{error}")
-            logger.warning("获取粉丝牌失败：%s", error)
+            log_data.warning("获取粉丝牌失败：%s", error)
             return
         medals = payload.get("medals") or []
         self._medals = medals
@@ -1576,6 +1610,7 @@ class ScMonitorApp:
         if not self.hub.ready.is_set():
             self.medal_hint_var.set("后台初始化中，请稍候…")
             return
+        log_data.info("手动刷新粉丝牌任务：%d 个房间", len(room_ids))
         self.medal_hint_var.set("正在刷新任务…")
         self._sync_medal_task_rows()
         self.hub.submit(self._async_refresh_medal_tasks(room_ids))
@@ -1688,6 +1723,7 @@ class ScMonitorApp:
         if room_id is None or room_id not in self.entries:
             self.medal_hint_var.set("请先在上方列表选择一个直播间")
             return
+        log_task.info("手动触发粉丝牌任务：房间 %s，类型 %s", room_id, task_label(only))
         self._start_medal_room(room_id, only=only)
 
     def _start_medal_room(self, room_id: int, *, manual: bool = True,
@@ -1697,6 +1733,8 @@ class ScMonitorApp:
         ``only`` 为任务类型：单个字符串（点赞 / 发弹幕）或类型列表（两项都做）；
         ``None`` 表示全部可执行写任务。
         """
+        log_task.debug("提交粉丝牌任务：房间 %s，类型 %s，来源 %s", room_id,
+                       only or "全部", "手动" if manual else "自动")
         if room_id in self._medal_running:
             self.medal_hint_var.set("该房间任务正在执行中")
             return
@@ -1731,9 +1769,10 @@ class ScMonitorApp:
                                          only: Optional[Union[str, List[str]]] = None) -> None:
         try:
             result = await runner.complete_room(real_room, uid, live,
-                                                room_label=label, only=only)
+                                                room_label=label, only=only,
+                                                auto=not manual)
         except Exception as exc:
-            logger.exception("粉丝牌任务执行异常 room=%s", room_id)
+            log_task.exception("粉丝牌任务执行异常 room=%s", room_id)
             result = {"room_id": real_room, "status": "error",
                       "message": f"执行异常：{exc}", "details": {}}
         result = dict(result or {})
@@ -1750,14 +1789,15 @@ class ScMonitorApp:
         elapsed = payload.get("elapsed")
         suffix = f"（总耗时 {elapsed}s）" if elapsed is not None else ""
         prefix = {"done": "完成", "partial": "部分完成", "risk": "风控中止",
-                  "blocked": "未执行", "error": "失败"}.get(status, status)
+                  "interrupted": "已打断", "blocked": "未执行",
+                  "error": "失败"}.get(status, status)
         # 自动执行「无事可做」时静默（仅记日志），避免每轮覆盖用户可见提示
         if bool(payload.get("manual", True)) or status != "done":
             self.medal_hint_var.set(f"{prefix}：{message}{suffix}")
         if status in ("risk", "error"):
-            logger.warning("粉丝牌任务%s：%s%s", prefix, message, suffix)
+            log_task.warning("粉丝牌任务%s：%s%s", prefix, message, suffix)
         else:
-            logger.info("粉丝牌任务%s：%s%s", prefix, message, suffix)
+            log_task.info("粉丝牌任务%s：%s%s", prefix, message, suffix)
         self._update_medal_buttons()
         if self.hub.ready.is_set():
             # 任务完成会改变亲密度/经验，顺带刷新粉丝牌列表，无需手动点刷新
@@ -1806,6 +1846,26 @@ class ScMonitorApp:
         else:
             self.medal_hint_var.set(f"已为该房间{'开启' if enabled else '关闭'}{name}")
 
+    def _interrupt_auto_danmaku(self, room_id: int) -> None:
+        """开播信号打断该房间正在执行的「自动发弹幕」任务（ROADMAP 64）。
+
+        自动发弹幕**默认只在未开播时**执行；轮次发送期间主播开播，就不该继续刷屏，
+        故收到开播信号即打断（执行器在下一个检查点停止，已发出的弹幕保留）。
+
+        仅在**未**勾选「允许开播时自动发弹幕」时打断：勾选表示用户明确允许开播时也
+        自动发（此时任务本就该继续）；**手动**「发弹幕」按钮触发的任务同样不受影响
+        （执行器只打断 ``auto=True`` 的提交）。
+        """
+        entry = self.entries.get(room_id)
+        if entry is None or entry.auto_danmaku_when_live:
+            return
+        runner = self._medal_runner
+        if runner is None:
+            return
+        # 执行器记录的是真实房间号（短号场景与输入房间号不同）
+        real_room = self._room_id_map.get(room_id, room_id)
+        self.hub.submit(runner.interrupt_auto_danmaku(real_room))
+
     def _try_auto_like(self, room_id: int) -> None:
         """为某房间触发一次自动点赞（开播信号与周期轮询**共用**，ROADMAP 54/55）。
 
@@ -1826,7 +1886,7 @@ class ScMonitorApp:
         if not (self.app_config.auto_medal_tasks and self.app_config.allow_write_operations
                 and self.hub.ready.is_set()):
             return
-        logger.info("房间 %s 开播/轮询触发自动点赞", room_id)
+        log_task.info("房间 %s 开播/轮询触发自动点赞", room_id)
         self._start_medal_room(room_id, manual=False, only=TASK_LIKE)
 
     def _medal_auto_tick(self) -> None:
@@ -1853,7 +1913,7 @@ class ScMonitorApp:
                         auto_danmaku_when_live=entry.auto_danmaku_when_live,
                         live_status=live)
                     if not only:
-                        logger.debug(
+                        log_task.debug(
                             "房间 %s 本轮无自动任务可执行（直播状态=%s；自动发弹幕=%s，"
                             "允许开播时发=%s；自动点赞=%s）",
                             room_id, live, entry.auto_danmaku,
@@ -1870,14 +1930,18 @@ class ScMonitorApp:
         if event_type == "medal_note":
             message = str(payload.get("message") or "")
             self.medal_hint_var.set(f"房间 {label}：{message}")
-            logger.info("粉丝牌任务（房间 %s）：%s", label, message)
+            log_task.info("粉丝牌任务（房间 %s）：%s", label, message)
+        elif event_type == "medal_interrupt":
+            message = str(payload.get("message") or "已打断自动发弹幕任务")
+            self.medal_hint_var.set(f"房间 {label}：{message}")
+            log_task.info("粉丝牌任务（房间 %s）：%s", label, message)
         elif event_type == "medal_start":
-            logger.info("房间 %s 开始执行粉丝牌任务", label)
+            log_task.info("房间 %s 开始执行粉丝牌任务", label)
         elif event_type == "medal_progress":
             outcome = payload.get("outcome") or {}
             elapsed = outcome.get("elapsed")
             tail = f"（用时 {elapsed}s）" if elapsed is not None else ""
-            logger.info("房间 %s %s：%s%s", label,
+            log_task.info("房间 %s %s：%s%s", label,
                         task_label(str(payload.get("jump_type") or "")),
                         outcome.get("message") or "", tail)
         elif event_type == "medal_task_progress":
@@ -1903,24 +1967,35 @@ class ScMonitorApp:
     # ---------- 日志 ----------
 
     def _setup_logging(self) -> None:
-        fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-                                datefmt="%H:%M:%S")
+        """日志出口：GUI 调试页 +（有控制台时）标准输出 +（可选）**轮转文件**。
+
+        两级开关由 ``config.json`` 的 ``logging`` 段决定：``enabled`` 只决定是否**落盘**
+        （关闭时日志照常进调试页 / 控制台），``categories`` 决定哪些**区块**输出
+        （默认全开）。静默启动（pythonw / VBS）时文件日志是事后排查的唯一依据。
+        """
+        fmt = make_formatter()
         root = logging.getLogger()
-        root.setLevel(logging.INFO)
+        self._log_switches = configure(self.app_config.log)  # 根级别 + 区块开关
+        self._base_log_level = self.app_config.log.level_value
         # 必须设置 Formatter，否则默认只输出 message，会丢掉 Room[房间号] 前缀
-        queue_handler = _QueueLogHandler(self.ui_queue)
-        queue_handler.setFormatter(fmt)
-        root.addHandler(queue_handler)
+        attach(_QueueLogHandler(self.ui_queue), formatter=fmt)
         # pythonw 启动时 stdout/stderr 为 None，只保留 GUI 内的日志显示
         if sys.stdout is not None and not any(
             isinstance(h, logging.StreamHandler) for h in root.handlers
         ):
-            stream = logging.StreamHandler(sys.stdout)
-            stream.setFormatter(fmt)
-            root.addHandler(stream)
+            attach(logging.StreamHandler(sys.stdout), formatter=fmt)
+        # 文件日志（logging.enabled 为真时）：带完整日期并按大小轮转，方便事后回溯
+        install_file_handler(self.app_config.log, formatter=make_formatter(with_date=True))
+        log_app.info("%s", describe(self.app_config.log))
+        log_app.info("%s", self._log_switches.describe())
 
     def _on_debug_toggle(self) -> None:
-        logging.getLogger().setLevel(logging.DEBUG if self.debug_var.get() else logging.INFO)
+        # 取消勾选时回到 config.json 配置的级别（而不是硬编码 INFO）
+        level = logging.DEBUG if self.debug_var.get() else self._base_log_level
+        logging.getLogger().setLevel(level)
+        log_app.info("调试日志开关：%s（当前级别 %s）",
+                     "开" if self.debug_var.get() else "关",
+                     logging.getLevelName(level))
 
     def _append_log(self, line: str) -> None:
         self._append_logs([line])
@@ -2084,6 +2159,8 @@ class ScMonitorApp:
                                 if rid in self.entries}
                 self._save_config()
                 self._apply_medal_task_order()  # 粉丝牌页任务列表实时跟随拖动顺序
+                log_room.info("拖动排序完成，新顺序：%s",
+                              "、".join(str(rid) for rid in self.entries))
             elif not (event.state & 0x0005):  # Ctrl/Shift 多选点击不触发跳转
                 self._open_tree_link(event)
         self._drag_iid = None
@@ -2098,16 +2175,18 @@ class ScMonitorApp:
             return
         room_id = int(iid)
         if col == "#1":
+            log_room.info("打开直播间页面：房间 %s", room_id)
             webbrowser.open(f"https://live.bilibili.com/{room_id}")
         elif col == "#2":
             entry = self.entries.get(room_id)
             uid = entry.uid if entry else 0
             if uid:
+                log_room.info("打开主播个人空间：uid=%s（房间 %s）", uid, room_id)
                 webbrowser.open(f"https://space.bilibili.com/{uid}")
             elif self.hub.ready.is_set():
                 # uid 未知（旧配置或刚导入）：后台查询一次，成功后再点即可跳转
                 self.hub.submit(self._async_fetch_uid(room_id))
-                logger.info("正在获取房间 %s 的主播信息，稍后再次点击主播名即可打开个人空间",
+                log_data.info("正在获取房间 %s 的主播信息，稍后再次点击主播名即可打开个人空间",
                             room_id)
         elif col == "#4":
             entry = self.entries.get(room_id)
@@ -2115,15 +2194,20 @@ class ScMonitorApp:
                 entry.notify_live = not entry.notify_live
                 self._save_config()
                 self._refresh_row(room_id)
+                log_room.info("房间 %s 开播提醒：%s", room_id,
+                              "开" if entry.notify_live else "关")
 
     def _on_sort_clicked(self) -> None:
         """手动触发排序：按所选方式重排，直播中置顶开关生效，并记忆新顺序。"""
         self._apply_sort()
         self._save_config()
+        log_room.info("手动触发排序（直播中置顶：%s）",
+                      "开" if self.pin_live_var.get() else "关")
 
     def _on_pin_live_toggled(self) -> None:
         self.ui_prefs["pin_live"] = bool(self.pin_live_var.get())
         self._save_config()
+        log_room.info("「直播中置顶」：%s", "开" if self.pin_live_var.get() else "关")
 
     def _on_overlay_toggled(self) -> None:
         self.ui_prefs["notify_overlay"] = bool(self.notify_overlay_var.get())
@@ -2131,12 +2215,12 @@ class ScMonitorApp:
         # 悬浮窗总开关关闭时，常驻选项无意义，置灰（保留其取值）
         self.notify_persist_check.configure(
             state="normal" if self.ui_prefs["notify_overlay"] else "disabled")
-        logger.info("开播悬浮窗提醒已%s", "开启" if self.ui_prefs["notify_overlay"] else "关闭")
+        log_task.info("开播悬浮窗提醒已%s", "开启" if self.ui_prefs["notify_overlay"] else "关闭")
 
     def _on_persist_toggled(self) -> None:
         self.ui_prefs["notify_persist"] = bool(self.notify_persist_var.get())
         self._save_config()
-        logger.info(
+        log_task.info(
             "开播悬浮窗已设为%s",
             "常驻（需点击关闭）" if self.ui_prefs["notify_persist"] else "超时自动关闭")
 
@@ -2151,6 +2235,7 @@ class ScMonitorApp:
         visible = bool(self.dm_var.get())
         self.ui_prefs["dm_visible"] = visible
         self._save_config()
+        log_window.info("弹幕区%s", "显示" if visible else "隐藏")
         if not visible:
             # 弹幕区整体隐藏时表情面板也随之不可见，顺手收起并记录
             self._hide_emoticon_panel()
@@ -2382,7 +2467,7 @@ class ScMonitorApp:
             self._dm_send_reason = reason
             if reason:
                 self.dm_send_hint_var.set(reason)
-                logger.info("发送弹幕不可用：%s", reason)
+                log_task.info("发送弹幕不可用：%s", reason)
             elif previous:
                 self.dm_send_hint_var.set("")
 
@@ -2439,6 +2524,10 @@ class ScMonitorApp:
         self._dm_sending = True
         self._refresh_dm_send_state()
         self.dm_send_hint_var.set("发送中…")
+        log_task.info("发送弹幕：房间 %s，%d 字，颜色 %s，模式 %s%s，内容：%s",
+                      room_id, len(text), color, mode,
+                      f"，回复 {target.get('uname')}" if target else "",
+                      text if len(text) <= 50 else text[:50] + "…")
         self.hub.submit(self._async_send_danmaku(
             real_room, text, color=color, mode=mode,
             reply_mid=int(target.get("uid") or 0),
@@ -2484,11 +2573,11 @@ class ScMonitorApp:
                 self._update_dm_len_hint()
                 self._set_dm_reply_target(None)
             self.dm_send_hint_var.set("已发送")
-            logger.info("已发送%s：%s", "表情包" if payload.get("emoticon") else "弹幕", text)
+            log_task.info("已发送%s：%s", "表情包" if payload.get("emoticon") else "弹幕", text)
         else:
             error = payload.get("error") or "发送失败"
             self.dm_send_hint_var.set(error)
-            logger.warning("发送弹幕失败：%s", error)
+            log_task.warning("发送弹幕失败：%s", error)
         self._refresh_dm_send_state()
 
     def _remember_dm_meta(self, dmid: str, uid: int, uname: str, content: str) -> None:
@@ -2715,6 +2804,7 @@ class ScMonitorApp:
         if self._emoticon_visible:
             return
         self._emoticon_visible = True
+        log_window.debug("展开表情面板")
         self.emoticon_panel.pack(side="top", fill="x", before=self.dm_send_row)
         try:
             # 先让布局生效，随后渲染才能按真实宽度算出行列数（避免先按兜底列数闪一下）
@@ -2733,6 +2823,7 @@ class ScMonitorApp:
         if not self._emoticon_visible:
             return
         self._emoticon_visible = False
+        log_window.debug("收起表情面板")
         self._remember_emoticon_page()
         self.emoticon_panel.pack_forget()
 
@@ -2759,6 +2850,7 @@ class ScMonitorApp:
         if now - self._emoticon_fetched_at.get(room_id, 0.0) < EMOTICON_REFRESH_COOLDOWN_S:
             return
         self._emoticon_fetched_at[room_id] = now
+        log_data.debug("刷新直播间 %s 的可用表情包（展开表情面板）", room_id)
         self.hub.submit(self._async_load_emoticons(room_id))
 
     async def _async_load_emoticons(self, room_id: int) -> None:
@@ -2783,7 +2875,7 @@ class ScMonitorApp:
                    or emoticon_packages_signature(previous)
                    != emoticon_packages_signature(packages))
         if previous is not None and changed:
-            logger.info("房间 %s 的可用表情包已更新：%d → %d 个"
+            log_data.info("房间 %s 的可用表情包已更新：%d → %d 个"
                         "（粉丝灯牌升级等可能解锁新表情包）",
                         room_id, len(previous), len(packages))
         self._emoticons[room_id] = packages
@@ -2973,7 +3065,7 @@ class ScMonitorApp:
                     resp.raise_for_status()
                     raw = await resp.read()
         except Exception as exc:
-            logger.debug("下载表情图片失败 %s: %s", url, exc)
+            log_data.debug("下载表情图片失败 %s: %s", url, exc)
             self.ui_queue.put(("emoticon_image", {"url": url, "data": ""}))
             return
         self.ui_queue.put(("emoticon_image", {
@@ -3000,13 +3092,13 @@ class ScMonitorApp:
             # 用 Pillow 转成 PNG 再解码；未安装 Pillow 时回退为文字
             converted = self._convert_image_data(data)
             if converted is None:
-                logger.debug("表情图片格式不受 Tk 支持且无法转换（如 WebP，需 Pillow）: %s",
+                log_data.debug("表情图片格式不受 Tk 支持且无法转换（如 WebP，需 Pillow）: %s",
                              url)
                 return
             try:
                 raw = tk.PhotoImage(master=self.root, data=converted)
             except tk.TclError:
-                logger.debug("表情图片转换后仍无法解码: %s", url)
+                log_data.debug("表情图片转换后仍无法解码: %s", url)
                 return
         image = self._scale_photo(raw)
         if len(self._emoticon_images) >= EMOTICON_IMAGE_CACHE_MAX:
@@ -3229,6 +3321,8 @@ class ScMonitorApp:
             return
         room_id = self._selected_room_id
         trigger = str(emoticon.get("trigger") or emoticon.get("text") or "").strip()
+        log_task.info("发送表情：房间 %s，表情 %s（unique=%s）", room_id,
+                      trigger or "无触发词", emoticon.get("unique") or "")
         guard = danmaku_send_guard(
             trigger,
             last_time=self._last_dm_send.get(room_id, 0.0),
@@ -3256,6 +3350,7 @@ class ScMonitorApp:
             return
         if not self.dm_var.get():
             return
+        log_data.debug("拉取直播间 %s 可用的弹幕颜色/模式", room_id)
         self.hub.submit(self._async_load_dm_config(room_id))
 
     async def _async_load_dm_config(self, room_id: int) -> None:
@@ -3382,7 +3477,7 @@ class ScMonitorApp:
             text.delete("1.0", cut)
         except tk.TclError:
             return
-        logger.debug("弹幕区超过 %d 行，已裁剪最旧的一半（完整内容仍在落盘文件）",
+        log_window.debug("弹幕区超过 %d 行，已裁剪最旧的一半（完整内容仍在落盘文件）",
                      DM_TEXT_MAX_LINES)
 
     def _sorted_room_ids(self) -> List[int]:
@@ -3442,15 +3537,19 @@ class ScMonitorApp:
         try:
             room_id, uid = parse_add_input(raw)
         except Exception:
+            log_room.warning("添加直播间失败：无法从 %r 解析出房间号", raw)
             messagebox.showerror("添加失败", f"无法从输入中解析出房间号：{raw}")
             return
         self.add_var.set("")
         if room_id is not None and room_id in self.entries:
+            log_room.info("添加直播间 %s：已在列表中，忽略", room_id)
             messagebox.showinfo("已存在", f"房间 {room_id} 已在列表中")
             return
         if not self.hub.ready.is_set():
+            log_room.info("添加直播间 %s：后台尚未就绪，稍后再试", room_id or uid)
             messagebox.showwarning("请稍候", "后台网络初始化中，请稍后再试")
             return
+        log_room.info("添加直播间：输入 %r → 房间 %s，uid %s", raw, room_id, uid or "未知")
         self.hub.submit(self._async_add_room(room_id, uid))
 
     async def _async_add_room(self, room_id: Optional[int],
@@ -3478,6 +3577,7 @@ class ScMonitorApp:
     def _on_add_result(self, payload: dict) -> None:
         room_id = payload["room_id"]
         if not payload.get("ok"):
+            log_room.warning("添加直播间 %s 失败：%s", room_id, payload.get("error"))
             messagebox.showerror("添加失败", f"房间 {room_id} 添加失败：\n{payload.get('error')}")
             return
         if room_id in self.entries:
@@ -3526,6 +3626,8 @@ class ScMonitorApp:
         for room_id in valid:
             self._refresh_row(room_id)
         self._refresh_buttons()
+        log_room.info("%s监听 %d 个房间：%s", "停用" if all_enabled else "启用",
+                      len(valid), "、".join(str(r) for r in valid))
 
     def _on_delete(self) -> None:
         valid = [r for r in self._get_selected_room_ids() if r in self.entries]
@@ -3538,6 +3640,7 @@ class ScMonitorApp:
             "已保存的 SC 数据会保留在磁盘",
         ):
             return
+        log_room.info("删除直播间 %d 个：%s", len(valid), "、".join(str(r) for r in valid))
         for room_id in valid:
             if self.entries[room_id].enabled:
                 self.hub.submit(self._async_stop_room(room_id))
@@ -3553,6 +3656,7 @@ class ScMonitorApp:
         self._on_room_selected()
 
     def _on_refresh_history(self) -> None:
+        log_data.info("手动刷新历史 SC（房间 %s）", self._selected_room_id)
         self._on_room_selected()
 
     # ---------- 获取浏览器 Cookie ----------
@@ -3575,7 +3679,7 @@ class ScMonitorApp:
             messagebox.showwarning("请稍候", "后台网络初始化中，请稍后再试")
             return
         self.cookie_btn.configure(state="disabled")
-        logger.info("开始从本机浏览器获取 B 站 Cookie…")
+        log_task.info("开始从本机浏览器获取 B 站 Cookie…")
         threading.Thread(target=self._fetch_cookie_worker,
                          name="fetch-cookie", daemon=True).start()
 
@@ -3583,7 +3687,7 @@ class ScMonitorApp:
         try:
             cookie, source, errors = get_bilibili_cookie()
         except Exception as exc:
-            logger.exception("获取浏览器 Cookie 异常")
+            log_task.exception("获取浏览器 Cookie 异常")
             cookie, source, errors = None, None, [f"获取过程异常：{exc}"]
         self.ui_queue.put(("cookie_result",
                            {"cookie": cookie, "source": source, "errors": errors}))
@@ -3594,7 +3698,7 @@ class ScMonitorApp:
         source = payload.get("source")
         errors = payload.get("errors") or []
         for err in errors:
-            logger.info("Cookie 获取提示：%s", err)
+            log_task.info("Cookie 获取提示：%s", err)
         if not cookie:
             detail = "\n".join(errors) if errors else "未找到可用 Cookie"
             messagebox.showerror(
@@ -3609,7 +3713,7 @@ class ScMonitorApp:
             messagebox.showerror("获取 Cookie 失败", f"写入 cookie.txt 失败：{exc}")
             return
         self.hub.submit(self._async_apply_cookie(cookie))
-        logger.info("已获取 B 站 Cookie（来源：%s，长度 %d），已保存并应用到当前会话",
+        log_task.info("已获取 B 站 Cookie（来源：%s，长度 %d），已保存并应用到当前会话",
                     source, len(cookie))
         suffix = ("\n\n注意：\n" + "\n".join(errors)) if errors else ""
         messagebox.showinfo("获取 Cookie 成功",
@@ -3638,7 +3742,7 @@ class ScMonitorApp:
             messagebox.showwarning("请稍候", "后台网络初始化中，请稍后再试")
             return
         self.cookie_plugin_btn.configure(state="disabled")
-        logger.info("开始等待浏览器扩展发送 B 站 Cookie（端口 %s）…", DEFAULT_COOKIE_PORT)
+        log_task.info("开始等待浏览器扩展发送 B 站 Cookie（端口 %s）…", DEFAULT_COOKIE_PORT)
         threading.Thread(target=self._fetch_cookie_plugin_worker,
                          name="fetch-cookie-plugin", daemon=True).start()
 
@@ -3646,12 +3750,12 @@ class ScMonitorApp:
         try:
             cookie = wait_for_extension_cookie(port=DEFAULT_COOKIE_PORT)
         except OSError as exc:
-            logger.warning("cookie server 无法启动: %s", exc)
+            log_task.warning("cookie server 无法启动: %s", exc)
             self.ui_queue.put(("cookie_plugin_result",
                                {"cookie": None, "error": f"本地端口无法开启：{exc}"}))
             return
         except Exception as exc:
-            logger.exception("等待扩展 Cookie 异常")
+            log_task.exception("等待扩展 Cookie 异常")
             self.ui_queue.put(("cookie_plugin_result",
                                {"cookie": None, "error": f"获取过程异常：{exc}"}))
             return
@@ -3677,7 +3781,7 @@ class ScMonitorApp:
             messagebox.showerror("从插件获取失败", f"写入 cookie.txt 失败：{exc}")
             return
         self.hub.submit(self._async_apply_cookie(cookie))
-        logger.info("已通过浏览器扩展获取 B 站 Cookie（长度 %d），已保存并应用到当前会话",
+        log_task.info("已通过浏览器扩展获取 B 站 Cookie（长度 %d），已保存并应用到当前会话",
                     len(cookie))
         messagebox.showinfo("从插件获取成功",
                             "已通过浏览器扩展获取到 B 站登录 Cookie\n"
@@ -3690,7 +3794,7 @@ class ScMonitorApp:
         try:
             await self.hub.api.refresh_login()
         except Exception as exc:
-            logger.debug("刷新登录 uid 失败: %s", exc)
+            log_data.debug("刷新登录 uid 失败: %s", exc)
         # 登录态变化后刷新发送弹幕控件可用状态
         self.ui_queue.put(("dm_state", None))
 
@@ -3730,6 +3834,11 @@ class ScMonitorApp:
     def _on_room_selected(self, _event=None) -> None:
         self._flush_note()
         room_id = self._get_selected_room_id()
+        if room_id != self._selected_room_id:
+            log_room.info("切换直播间：%s（%s，%s）",
+                          room_id if room_id is not None else "未选择",
+                          self.anchor_names.get(room_id) or "未知主播" if room_id else "—",
+                          self.live_state.get(room_id, "未知") if room_id else "—")
         self._selected_room_id = room_id
         self._note_room_id = room_id
         self._refresh_buttons()
@@ -3791,6 +3900,7 @@ class ScMonitorApp:
         """
         self._history_gen += 1
         gen = self._history_gen
+        log_data.debug("读取历史 SC：房间 %s，skip=%d", room_id, skip)
         if self.hub.storage is None:
             self._append_info("（后台网络初始化中，稍后会自动加载历史 SC…）")
             return
@@ -3809,7 +3919,7 @@ class ScMonitorApp:
                 deleted = storage.load_deleted_ids(room_id)
                 total = storage.count_sc_records(room_id)
             except Exception:
-                logger.exception("读取历史 SC 失败 room=%s", room_id)
+                log_data.exception("读取历史 SC 失败 room=%s", room_id)
                 page, deleted, total = [], {}, 0
             self.ui_queue.put(("history", {
                 "gen": gen, "room_id": room_id, "records": page, "deleted": deleted,
@@ -4038,7 +4148,7 @@ class ScMonitorApp:
 
     def _notify_live(self, room_id: int, title: str) -> None:
         """开播提醒：提示音 + 任务栏图标闪烁（悬浮窗由主开关另控）。"""
-        logger.info("房间 %s 开播了：%s", room_id, title or "（无标题）")
+        log_task.info("房间 %s 开播了：%s", room_id, title or "（无标题）")
         self._play_notify_sound()
         self._flash_taskbar()
 
@@ -4052,6 +4162,7 @@ class ScMonitorApp:
             return
         player = NOTIFY_SOUND_PLAYERS.get(
             str(self.ui_prefs.get("notify_sound", "上行双音")))
+        log_task.debug("播放开播提示音：%s", self.ui_prefs.get("notify_sound"))
         if player is None:  # 静音
             return
 
@@ -4100,6 +4211,7 @@ class ScMonitorApp:
         anchor = self.anchor_names.get(room_id)
         head = f"{anchor} 开播了" if anchor else f"直播间 {room_id} 开播了"
         message = title if len(title) <= 60 else title[:57] + "…"
+        log_task.info("弹出悬浮窗开播提醒：房间 %s（%s）", room_id, head)
         self.overlay.show(head, message,
                           persist=bool(self.ui_prefs.get("notify_persist", False)))
 
@@ -4112,6 +4224,7 @@ class ScMonitorApp:
             return
         self.entries[room_id].note = text
         self._save_config()
+        log_room.info("房间 %s 备注已保存：%s", room_id, text or "（清空）")
         if self.tree.exists(str(room_id)):
             self.tree.set(str(room_id), "note", text)
 
@@ -4127,7 +4240,7 @@ class ScMonitorApp:
         if is_room_being_recorded(self.output_dir, room_id):
             # 一并读出锁文件里的持有者信息，便于用户判断是哪个实例在监听
             holder = read_room_lock_holder(self.output_dir, room_id)
-            logger.warning("房间 %s 已被其它实例监听%s，本程序不重复监听"
+            log_live.warning("房间 %s 已被其它实例监听%s，本程序不重复监听"
                            "（关闭对应窗口/进程后重启即可恢复）",
                            room_id, f"（持有者 {holder}）" if holder else "")
             self.ui_queue.put(("client", "occupied", {"room_id": room_id}))
@@ -4151,7 +4264,7 @@ class ScMonitorApp:
         await asyncio.gather(task, return_exceptions=True)
 
     def _on_hub_ready(self) -> None:
-        logger.info("后台就绪，开始启动已启用的房间")
+        log_app.info("后台就绪，开始启动已启用的房间")
         for room_id in self.entries:
             if self.entries[room_id].enabled:
                 self.client_states[room_id] = "starting"
@@ -4173,7 +4286,7 @@ class ScMonitorApp:
         self.hub.submit(self._async_refresh_medals_and_tasks())
 
     def _on_hub_failed(self, error: str) -> None:
-        logger.error("后台初始化失败：%s", error)
+        log_app.error("后台初始化失败：%s", error)
         for room_id in list(self.client_states):
             if self.client_states[room_id] in ("starting", "running"):
                 self.client_states[room_id] = "stopped"
@@ -4208,6 +4321,9 @@ class ScMonitorApp:
                     # 悬浮窗提醒：全局主开关控制这一通道，房间级开关上面已判过
                     if self.ui_prefs.get("notify_overlay", True):
                         self._notify_overlay(room_id, title)
+                # 开播信号打断正在执行的「自动发弹幕」（ROADMAP 64）：默认只在
+                # 未开播时自动发弹幕，开播后不该继续刷屏
+                self._interrupt_auto_danmaku(room_id)
                 # 开播信号直接触发自动点赞（ROADMAP 55）：点赞只在直播中才推进，
                 # 开播瞬间即触发，不必等下一个周期轮询
                 self._try_auto_like(room_id)
@@ -4255,11 +4371,11 @@ class ScMonitorApp:
         elif event_type == "reconnecting":
             # 细粒度重连轨迹（默认日志级别不显示）；INFO 级轨迹由 client 自身的
             # 「连接中断 / N 秒后重连」日志给出，避免重复刷屏
-            logger.debug("房间 %s 连接中断，%.1f 秒后进行第 %d 次重连",
+            log_live.debug("房间 %s 连接中断，%.1f 秒后进行第 %d 次重连",
                          room_id, float(payload.get("delay") or 0),
                          int(payload.get("attempt") or 0))
         elif event_type == "reconnected":
-            logger.info("房间 %s 断线后已自动重连成功（第 %d 次尝试）",
+            log_live.info("房间 %s 断线后已自动重连成功（第 %d 次尝试）",
                         room_id, int(payload.get("attempt") or 0))
 
     async def _async_fetch_uid(self, room_id: int) -> None:
@@ -4277,7 +4393,7 @@ class ScMonitorApp:
             uid = int(info.get("uid") or 0)
             anchor = await api.get_anchor_name(uid) if uid else ""
         except Exception as exc:
-            logger.warning("获取房间 %s 的主播信息失败：%s", room_id, exc)
+            log_data.warning("获取房间 %s 的主播信息失败：%s", room_id, exc)
             return
         self.ui_queue.put(("room_info", {
             "room_id": room_id,
@@ -4301,7 +4417,7 @@ class ScMonitorApp:
         if uid and entry.uid != uid:
             entry.uid = uid
             self._save_config()
-            logger.info("已获取房间 %s 的主播 uid=%s，再次点击主播名可打开个人空间",
+            log_data.info("已获取房间 %s 的主播 uid=%s，再次点击主播名可打开个人空间",
                         room_id, uid)
         anchor = str(payload.get("anchor_name") or "")
         if anchor:
@@ -4353,6 +4469,8 @@ class ScMonitorApp:
         拖动停止 300ms 后再恢复换行并排版一次。"""
         if event.widget is not self.root:
             return
+        # 拖动过程中会连续触发：由节流器合并成一条（含首末尺寸），停止 0.6s 后落日志
+        self._window_size_log.note(f"{event.width}x{event.height}")
         if not self._resize_wrap_frozen:
             self._resize_wrap_frozen = True
             try:
@@ -4454,6 +4572,7 @@ class ScMonitorApp:
     def _on_close(self) -> None:
         if not messagebox.askokcancel("退出", "确定退出？将停止所有房间的监听。"):
             return
+        log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self.room_tasks))
         self._remember_emoticon_page()  # 面板还开着时直接退出也要记住当前表情包
         self._hide_emoticon_tooltip()
         self.hub.submit(self._async_shutdown())
@@ -4486,9 +4605,11 @@ class ScMonitorApp:
             # 兜底：任何退出路径都把当前表情包落盘（无变化时内部会跳过写盘）
             self._remember_emoticon_page()
         except Exception:
-            logger.debug("退出前记录表情包失败", exc_info=True)
+            log_window.debug("退出前记录表情包失败", exc_info=True)
         self._hide_emoticon_tooltip()
+        self._window_size_log.flush()  # 退出前把待写的窗口尺寸变化补上
         self.emoticon_tooltip.destroy()
+        log_app.info("程序已退出")
         try:
             self.root.destroy()
         except tk.TclError:

@@ -61,7 +61,17 @@ from .gui_app import (
     unseen_badge_text,
 )
 
+from .log_categories import (
+    CATEGORY_DATA,
+    CATEGORY_TASK,
+    CATEGORY_WINDOW,
+    get_logger,
+)
+
 logger = logging.getLogger("gui_qt.dm")
+log_window = get_logger(CATEGORY_WINDOW, "gui_qt.dm.window")
+log_data = get_logger(CATEGORY_DATA, "gui_qt.dm.data")
+log_task = get_logger(CATEGORY_TASK, "gui_qt.dm.task")
 
 DANMAKU_MAX_LEN = 20
 DM_SEND_COOLDOWN = 2.0
@@ -716,7 +726,7 @@ class DmPanel(QWidget):
         try:
             self._remember_page()
         except Exception:
-            logger.debug("退出前记录表情包失败", exc_info=True)
+            log_window.debug("退出前记录表情包失败", exc_info=True)
         self._hide_emoji_tooltip()
         label = self._emoji_tip_label
         self._emoji_tip_label = None
@@ -884,6 +894,8 @@ class DmPanel(QWidget):
             self.dm_hint.setText(block)
             return
         text = self.dm_send_entry.text().strip()
+        log_task.info("发送弹幕：房间 %s，%d 字，内容：%s", self.selected_room, len(text),
+                      text if len(text) <= 50 else text[:50] + "…")
         reason = danmaku_send_guard(
             text, last_time=self._last_dm_send, now=time.time(),
             cooldown=DM_SEND_COOLDOWN)
@@ -937,12 +949,12 @@ class DmPanel(QWidget):
                 self._update_dm_len_hint()
                 self._clear_dm_reply_target()
             self.dm_hint.setText("已发送")
-            logger.info("已发送%s：%s", "表情包" if payload.get("emoticon") else "弹幕",
+            log_task.info("已发送%s：%s", "表情包" if payload.get("emoticon") else "弹幕",
                         payload.get("text") or "")
         else:
             error = payload.get("error") or "发送失败"
             self.dm_hint.setText(error)
-            logger.warning("发送弹幕失败：%s", error)
+            log_task.warning("发送弹幕失败：%s", error)
         self._refresh_dm_send_state()
 
     # ---------- 表情面板 ----------
@@ -961,6 +973,7 @@ class DmPanel(QWidget):
             return
         self._emoticon_visible = True
         self._emoticon_panel_room = room_id
+        log_window.debug("展开表情面板（房间 %s）", room_id)
         self.emoticon_panel.setVisible(True)
         self._refresh_emoticons()
 
@@ -970,6 +983,7 @@ class DmPanel(QWidget):
         if not self._emoticon_visible:
             return
         self._emoticon_visible = False
+        log_window.debug("收起表情面板")
         self._remember_page()
         self.emoticon_panel.setVisible(False)
 
@@ -1122,12 +1136,12 @@ class DmPanel(QWidget):
         try:
             raw = base64.b64decode(data)
         except Exception:
-            logger.debug("表情图片 base64 解码失败: %s", url)
+            log_data.debug("表情图片 base64 解码失败: %s", url)
             return
         pixmap = QPixmap()
         if not pixmap.loadFromData(raw):
             # Qt 未内置该格式的解码器（极少见）：保留触发词文字按钮
-            logger.debug("表情图片无法解码: %s", url)
+            log_data.debug("表情图片无法解码: %s", url)
             return
         if (pixmap.width() > EMOTICON_ICON_MAX_WIDTH
                 or pixmap.height() > EMOTICON_ICON_MAX_HEIGHT):
@@ -1172,6 +1186,8 @@ class DmPanel(QWidget):
             self.dm_hint.setText(block)
             return
         trigger = str(emo.get("trigger") or emo.get("text") or "").strip()
+        log_task.info("发送表情：房间 %s，表情 %s（unique=%s）", self.selected_room,
+                      trigger or "无触发词", emo.get("unique") or "")
         reason = danmaku_send_guard(
             trigger, last_time=self._last_dm_send, now=time.time(),
             cooldown=DM_SEND_COOLDOWN)

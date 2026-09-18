@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from datetime import datetime
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from .log_categories import CATEGORY_APP, get_logger
+
+logger = get_logger(CATEGORY_APP, __name__)
 
 try:  # POSIX
     import fcntl
@@ -58,6 +59,7 @@ class RoomLock:
             fp.close()
             holder = self._read_holder()
             detail = f"（持有者: {holder}）" if holder else ""
+            logger.info("房间锁被占用（%s）%s", self._path, detail)
             raise RoomLockAcquireError(
                 f"另一个实例正在监听该房间 {detail}，锁文件: {self._path}"
             ) from exc
@@ -67,6 +69,7 @@ class RoomLock:
         fp.write(f"pid={os.getpid()} started={datetime.now().isoformat(timespec='seconds')}\n")
         fp.flush()
         self._fp = fp
+        logger.debug("已获取房间锁 %s（pid=%d）", self._path, os.getpid())
 
     def release(self) -> None:
         if self._fp is None:
@@ -83,6 +86,7 @@ class RoomLock:
             pass
         finally:
             fp.close()
+        logger.debug("已释放房间锁 %s", self._path)
 
     def _read_holder(self) -> str:
         try:

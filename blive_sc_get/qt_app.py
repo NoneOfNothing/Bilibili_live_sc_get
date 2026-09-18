@@ -103,8 +103,31 @@ from .medal_tasks import (
 from .medal_runner import MedalTaskRunner
 from .qt_overlay import QtToastOverlayManager
 from .storage import SCStorage
+from .log_setup import (
+    CATEGORY_APP,
+    CATEGORY_DATA,
+    CATEGORY_LIVE,
+    CATEGORY_ROOM,
+    CATEGORY_TASK,
+    CATEGORY_WINDOW,
+    DebouncedValueLogger,
+    attach,
+    configure,
+    describe,
+    get_logger,
+    install_file_handler,
+    make_formatter,
+)
 
 logger = logging.getLogger("gui_qt")
+
+# 按区块分类的 logger：每个区块可在 config.json 的 logging.categories 里单独关闭
+log_room = get_logger(CATEGORY_ROOM, "gui_qt.room")
+log_window = get_logger(CATEGORY_WINDOW, "gui_qt.window")
+log_data = get_logger(CATEGORY_DATA, "gui_qt.data")
+log_task = get_logger(CATEGORY_TASK, "gui_qt.task")
+log_live = get_logger(CATEGORY_LIVE, "gui_qt.live")
+log_app = get_logger(CATEGORY_APP, "gui_qt.app")
 
 COOKIE_FILE_PATH = Path(__file__).resolve().parent.parent / COOKIE_FILE_NAME
 
@@ -389,13 +412,22 @@ class QtScMonitorApp(QMainWindow):
 
         self._medal_running: set = set()
         self._runner: Optional[MedalTaskRunner] = None
+        self._base_log_level = logging.INFO  # 由 _setup_logging 按 config.json 覆盖
+        self._log_switches = None            # 同上：区块开关（configure 的返回值）
+        # 高频布局事件合并成一条日志（含首末值），避免拖动时刷屏
+        self._window_size_log = DebouncedValueLogger(
+            log_window, delay=0.6, template="窗口尺寸 {first} → {last}")
+        self._splitter_size_log = DebouncedValueLogger(
+            log_window, delay=0.6, template="分隔条位置 {first} → {last}")
         self._medal_tab_refresh_ms = 90 * 1000
         self._pane_ratio_done = False  # 三板块默认占比是否已按窗口高度应用
         self.overlay = QtToastOverlayManager()
 
         self._setup_logging()
-        logger.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
-                    "启用" if self.app_config.allow_write_operations else "禁用")
+        log_app.info("写操作（发送弹幕等）当前为%s（config.json 的 allow_write_operations）",
+                     "启用" if self.app_config.allow_write_operations else "禁用")
+        log_app.info("程序启动：数据目录 %s，直播间列表 %s（%d 个房间）",
+                     self.output_dir, self.config_path, len(self.entries))
         self._build_ui()
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_queue)
@@ -410,26 +442,30 @@ class QtScMonitorApp(QMainWindow):
     # ---------- 日志 ----------
 
     def _setup_logging(self) -> None:
-        """把日志接到 UI 队列（调试页），与 Tk 版 _setup_logging 同款。"""
-        fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-                                datefmt="%H:%M:%S")
+        """把日志接到 UI 队列（调试页）、控制台与（可选）**轮转文件**，与 Tk 版同款。
+
+        级别与文件输出由 ``config.json`` 的 ``logging`` 段决定（``app_config.LogConfig``）：
+        文件日志用于事后监测运行状态——``pythonw`` / ``start_gui_silent.vbs`` 静默启动
+        时没有控制台，只有落盘的日志可查。
+        """
+        fmt = make_formatter()
         root = logging.getLogger()
-        root.setLevel(logging.INFO)
-        queue_handler = _QueueLogHandler(self.ui_queue)
-        queue_handler.setFormatter(fmt)
-        root.addHandler(queue_handler)
+        self._base_log_level = self.app_config.log.level_value
         # 已有 handler（如 logging.basicConfig 建的）补上 Formatter，避免只显示 message
         for handler in root.handlers:
-            if handler is queue_handler:
-                continue
             if handler.formatter is None:
                 handler.setFormatter(fmt)
+        attach(_QueueLogHandler(self.ui_queue), formatter=fmt)
         # pythonw 启动时 stdout/stderr 为 None，只保留 GUI 内的日志显示
         if sys.stdout is not None and not any(
                 isinstance(h, logging.StreamHandler) for h in root.handlers):
-            stream = logging.StreamHandler(sys.stdout)
-            stream.setFormatter(fmt)
-            root.addHandler(stream)
+            attach(logging.StreamHandler(sys.stdout), formatter=fmt)
+        # 根级别 + 区块开关（会给上面所有 handler 补挂区块过滤器）
+        self._log_switches = configure(self.app_config.log)
+        # 文件日志（logging.enabled 为真时）：带完整日期并按大小轮转，方便事后回溯
+        install_file_handler(self.app_config.log, formatter=make_formatter(with_date=True))
+        log_app.info("%s", describe(self.app_config.log))
+        log_app.info("%s", self._log_switches.describe())
 
     # ---------- UI 构建 ----------
 
@@ -514,6 +550,7 @@ class QtScMonitorApp(QMainWindow):
         # 三板块垂直分割（房间列表 / SC / 弹幕占位）
         splitter = QSplitter(Qt.Vertical)
         self.splitter = splitter
+        splitter.splitterMoved.connect(self._on_splitter_moved)
         outer.addWidget(splitter, 1)
 
         # ---- 房间列表 ----
@@ -629,7 +666,9 @@ class QtScMonitorApp(QMainWindow):
 
     def _on_tab_changed(self, index: int) -> None:
         """切到「粉丝牌」页签时：同步任务行、刷新自动开关，必要时自动拉一次。"""
-        if index != self._tab_medal_index:
+        is_medal = index == self._tab_medal_index
+        log_window.info("页签切换：%s", "「粉丝牌」页" if is_medal else f"索引 {index}")
+        if not is_medal:
             return
         self.medal_tab.sync_task_rows()
         if (not self.medal_tab._medals and self.hub.ready.is_set()
@@ -646,6 +685,29 @@ class QtScMonitorApp(QMainWindow):
             return
         self.hub.submit(self.medal_tab._async_refresh_medals())
         self.hub.submit(self.medal_tab._async_refresh_tasks(announce=False))
+
+    def _interrupt_auto_danmaku(self, room_id: int) -> None:
+        """开播信号打断该房间正在执行的「自动发弹幕」任务（与 Tk 版一致，ROADMAP 64）。
+
+        自动发弹幕**默认只在未开播时**执行；轮次发送期间主播开播，就不该继续刷屏，
+        故收到开播信号即打断（执行器在下一个检查点停止，已发出的弹幕保留）。
+
+        仅在**未**勾选「允许开播时自动发弹幕」时打断：勾选表示用户明确允许开播时也
+        自动发（此时任务本就该继续）；**手动**「发弹幕」按钮触发的任务同样不受影响
+        （执行器只打断 ``auto=True`` 的提交）。
+        """
+        entry = self.entries.get(room_id)
+        if entry is None or entry.auto_danmaku_when_live:
+            return
+        try:
+            runner = self.medal_tab.runner()
+        except Exception:  # 执行器构造异常不应连带打断开播流程（调试页可见）
+            log_task.warning("查询房间 %s 的粉丝牌执行器失败", room_id, exc_info=True)
+            return
+        if runner is None:
+            return
+        # 执行器记录的是真实房间号（短号场景与输入房间号不同）
+        self.hub.submit(runner.interrupt_auto_danmaku(self.real_room_id(room_id)))
 
     def _try_start_auto_room(self, room_id: int) -> None:
         """粉丝牌自动开关触发：仅点赞走开播/周期，发弹幕留给 medal_auto_tick。"""
@@ -698,7 +760,7 @@ class QtScMonitorApp(QMainWindow):
                 auto_danmaku_when_live=entry.auto_danmaku_when_live,
                 live_status=live_status)
             if not only:
-                logger.debug(
+                log_task.debug(
                     "房间 %s 本轮无自动任务可执行（直播状态=%s；自动发弹幕=%s，"
                     "允许开播时发=%s；自动点赞=%s）",
                     room_id, live_status, entry.auto_danmaku,
@@ -718,6 +780,12 @@ class QtScMonitorApp(QMainWindow):
         self.log_view.setReadOnly(True)
         layout.addWidget(self.log_view, 1)
         self.log_level_check = QCheckBox("调试日志（DEBUG）")
+        self.log_level_check.setToolTip(
+            "临时把日志级别提升为 DEBUG（含所有弹幕消息类型与人气值）；"
+            "取消勾选回到 config.json 里 logging.level 配置的级别。"
+            "同一份日志还会按 logging 段写入文件（默认 logs/app.log）。")
+        # 初始勾选状态跟随 config.json 的 logging.level（DEBUG 时即为勾选）
+        self.log_level_check.setChecked(self._base_log_level <= logging.DEBUG)
         self.log_level_check.toggled.connect(self._on_debug_toggle)
         layout.addWidget(self.log_level_check)
         clear_btn = QPushButton("清空")
@@ -833,6 +901,11 @@ class QtScMonitorApp(QMainWindow):
     def _on_room_selected(self) -> None:
         self._flush_note()  # 先把备注写回它所属的房间，再切换
         room_id = self._get_selected_room_id()
+        if room_id != self._selected_room_id:
+            log_room.info("切换直播间：%s（%s，%s）",
+                          room_id if room_id is not None else "未选择",
+                          self.anchor_names.get(room_id, "未知主播") if room_id else "—",
+                          self.live_state.get(room_id, "未知") if room_id else "—")
         self._refresh_buttons()
         if room_id is None:
             self._selected_room_id = None
@@ -919,6 +992,7 @@ class QtScMonitorApp(QMainWindow):
                 new_order.append(rid)
         self._room_order = new_order
         self._save_config()
+        log_room.info("拖动排序完成，新顺序：%s", "、".join(str(r) for r in new_order))
         # 重建行以刷新选中高亮顺序（保持选中房间）
         selected = self._get_selected_room_id()
         self._populate_rows()
@@ -936,6 +1010,7 @@ class QtScMonitorApp(QMainWindow):
             else:
                 self._async_fetch_uid(room_id)
                 return
+        log_room.info("点击跳转：房间 %s 的%s", room_id, "主播主页" if col == 1 else "直播间")
         webbrowser.open(url)
 
     def _async_fetch_uid(self, room_id: int) -> None:
@@ -958,7 +1033,7 @@ class QtScMonitorApp(QMainWindow):
             uid = int(info.get("uid") or 0)
             anchor = await api.get_anchor_name(uid) if uid else ""
         except Exception as exc:
-            logger.debug("获取房间 %s 信息失败: %s", room_id, exc)
+            log_data.debug("获取房间 %s 信息失败: %s", room_id, exc)
             return
         self.ui_queue.put(("room_info", {
             "room_id": room_id,
@@ -1031,9 +1106,11 @@ class QtScMonitorApp(QMainWindow):
         try:
             room_id, uid = parse_add_input(raw)
         except Exception:
+            log_room.warning("添加直播间失败：无法从 %r 解析出房间号", raw)
             QMessageBox.critical(self, "添加失败", f"无法从输入中解析出房间号：{raw}")
             return
         self.add_edit.clear()
+        log_room.info("添加直播间：输入 %r → 房间 %s，uid %s", raw, room_id, uid or "未知")
         if room_id is not None and room_id in self.entries:
             QMessageBox.information(self, "已存在", f"房间 {room_id} 已在列表中")
             return
@@ -1066,6 +1143,7 @@ class QtScMonitorApp(QMainWindow):
     def _on_add_result(self, payload: dict) -> None:
         room_id = payload["room_id"]
         if not payload.get("ok"):
+            log_room.warning("添加直播间 %s 失败：%s", room_id, payload.get("error"))
             QMessageBox.critical(self, "添加失败",
                                  f"房间 {room_id} 添加失败：\n{payload.get('error')}")
             return
@@ -1085,6 +1163,7 @@ class QtScMonitorApp(QMainWindow):
         self._select_room(room_id)
         uid = int(payload.get("uid") or 0)
         anchor = self.anchor_names.get(room_id) or "未知"
+        log_room.info("已添加直播间 %s（%s，uid=%s）", room_id, anchor, uid or "未知")
         QMessageBox.information(self, "添加成功",
                                 f"房间 {room_id} 已加入监听\n主播：{anchor}（uid：{uid or '未知'}）")
         self.hub.submit(self._start_room(room_id))
@@ -1116,6 +1195,8 @@ class QtScMonitorApp(QMainWindow):
             self._refresh_row(room_id)
         self._refresh_buttons()
         self._apply_dm_gate()
+        log_room.info("%s监听 %d 个房间：%s", "停用" if all_enabled else "启用",
+                      len(valid), "、".join(str(r) for r in valid))
 
     def _on_delete(self) -> None:
         valid = [r for r in self._get_selected_room_ids() if r in self.entries]
@@ -1128,6 +1209,7 @@ class QtScMonitorApp(QMainWindow):
                 "已保存的 SC 数据会保留在磁盘",
                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             return
+        log_room.info("删除直播间 %d 个：%s", len(valid), "、".join(str(r) for r in valid))
         for room_id in valid:
             if self.entries[room_id].enabled:
                 self.hub.submit(self._stop_room(room_id))
@@ -1156,6 +1238,7 @@ class QtScMonitorApp(QMainWindow):
     def _on_refresh_history(self) -> None:
         room_id = self._get_selected_room_id()
         if room_id is not None:
+            log_data.info("手动刷新历史 SC（房间 %s）", room_id)
             self._load_history(room_id)
 
     def _flush_note(self) -> None:
@@ -1172,6 +1255,7 @@ class QtScMonitorApp(QMainWindow):
             return
         self.entries[room_id].note = text
         self._save_config()
+        log_room.info("房间 %s 备注已保存：%s", room_id, text or "（清空）")
         self._refresh_row(room_id)
 
     def _on_sort_clicked(self) -> None:
@@ -1180,6 +1264,7 @@ class QtScMonitorApp(QMainWindow):
         self.ui_prefs["sort_mode"] = mode
         self._save_config()
         self._apply_sort()
+        log_room.info("手动排序：方式 %s（显示 %s）", mode, text)
 
     def _apply_sort(self) -> None:
         mode = self.ui_prefs.get("sort_mode", "manual")
@@ -1201,6 +1286,7 @@ class QtScMonitorApp(QMainWindow):
     def _on_pin_live_toggled(self, checked: bool) -> None:
         self.ui_prefs["pin_live"] = checked
         self._save_config()
+        log_room.info("「直播中置顶」：%s", "开" if checked else "关")
         if checked:
             ids = [r for r in self._room_order if r in self.entries]
             current = self._selected_room_id
@@ -1227,6 +1313,7 @@ class QtScMonitorApp(QMainWindow):
         if hasattr(self, "dm_panel"):
             self.dm_panel.setVisible(self.dm_var)
         self._save_config()
+        log_window.info("弹幕区%s", "显示" if self.dm_var else "隐藏")
         self._apply_dm_gate()
         self._refresh_dm_send_state()
         self._load_dm_options_for_selected()
@@ -1239,6 +1326,21 @@ class QtScMonitorApp(QMainWindow):
         if not self._pane_ratio_done:
             self._pane_ratio_done = True
             self._apply_pane_ratio()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """窗口尺寸变化：由节流器合并成一条日志（与 Tk 版 _on_root_configure 一致）。"""
+        super().resizeEvent(event)
+        debounced = getattr(self, "_window_size_log", None)
+        if debounced is not None:
+            size = self.size()
+            debounced.note(f"{size.width()}x{size.height()}")
+
+    def _on_splitter_moved(self, _pos: int, _index: int) -> None:
+        """拖动分隔条：合并成一条日志（含首末各板块尺寸）。"""
+        sizes = getattr(self, "splitter", None)
+        if sizes is None:
+            return
+        self._splitter_size_log.note("、".join(str(s) for s in sizes.sizes()))
 
     def _apply_pane_ratio(self, *, initial: bool = False) -> None:
         """按 Tk 的 PANE_RATIO（2 : 3.5 : 4.5）分配板块高度。
@@ -1288,7 +1390,7 @@ class QtScMonitorApp(QMainWindow):
             # 其它实例/CLI 已占用该房间：不重复监听（与 Tk 版一致）。
             # 一并读出锁文件里的持有者信息，便于用户判断是哪个实例在监听
             holder = read_room_lock_holder(self.output_dir, room_id)
-            logger.warning("房间 %s 已被其它实例监听%s，本程序不重复监听"
+            log_live.warning("房间 %s 已被其它实例监听%s，本程序不重复监听"
                            "（关闭对应窗口/进程后重启即可恢复）",
                            room_id, f"（持有者 {holder}）" if holder else "")
             self.ui_queue.put(("client", "occupied",
@@ -1342,7 +1444,7 @@ class QtScMonitorApp(QMainWindow):
                     resp.raise_for_status()
                     raw = await resp.read()
         except Exception as exc:
-            logger.debug("下载表情图片失败 %s: %s", url, exc)
+            log_data.debug("下载表情图片失败 %s: %s", url, exc)
             self.ui_queue.put(("emoticon_image", {"url": url, "data": ""}))
             return
         self.ui_queue.put(("emoticon_image", {
@@ -1391,6 +1493,7 @@ class QtScMonitorApp(QMainWindow):
     def _load_history(self, room_id: int, skip: int = 0) -> None:
         self._history_gen += 1
         gen = self._history_gen
+        log_data.debug("读取历史 SC：房间 %s，skip=%d", room_id, skip)
         if self.hub.storage is None:
             self._append_info("（后台网络初始化中，稍后会自动加载历史 SC…）")
             return
@@ -1409,7 +1512,7 @@ class QtScMonitorApp(QMainWindow):
                 deleted = storage.load_deleted_ids(room_id)
                 total = storage.count_sc_records(room_id)
             except Exception:
-                logger.exception("读取历史 SC 失败 room=%s", room_id)
+                log_data.exception("读取历史 SC 失败 room=%s", room_id)
                 page, deleted, total = [], {}, 0
             self.ui_queue.put(("history", {
                 "gen": gen, "room_id": room_id, "records": page, "deleted": deleted,
@@ -1705,7 +1808,7 @@ class QtScMonitorApp(QMainWindow):
                 elif kind == "medal_event":
                     self._on_medal_event(item[1], item[2])
                 else:
-                    logger.debug("未处理的队列事件: %s", item[0])
+                    log_app.debug("未处理的队列事件: %s", item[0])
         except queue.Empty:
             pass
         self._append_logs(log_lines)
@@ -1744,8 +1847,12 @@ class QtScMonitorApp(QMainWindow):
         bar.setValue(bar.maximum())
 
     def _on_debug_toggle(self, checked: bool) -> None:
-        # 与 Tk 版一致：改根 logger 级别，各模块子 logger 才会跟着放行 DEBUG
-        logging.getLogger().setLevel(logging.DEBUG if checked else logging.INFO)
+        # 与 Tk 版一致：改根 logger 级别，各模块子 logger 才会跟着放行 DEBUG；
+        # 取消勾选时回到 config.json 配置的级别（而不是硬编码 INFO）
+        level = logging.DEBUG if checked else self._base_log_level
+        logging.getLogger().setLevel(level)
+        log_app.info("调试日志开关：%s（当前级别 %s）",
+                     "开" if checked else "关", logging.getLevelName(level))
 
     # ---------- 弹幕 / 粉丝牌状态 ----------
 
@@ -1773,14 +1880,15 @@ class QtScMonitorApp(QMainWindow):
         elapsed = payload.get("elapsed")
         suffix = f"（总耗时 {elapsed}s）" if elapsed is not None else ""
         prefix = {"done": "完成", "partial": "部分完成", "risk": "风控中止",
-                  "blocked": "未执行", "error": "失败"}.get(status, status)
+                  "interrupted": "已打断", "blocked": "未执行",
+                  "error": "失败"}.get(status, status)
         # 自动执行「无事可做」时静默（仅记日志），避免每轮覆盖用户可见提示
         if bool(payload.get("manual", True)) or status != "done":
             self.medal_tab.set_hint(f"{prefix}：{message}{suffix}")
         if status in ("risk", "error"):
-            logger.warning("粉丝牌任务%s：%s%s", prefix, message, suffix)
+            log_task.warning("粉丝牌任务%s：%s%s", prefix, message, suffix)
         else:
-            logger.info("粉丝牌任务%s：%s%s", prefix, message, suffix)
+            log_task.info("粉丝牌任务%s：%s%s", prefix, message, suffix)
         self.medal_tab._on_task_selected()
         # 任务完成会改变亲密度/经验：顺带刷新粉丝牌与该房间任务，无需手动点刷新
         if (room_id is not None and self.hub.ready.is_set()
@@ -1809,14 +1917,18 @@ class QtScMonitorApp(QMainWindow):
         if event_type == "medal_note":
             message = str(payload.get("message") or "")
             self.medal_tab.set_hint(f"房间 {label}：{message}")
-            logger.info("粉丝牌任务（房间 %s）：%s", label, message)
+            log_task.info("粉丝牌任务（房间 %s）：%s", label, message)
+        elif event_type == "medal_interrupt":
+            message = str(payload.get("message") or "已打断自动发弹幕任务")
+            self.medal_tab.set_hint(f"房间 {label}：{message}")
+            log_task.info("粉丝牌任务（房间 %s）：%s", label, message)
         elif event_type == "medal_start":
-            logger.info("房间 %s 开始执行粉丝牌任务", label)
+            log_task.info("房间 %s 开始执行粉丝牌任务", label)
         elif event_type == "medal_progress":
             outcome = payload.get("outcome") or {}
             elapsed = outcome.get("elapsed")
             tail = f"（用时 {elapsed}s）" if elapsed is not None else ""
-            logger.info("房间 %s %s：%s%s", label,
+            log_task.info("房间 %s %s：%s%s", label,
                         task_label(str(payload.get("jump_type") or "")),
                         outcome.get("message") or "", tail)
         elif event_type == "medal_task_progress":
@@ -1829,7 +1941,7 @@ class QtScMonitorApp(QMainWindow):
     # ---------- Cookie ----------
 
     def _on_hub_ready(self) -> None:
-        logger.info("后台就绪，开始启动已启用的房间")
+        log_app.info("后台就绪，开始启动已启用的房间")
         for room_id in self.entries:
             if self.entries[room_id].enabled:
                 self.client_states[room_id] = "starting"
@@ -1855,7 +1967,7 @@ class QtScMonitorApp(QMainWindow):
             self._refresh_row(room_id)
 
     def _on_hub_failed(self, error: str) -> None:
-        logger.error("后台初始化失败：%s", error)
+        log_app.error("后台初始化失败：%s", error)
         for room_id in list(self.client_states):
             if self.client_states[room_id] in ("starting", "running"):
                 self.client_states[room_id] = "stopped"
@@ -1885,6 +1997,9 @@ class QtScMonitorApp(QMainWindow):
             if prev_text and prev_text != "直播中" and status_text == "直播中":
                 if entry is None or entry.notify_live:
                     self._notify_live(room_id, payload.get("title") or "")
+                # 开播信号打断正在执行的「自动发弹幕」（与 Tk 版一致，ROADMAP 64）：
+                # 默认只在未开播时自动发弹幕，开播后不该继续刷屏
+                self._interrupt_auto_danmaku(room_id)
                 # 开播信号直接触发自动点赞（与 Tk 版一致，与「提醒」开关无关）
                 self._try_start_auto_room(room_id)
             if self.client_states.get(room_id) == "starting":
@@ -1929,11 +2044,11 @@ class QtScMonitorApp(QMainWindow):
                 if room_id == self._selected_room_id:
                     self._update_sc_header(room_id)
         elif event_type == "reconnecting":
-            logger.debug("房间 %s 连接中断，%.1f 秒后进行第 %d 次重连",
+            log_live.debug("房间 %s 连接中断，%.1f 秒后进行第 %d 次重连",
                          room_id, float(payload.get("delay") or 0),
                          int(payload.get("attempt") or 0))
         elif event_type == "reconnected":
-            logger.info("房间 %s 断线后已自动重连成功（第 %d 次尝试）",
+            log_live.info("房间 %s 断线后已自动重连成功（第 %d 次尝试）",
                         room_id, int(payload.get("attempt") or 0))
 
     def _on_room_done(self, room_id: int) -> None:
@@ -1985,7 +2100,7 @@ class QtScMonitorApp(QMainWindow):
             QMessageBox.warning(self, "请稍候", "后台网络初始化中，请稍后再试")
             return
         self.cookie_btn.setEnabled(False)
-        logger.info("开始从本机浏览器获取 B 站 Cookie…")
+        log_task.info("开始从本机浏览器获取 B 站 Cookie…")
         threading.Thread(target=self._fetch_cookie_worker,
                          name="fetch-cookie", daemon=True).start()
 
@@ -1993,7 +2108,7 @@ class QtScMonitorApp(QMainWindow):
         try:
             cookie, source, errors = get_bilibili_cookie()
         except Exception as exc:
-            logger.exception("获取浏览器 Cookie 异常")
+            log_task.exception("获取浏览器 Cookie 异常")
             cookie, source, errors = None, None, [f"获取过程异常：{exc}"]
         self.ui_queue.put(("cookie_result",
                            {"cookie": cookie, "source": source, "errors": errors}))
@@ -2004,7 +2119,7 @@ class QtScMonitorApp(QMainWindow):
         source = payload.get("source")
         errors = payload.get("errors") or []
         for err in errors:
-            logger.info("Cookie 获取提示：%s", err)
+            log_task.info("Cookie 获取提示：%s", err)
         if not cookie:
             detail = "\n".join(errors) if errors else "未找到可用 Cookie"
             QMessageBox.critical(self, "获取 Cookie 失败",
@@ -2018,7 +2133,7 @@ class QtScMonitorApp(QMainWindow):
             QMessageBox.critical(self, "获取 Cookie 失败", f"写入 cookie.txt 失败：{exc}")
             return
         self.hub.submit(self._async_apply_cookie(cookie))
-        logger.info("已获取 B 站 Cookie（来源：%s，长度 %d），已保存并应用到当前会话",
+        log_task.info("已获取 B 站 Cookie（来源：%s，长度 %d），已保存并应用到当前会话",
                     source, len(cookie))
         QMessageBox.information(self, "获取 Cookie 成功",
                                 f"来源：{source}\n已保存到 cookie.txt 并应用到当前会话。")
@@ -2041,7 +2156,7 @@ class QtScMonitorApp(QMainWindow):
             QMessageBox.warning(self, "请稍候", "后台网络初始化中，请稍后再试")
             return
         self.cookie_plugin_btn.setEnabled(False)
-        logger.info("开始等待浏览器扩展发送 B 站 Cookie（端口 %s）…", DEFAULT_COOKIE_PORT)
+        log_task.info("开始等待浏览器扩展发送 B 站 Cookie（端口 %s）…", DEFAULT_COOKIE_PORT)
         threading.Thread(target=self._fetch_cookie_plugin_worker,
                          name="fetch-cookie-plugin", daemon=True).start()
 
@@ -2049,12 +2164,12 @@ class QtScMonitorApp(QMainWindow):
         try:
             cookie = wait_for_extension_cookie(port=DEFAULT_COOKIE_PORT)
         except OSError as exc:
-            logger.warning("cookie server 无法启动: %s", exc)
+            log_task.warning("cookie server 无法启动: %s", exc)
             self.ui_queue.put(("cookie_plugin_result",
                                {"cookie": None, "error": f"本地端口无法开启：{exc}"}))
             return
         except Exception as exc:
-            logger.exception("等待扩展 Cookie 异常")
+            log_task.exception("等待扩展 Cookie 异常")
             self.ui_queue.put(("cookie_plugin_result",
                                {"cookie": None, "error": f"获取过程异常：{exc}"}))
             return
@@ -2080,7 +2195,7 @@ class QtScMonitorApp(QMainWindow):
             QMessageBox.critical(self, "从插件获取失败", f"写入 cookie.txt 失败：{exc}")
             return
         self.hub.submit(self._async_apply_cookie(cookie))
-        logger.info("已通过浏览器扩展获取 B 站 Cookie（长度 %d），已保存并应用到当前会话",
+        log_task.info("已通过浏览器扩展获取 B 站 Cookie（长度 %d），已保存并应用到当前会话",
                     len(cookie))
         QMessageBox.information(self, "从插件获取成功",
                                 "已通过浏览器扩展获取到 B 站登录 Cookie\n"
@@ -2093,13 +2208,13 @@ class QtScMonitorApp(QMainWindow):
         try:
             await self.hub.api.refresh_login()
         except Exception as exc:
-            logger.debug("刷新登录 uid 失败: %s", exc)
+            log_data.debug("刷新登录 uid 失败: %s", exc)
         self.ui_queue.put(("dm_state", None))
 
     # ---------- 开播提醒 ----------
 
     def _notify_live(self, room_id: int, title: str) -> None:
-        logger.info("房间 %s 开播了：%s", room_id, title or "（无标题）")
+        log_task.info("房间 %s 开播了：%s", room_id, title or "（无标题）")
         _notify_sound_play(str(self.ui_prefs.get("notify_sound", "上行双音")))
         try:
             hwnd = int(self.winId())
@@ -2136,6 +2251,9 @@ class QtScMonitorApp(QMainWindow):
                                     QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             event.ignore()
             return
+        log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self._room_order))
+        self._window_size_log.flush()    # 退出前把待写的窗口尺寸变化补上
+        self._splitter_size_log.flush()
         if hasattr(self, "dm_panel"):
             self.dm_panel.destroy_popups()
         self.hub.submit(self._async_shutdown())

@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import csv
 import json
-import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set, Union
 
-logger = logging.getLogger(__name__)
+from .log_categories import CATEGORY_DATA, get_logger
+
+logger = get_logger(CATEGORY_DATA, __name__)
 
 JSONL_PREFIX = "sc_"
 DM_PREFIX = "dm_"
@@ -71,6 +72,8 @@ class SCStorage:
         self._pending: Dict[int, List[Dict[str, Any]]] = {}
         # room_id -> 追加模式弹幕文件句柄（缓冲写，定期 flush）
         self._dm_files: Dict[int, Any] = {}
+        # room_id -> 自上次汇总以来写入的弹幕条数（**按批汇总**输出日志，不逐条记）
+        self._dm_counts: Dict[int, int] = {}
 
     @property
     def base_dir(self) -> Path:
@@ -148,6 +151,8 @@ class SCStorage:
             logger.warning("CSV 写入失败，已加入重试队列 room=%s sc_id=%s: %s",
                            room_id, sc.get("id"), exc)
         if jsonl_ok and csv_ok:
+            logger.info("SC 已落盘 room=%s sc_id=%s 金额=%s 元",
+                        room_id, sc.get("id"), sc.get("price"))
             return True
         self._pending.setdefault(room_id, []).append({
             "sc": sc,
@@ -221,25 +226,40 @@ class SCStorage:
             "text": text,
         }
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # 逐条不记日志（弹幕高频，会刷爆日志）：计数留到刷盘/关闭时按批汇总
+        self._dm_counts[room_id] = self._dm_counts.get(room_id, 0) + 1
+
+    def _log_dm_counts(self, *, closing: bool = False) -> None:
+        """把缓冲期间的弹幕写入条数**按房间汇总**输出一条日志（无写入则跳过）。"""
+        counts = {room: n for room, n in self._dm_counts.items() if n > 0}
+        self._dm_counts = {}
+        if not counts:
+            return
+        total = sum(counts.values())
+        detail = "、".join(f"{room}×{n}" for room, n in sorted(counts.items()))
+        logger.info("弹幕已%s入盘 %d 条（%s）", "落盘并关闭" if closing else "刷", total, detail)
 
     def flush_danmaku_buffers(self) -> None:
-        """把缓冲中的弹幕刷盘，由定时任务周期性调用。"""
+        """把缓冲中的弹幕刷盘，由定时任务周期性调用；按批汇总记一条日志。"""
         for handle in self._dm_files.values():
             try:
                 handle.flush()
             except OSError as exc:
                 logger.debug("弹幕缓冲刷盘失败: %s", exc)
+        self._log_dm_counts()
 
     def close_danmaku_buffer(self, room_id: int) -> None:
         """关闭并移除单个房间的弹幕句柄（停止监听该房间时调用）。"""
         handle = self._dm_files.pop(room_id, None)
         if handle is None:
+            self._log_dm_counts(closing=True)
             return
         try:
             handle.flush()
             handle.close()
         except OSError:
             pass
+        self._log_dm_counts(closing=True)
 
     def close_danmaku_buffers(self) -> None:
         """关闭所有弹幕句柄（程序退出前调用）。"""
@@ -250,6 +270,7 @@ class SCStorage:
             except OSError:
                 pass
         self._dm_files.clear()
+        self._log_dm_counts(closing=True)
 
     @staticmethod
     def _parse_received_at(item: Dict[str, Any]) -> datetime:
@@ -378,6 +399,7 @@ class SCStorage:
             if len(page) >= limit:
                 break
         page.reverse()
+        logger.info("历史 SC 分页读取 room=%s（skip=%d，返回 %d 条）", room_id, skip, len(page))
         return page
 
     def count_sc_records(self, room_id: int) -> int:
@@ -422,3 +444,6 @@ class SCStorage:
         deleted_path.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        logger.info("已记录 SC 删除（退款）room=%s 共 %d 条：%s",
+                    room_id, len(record["ids"]),
+                    "、".join(str(i) for i in record["ids"][:5]))

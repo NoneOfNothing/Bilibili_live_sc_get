@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import random
 import time
 from datetime import datetime
@@ -13,6 +12,7 @@ from typing import Callable, Optional, Set
 import aiohttp
 
 from .api import ApiError, BilibiliLiveAPI, RISK_CONTROL_CODES
+from .log_categories import CATEGORY_LIVE, get_logger
 from .protocol import (
     Operation,
     ProtocolError,
@@ -135,7 +135,7 @@ class RoomClient:
         self._room_id_input = int(room_id)
         self._storage = storage
         self._room_id = int(room_id)
-        self._log = logging.getLogger(f"Room[{room_id}]")
+        self._log = get_logger(CATEGORY_LIVE, f"Room[{room_id}]")
         self._event_callback = event_callback
         self._seen_sc_ids: Set[int] = set()
         self._known_ids_loaded = False
@@ -461,6 +461,7 @@ class RoomClient:
         data = command.get("data") or {}
         count = data.get("count")
         if isinstance(count, (int, float)) and count > 0:
+            self._log.debug("同接人数 %d", int(count))  # 推送较密：只在 DEBUG 级别记录
             self._emit("online_count", {"room_id": self._room_id, "count": int(count)})
 
     def _on_stop_live_room_list(self, command: dict) -> None:
@@ -610,6 +611,8 @@ class RoomClient:
             self._title = title
         if uid is not None:
             self._uid = uid
+        self._log.debug("广播状态：%s（直播间 %s）",
+                        LIVE_STATUS_TEXT.get(live_status, "未知"), self._room_id)
         self._emit("status", {
             "room_id": self._room_id,
             "input_room_id": self._room_id_input,
