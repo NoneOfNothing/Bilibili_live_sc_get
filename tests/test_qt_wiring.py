@@ -250,6 +250,116 @@ class QtPreviewWiringTests(unittest.TestCase):
                       _called_attrs(_method(host, HOST_CLASS, "_on_room_selected")),
                       "切换直播间时未跟随预览")
 
+    def test_audio_follows_default_output_device(self):
+        """预览声音要跟随系统默认音频输出设备（``QAudioOutput`` 创建后不会自己跟随）。
+
+        不跟随的现象：切到耳机后声音仍从旧设备出去、甚至直接没声。做法是检测默认设备变化 →
+        逐路 ``setDevice`` → 重新下发音量 / 静音；信号之外还有巡检兜底。
+        """
+        tree = _tree("qt_preview.py")
+        sync = _method(tree, "PreviewWindow", "_sync_audio_device")
+        self.assertIn("defaultAudioOutput", _called_attrs(sync), "未读取系统默认输出设备")
+        self.assertIn("_apply_audio", _called_attrs(sync), "切换后未重新下发音量 / 静音")
+        tile = _method(tree, "PreviewTile", "set_audio_device")
+        self.assertIn("setDevice", _called_attrs(tile), "未指定新的输出设备")
+        # 必须在「停」之后切、「再播」回来；且**不能**换实例交给 setAudioOutput
+        # （实测播放中换 QAudioOutput 会让播放器卡住：画面定格 + 彻底没声）
+        self.assertIn("stop", _called_attrs(tile), "切换设备前未停播放器")
+        self.assertIn("play", _called_attrs(tile), "切换设备后未恢复播放")
+        self.assertIn("setSource", _called_attrs(tile),
+                      "stop 后只 play() 常常起不来（要等 5 秒健康检查），应重新装载同一地址")
+        lines = {attr: min(node.lineno for node in ast.walk(tile)
+                           if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                           and node.func.attr == attr)
+                 for attr in ("stop", "setDevice", "setSource", "play")}
+        self.assertLess(lines["stop"], lines["setDevice"], "应先停再切设备")
+        self.assertLess(lines["setDevice"], lines["setSource"], "应先切设备再重新装载")
+        self.assertLess(lines["setSource"], lines["play"], "装载后再 play")
+        self.assertNotIn("setAudioOutput", _called_attrs(tile),
+                         "播放中换 QAudioOutput 实例会让播放器卡住（画面定格 / 没声）")
+        init = _method(tree, "PreviewWindow", "__init__")
+        self.assertIn("audioOutputsChanged", _attr_names(init), "未监听设备变化信号")
+        self.assertIn("QMediaDevices", _names(init),
+                      "必须用 QMediaDevices 实例接信号（类属性上的信号 connect 会抛 AttributeError）")
+        start = _method(tree, "PreviewWindow", "_start_timers")
+        self.assertIn("_sync_audio_device", _called_attrs(start), "打开预览时未先对齐设备")
+        stop = _method(tree, "PreviewWindow", "_stop_timers")
+        self.assertIn("_audio_timer", _attr_names(stop), "停止预览时未停掉音频巡检")
+
+    def test_popup_menus_are_topmost(self):
+        """所有弹出菜单都要**置顶**：预览浮窗可能置顶，会把菜单压在下面。
+
+        菜单（``Qt.Popup``）会抢占鼠标，所以被压住时的现象很迷惑人——「右键后看不见菜单、
+        却能在原位置点到菜单项」（用户反馈）。菜单自己也设 ``WindowStaysOnTopHint``，
+        ``exec`` 激活它之后便压在浮窗之上。
+        """
+        for module in (HOST_MODULE, "qt_preview.py", "qt_dm_panel.py"):
+            tree = _tree(module)
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                makes_menu = any(isinstance(sub, ast.Call)
+                                 and isinstance(sub.func, ast.Name) and sub.func.id == "QMenu"
+                                 for sub in ast.walk(node))
+                if not makes_menu:
+                    continue
+                attrs = {sub.attr for sub in ast.walk(node) if isinstance(sub, ast.Attribute)}
+                self.assertIn("setWindowFlag", attrs,
+                              f"{module}:{node.name} 的弹出菜单未置顶（会被置顶浮窗盖住）")
+                self.assertIn("WindowStaysOnTopHint", attrs,
+                              f"{module}:{node.name} 的菜单未设置 WindowStaysOnTopHint")
+
+    def test_toggle_top_keeps_geometry_and_focus(self):
+        """切换置顶（会重建窗口）后要恢复几何，并且**不抢焦点**。
+
+        `setWindowFlag` 会隐藏并重建窗口：既要按切换前的可见性重新 show（否则窗口消失），
+        也要把位置尺寸恢复（否则窗口被系统摆到最前、顶住主界面），还要靠
+        `WA_ShowWithoutActivating` 避免显示时抢走主窗口焦点（用户反馈「置顶后无法右键 /
+        滚动列表」）。
+        """
+        tree = _tree("qt_preview.py")
+        handler = _method(tree, "PreviewWindow", "_on_top_toggled")
+        self.assertIn("geometry", _attr_names(handler), "未保存 / 恢复窗口几何")
+        self.assertIn("setGeometry", _called_attrs(handler), "重建后未恢复位置与尺寸")
+
+        def first_line(attr):
+            got = [node.lineno for node in ast.walk(handler)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == attr]
+            return min(got) if got else None
+
+        self.assertLess(first_line("isVisible"), first_line("setWindowFlag"),
+                        "isVisible 必须在 setWindowFlag 之前（之后窗口已被隐藏，恒为假）")
+        self.assertLess(first_line("geometry"), first_line("setWindowFlag"),
+                        "几何要在 setWindowFlag 之前取（重建后取值已被系统改掉）")
+
+        build = _method(tree, "PreviewWindow", "_build_ui")
+        self.assertIn("WA_ShowWithoutActivating", _attr_names(build),
+                      "显示窗口时会抢焦点（主界面像被顶住）")
+        self.assertIn("setAttribute", _called_attrs(build), "未设置窗口属性")
+
+    def test_toggle_top_keeps_window_visible(self):
+        """取消置顶不能把窗口弄没：``setWindowFlag`` 会先隐藏窗口，必须重新 ``show``。
+
+        判断可见性要放在 ``setWindowFlag`` **之前**——放在之后永远是 False，于是不 show、
+        窗口直接消失（用户反馈「取消置顶就消失」）。
+        """
+        tree = _tree("qt_preview.py")
+        handler = _method(tree, "PreviewWindow", "_on_top_toggled")
+        self.assertIn("setWindowFlag", _called_attrs(handler), "未切换置顶标志")
+        self.assertIn("show", _called_attrs(handler), "切换置顶后未重新显示窗口（会消失）")
+
+        def first_line(attr):
+            lines = [node.lineno for node in ast.walk(handler)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and node.func.attr == attr]
+            return min(lines) if lines else None
+
+        visible_line, flag_line = first_line("isVisible"), first_line("setWindowFlag")
+        self.assertIsNotNone(visible_line, "未记录切换前的可见性")
+        self.assertLess(visible_line, flag_line,
+                        "isVisible 必须在 setWindowFlag 之前（之后窗口已被隐藏，条件恒假）")
+
     def test_room_context_menu_previews_row(self):
         host = _tree(HOST_MODULE)
         build = _method(host, HOST_CLASS, "_build_rooms_tab")
@@ -260,7 +370,8 @@ class QtPreviewWiringTests(unittest.TestCase):
         self.assertIn("start", called, "右键菜单未启动预览")
         self.assertIn("remove_room", called, "右键菜单未提供「停止预览该房间」（只停这一路）")
         self.assertIn("set_main_room", called, "右键菜单未提供「设为主路」")
-        self.assertIn("_select_room", called, "右键预览后未同步选中行")
+        self.assertNotIn("_select_room", called,
+                         "右键菜单项不该切换选中行（预览不该连带切走 SC 面板与预览）")
         self.assertIn("_room_order", _attr_names(menu), "未按行取房间号")
 
     def test_stop_preview_closes_window_without_recursion(self):
@@ -517,39 +628,60 @@ class QtRoomListInteractionTests(unittest.TestCase):
             self.assertEqual(ast.literal_eval(kwargs["fit_height"]), False,
                              "拖动后重建行必须 fit_height=False")
 
-    def test_drag_is_insert_not_overwrite(self):
-        """拖动排序必须是**插入行**：QTableView 默认的覆盖模式会把数据糊到目标行上。
+    def test_right_click_does_not_change_selection(self):
+        """右键房间行只弹菜单，**不该改变选中**。
 
-        覆盖模式下放下鼠标不插入新行，而是把被拖行的数据 ``setData`` 覆盖到目标行对应单元格，
-        只覆盖前几列、目标行其余列还是原内容——现象就是「拖动的行盖在拖到的那一格上，连带把
-        后面的内容也串了」。
+        改了选中就会连带触发「切换直播间」：SC / 弹幕面板被切走，开着「跟随选中房间」时
+        连预览也会被切到那一行；菜单项本身按 ``indexAt`` 定位，与选中无关。
         """
         host = _tree(HOST_MODULE)
+        command = _method(host, "ProtectedLinkTable", "selectionCommand")
+        self.assertIn("RightButton", _attr_names(command), "未拦住「右键改选中」")
+        self.assertIn("NoUpdate", _attr_names(command), "未返回 NoUpdate（会改选中）")
+
+    def test_click_guard_covers_mouse_move(self):
+        """点击保护必须同时拦**按下 / 松开 / 移动**三种事件，少一种就会漏。
+
+        移动那条是自管拖动后新暴露的：以前按住移动由 ``QDrag`` 接管，Qt 的
+        ``mouseMoveEvent`` 不会去更新选中；关掉 Qt 拖放后它会按当前索引改选中，
+        于是「按住跳转列稍一移动，选中行就被改掉」（用户反馈保护失效）。
+        """
+        host = _tree(HOST_MODULE)
+        command = _method(host, "ProtectedLinkTable", "selectionCommand")
+        types = _attr_names(command)
+        for kind in ("MouseButtonPress", "MouseButtonRelease", "MouseMove"):
+            self.assertIn(kind, types, f"未拦截 {kind}（保护会在这个环节漏掉）")
+        menu = _method(host, HOST_CLASS, "_on_room_context_menu")
+        self.assertIn("indexAt", _called_attrs(menu), "未按右键位置定位房间")
+        self.assertNotIn("_select_room", _called_attrs(menu),
+                         "右键菜单项不该切换选中房间（预览不该连带切走 SC 面板）")
+
+    def test_drag_is_self_managed(self):
+        """拖动排序**不用 Qt 拖放**：平台拖放循环里滚轮收不到，且落数据是「覆盖 / 清空」语义。"""
+        host = _tree(HOST_MODULE)
+        init = _method(host, "ProtectedLinkTable", "__init__")
+        for attr in ("setDragEnabled", "setAcceptDrops", "setDragDropMode"):
+            self.assertIn(attr, _called_attrs(init),
+                          f"未关掉 Qt 拖放（{attr}）：会进平台拖放循环，滚轮收不到")
         build = _method(host, HOST_CLASS, "_build_rooms_tab")
-        calls = [node for node in ast.walk(build)
-                 if isinstance(node, ast.Call)
-                 and isinstance(node.func, ast.Attribute)
-                 and node.func.attr == "setDragDropOverwriteMode"]
-        self.assertTrue(calls, "未关闭 QTableView 默认的拖动覆盖模式（会糊在目标行上）")
-        self.assertEqual([ast.literal_eval(c.args[0]) for c in calls], [False],
-                         "拖动覆盖模式必须显式关掉（False）才算插入行")
+        self.assertNotIn("InternalMove", _attr_names(build),
+                         "主界面不应再启用 Qt 的内部移动（改由表格自管）")
 
     def test_drag_snapshot_and_finish(self):
-        """拖动要在 ``startDrag`` 记快照、在 ``drag->exec`` 结束后收尾，且落点自己算。
-
-        ``startDrag`` 里的 ``drag->exec()`` 是阻塞的，返回时这次拖放已彻底结束（含 Qt 对数据
-        的改动），所以收尾放那里最稳，且发生在同一帧内（用户看不到中间态）。
-        """
+        """自管拖动：移动超过阈值进入拖动模式 → 记快照 → 松手按「快照 + 插入位置」回报。"""
         host = _tree(HOST_MODULE)
-        start = _method(host, "ProtectedLinkTable", "startDrag")
-        self.assertIn("super", _names(start), "未让基类执行拖放")
-        self.assertIn("_finish_drag", _called_attrs(start), "拖放结束后未收尾")
-        self.assertIn("selectedIndexes", _called_attrs(start), "未记录被拖动的行")
-        self.assertIn("_drag_rooms", _attr_names(start), "未记录拖动前的行序快照")
-        finish = _method(host, "ProtectedLinkTable", "_finish_drag")
-        self.assertIn("on_reordered", _attr_names(finish), "收尾未回报快照与落点")
-        drop = _method(host, "ProtectedLinkTable", "dropEvent")
-        self.assertIn("drop_insert_row", _names(drop), "未自己算插入行号")
+        move = _method(host, "ProtectedLinkTable", "mouseMoveEvent")
+        self.assertIn("startDragDistance", _attr_names(move), "未用系统的拖动起始阈值")
+        self.assertIn("begin_drag", _called_attrs(move), "超过阈值未进入拖动模式")
+        self.assertIn("update_drag", _called_attrs(move), "拖动中未更新插入位置")
+        begin = _method(host, "ProtectedLinkTable", "begin_drag")
+        self.assertIn("_drag_rooms", _attr_names(begin), "未记录拖动前的行序快照")
+        self.assertIn("_dragging", _attr_names(begin), "未进入拖动状态")
+        release = _method(host, "ProtectedLinkTable", "mouseReleaseEvent")
+        self.assertIn("end_drag", _called_attrs(release), "松手未提交拖动")
+        end = _method(host, "ProtectedLinkTable", "end_drag")
+        self.assertIn("on_reordered", _attr_names(end), "收尾未回报快照与插入位置")
+        self.assertIn("_stop_autoscroll", _called_attrs(end), "收尾未停掉边缘自动滚动")
         init = _method(host, "ProtectedLinkTable", "__init__")
         self.assertIn("on_reordered", _attr_names(init), "未初始化拖动收尾回调")
 
@@ -564,34 +696,92 @@ class QtRoomListInteractionTests(unittest.TestCase):
         self.assertIn("visualRect", _called_attrs(helper), "未按行矩形细分上/下半")
         self.assertIn("DROP_EDGE_PX", _names(helper), "未用统一的边缘阈值")
 
-    def test_drag_hint_is_between_rows(self):
-        """拖动落点提示要画成**行间一条线**，不能框住整行（默认 OnItem 的画法）。"""
+    def test_saved_order_matches_display_order(self):
+        """保存时必须按**显示顺序**重排房间，否则拖动 / 手动排序重启后会丢（记忆排序）。
+
+        配置文件里 ``rooms`` 的顺序就是列表顺序（启动时 ``_room_order`` 由 ``entries.keys()``
+        初始化），所以排完不落盘 = 没记住。
+        """
         host = _tree(HOST_MODULE)
-        draw = _method(host, "DropLineStyle", "drawPrimitive")
-        called = _called_attrs(draw)
-        self.assertIn("drawLine", called, "未把落点提示画成线")
-        self.assertNotIn("drawRect", called, "不应再画方框")
-        self.assertIn("PE_IndicatorItemViewItemDrop", _attr_names(draw),
-                      "未拦截拖动落点提示的绘制")
+        save = _method(host, HOST_CLASS, "_save_config")
+        self.assertIn("ordered_room_ids", _names(save), "保存前未按显示顺序重排房间")
+        self.assertIn("_room_order", _attr_names(save), "未使用当前显示顺序")
+        self.assertIn("save_room_entries", _names(save), "未真正写盘")
+
+    def test_wheel_works_while_dragging(self):
+        """拖动中滚轮要能滚动列表——这正是放弃 Qt 拖放的原因（拖放循环里滚轮收不到）。"""
+        host = _tree(HOST_MODULE)
+        wheel = _method(host, "ProtectedLinkTable", "wheelEvent")
+        self.assertIn("_dragging", _attr_names(wheel), "未区分「拖动中 / 普通状态」")
+        self.assertIn("wheel_scroll_step", _names(wheel), "未按滚轮增量换算步长")
+        self.assertIn("verticalScrollBar", _called_attrs(wheel), "未滚动列表的滚动条")
+        self.assertIn("update_drag", _called_attrs(wheel),
+                      "滚动后未重算插入位置（提示线会停在旧位置）")
+        self.assertIn("super", _names(wheel), "普通状态应走默认滚动")
+
+    def test_drag_follows_pressed_row(self):
+        """拖动要按「鼠标按下的行」走，并把选中切到它。
+
+        跳转列（房间号 / 主播 / 提醒）按下时不改变选中，只看选中集合会拖走**上一次选中的
+        行**；不切选中还会让 Qt 的拖影与我们的快照对不上。
+        """
+        host = _tree(HOST_MODULE)
+        press = _method(host, "ProtectedLinkTable", "mousePressEvent")
+        self.assertIn("_press_row", _attr_names(press), "未记录鼠标按下的行")
         init = _method(host, "ProtectedLinkTable", "__init__")
-        self.assertIn("setStyle", _called_attrs(init), "未给房间列表应用插入线样式")
+        self.assertIn("_press_row", _attr_names(init), "未初始化 _press_row")
+        move = _method(host, "ProtectedLinkTable", "mouseMoveEvent")
+        self.assertIn("drag_source_rows", _names(move), "未按按下的行判定拖动源")
+        self.assertIn("selectRow", _called_attrs(move),
+                      "未把选中切到被拖的行（高亮会与拖动目标不一致）")
+
+    def test_order_changing_actions_save_after_reordering(self):
+        """改顺序的动作必须在**重排之后**保存，否则顺序不落盘（排序不记忆）。
+
+        配置里 ``rooms`` 的顺序就是列表顺序：先 ``_save_config()`` 再重排，等于存了个旧顺序，
+        重启自然被重置。
+        """
+        host = _tree(HOST_MODULE)
+
+        def first_line(node, attr):
+            lines = [call.lineno for call in ast.walk(node)
+                     if isinstance(call, ast.Call)
+                     and isinstance(call.func, ast.Attribute)
+                     and call.func.attr == attr]
+            return min(lines) if lines else None
+
+        for name, reorder in (("_on_sort_clicked", "_apply_sort"),
+                              ("_on_pin_live_toggled", "_populate_rows"),
+                              ("_on_add_result", "_insert_row")):
+            handler = _method(host, HOST_CLASS, name)
+            save = first_line(handler, "_save_config")
+            after = first_line(handler, reorder)
+            self.assertIsNotNone(save, f"{name} 未保存配置")
+            self.assertIsNotNone(after, f"{name} 未重排行序（{reorder}）")
+            self.assertGreater(save, after,
+                               f"{name} 必须先把顺序排好再保存（现在是先保存后重排）")
+
+    def test_drag_hint_is_between_rows(self):
+        """插入位置提示由表格**自己画**成一行细线（不再有 Qt 那套「框住整行」）。"""
+        host = _tree(HOST_MODULE)
+        paint = _method(host, "ProtectedLinkTable", "paintEvent")
+        self.assertIn("drawLine", _called_attrs(paint), "未把插入位置画成线")
+        self.assertNotIn("drawRect", _called_attrs(paint), "不应画方框")
+        self.assertIn("insert_indicator_y", _called_attrs(paint), "未按插入行取线位置")
+        self.assertIn("DROP_LINE_COLOR", _names(paint), "未用统一的提示色")
+        indicator = _method(host, "ProtectedLinkTable", "insert_indicator_y")
+        self.assertIn("visualRect", _called_attrs(indicator), "未按行矩形定位")
 
     def test_click_does_not_auto_scroll(self):
-        """点击 / 切换选中时不应自动滚动（autoScroll 关闭，仅拖动与键盘期间临时开）。"""
+        """点击 / 切换选中时不应自动滚动（autoScroll 关闭，仅键盘导航期间临时开）。"""
         host = _tree(HOST_MODULE)
         init = _method(host, "ProtectedLinkTable", "__init__")
         self.assertIn("setAutoScroll", _called_attrs(init), "未关闭「点击自动滚动」")
         values = [node.value for node in ast.walk(init) if isinstance(node, ast.Constant)]
         self.assertIn(False, values, "应传 False 关闭 autoScroll")
-        for name in ("dragEnterEvent", "keyPressEvent"):
-            handler = _method(host, "ProtectedLinkTable", name)
-            self.assertIn("setAutoScroll", _called_attrs(handler),
-                          f"{name} 未临时恢复自动滚动（拖动/键盘会不好用）")
-        # 拖动收尾（startDrag → _finish_drag）里恢复「不自动滚动」
-        for name in ("dragLeaveEvent", "_finish_drag"):
-            handler = _method(host, "ProtectedLinkTable", name)
-            self.assertIn("setAutoScroll", _called_attrs(handler),
-                          f"{name} 未恢复「不自动滚动」")
+        handler = _method(host, "ProtectedLinkTable", "keyPressEvent")
+        self.assertIn("setAutoScroll", _called_attrs(handler),
+                      "键盘导航未临时恢复自动滚动（方向键会跟不住）")
 
 
 class QtDanmakuEmoticonSwitchTests(unittest.TestCase):

@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -170,6 +170,13 @@ DRIFT_MIN_INTERVAL_S = 60.0
 
 CPU_CHECK_MS = 30 * 1000
 """进程 CPU 采样周期（资源保护）。"""
+
+AUDIO_DEVICE_CHECK_MS = 10 * 1000
+"""音频输出设备巡检周期：``QAudioOutput`` 创建后**不会**跟随系统默认设备切换。
+
+``QMediaDevices.audioOutputsChanged`` 在「设备列表没变、只是默认设备换了」时不一定触发，
+所以除了接信号，再用这个低频巡检兜底（只做一次设备比较，开销可忽略）。
+"""
 
 CPU_LIMIT = 0.70
 """进程 CPU 占用率告警线（1.0 = 一个核心跑满，多核可超过 1）。
@@ -476,6 +483,8 @@ class PreviewTile(QFrame):
         if self.room_id is None:
             return
         menu = QMenu(self)
+        # 浮窗本身可能是置顶窗口，菜单同样置顶才不会「看不见菜单却点得到」
+        menu.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         main_action = None
         if not self.is_main:
             main_action = menu.addAction("设为主路（有声音）")
@@ -531,6 +540,37 @@ class PreviewTile(QFrame):
             self.audio.setVolume(max(0, min(100, int(volume))) / 100.0)
         else:
             self.audio.setMuted(True)
+
+    def set_audio_device(self, device) -> bool:
+        """把这一路的音频输出切到指定设备（返回是否真的切了）。
+
+        三种做法都试过，前两种不行、第三种不即时，最终用**重新装载同一个地址**：
+        - 只调 ``setDevice()`` 而播放不停 → 声音仍从旧设备出（音频会话没换）；
+        - 播放中换一个 ``QAudioOutput`` 实例交给 ``setAudioOutput()`` → **播放器卡住**
+          （画面定格、之后彻底没声）；
+        - ``stop()`` 后只 ``play()`` → **常常起不来**，要等 5 秒健康检查才自愈。
+        所以这里按「换清晰度」同一套做法：``stop()`` → ``setDevice()`` → 先清空 source
+        再设回同一个地址 → ``play()``。代理地址是本机的、长期有效，重新拉流一两秒就回到画面，
+        不必等健康检查。
+        """
+        try:
+            if self.audio.device() == device:
+                return False
+            was_playing = self.player.playbackState() == QMediaPlayer.PlayingState
+            source = self.player.source()
+            if was_playing:
+                self.player.stop()
+            self.audio.setDevice(device)
+            if was_playing and not source.isEmpty():
+                self.player.setSource(QUrl())   # 先清空：同地址直接设不会重载（换清晰度同款坑）
+                self.player.setSource(source)
+                self.player.play()
+            log_live.debug("第 %s 路音频输出切换到「%s」（原本在播放：%s）",
+                           self.index + 1, device.description(), was_playing)
+        except Exception:  # 设备可能已被拔掉：不影响其它路
+            log_live.debug("第 %s 路切换音频输出设备失败", self.index + 1, exc_info=True)
+            return False
+        return True
 
     def set_status(self, text: str, *, error: bool = False) -> None:
         self._status = text
@@ -901,6 +941,18 @@ class PreviewWindow(QWidget):
         self._watch_reported = 0
         self._watch_next = LIVE_HEARTBEAT_DEFAULT_INTERVAL
         self._watch_room: Optional[int] = None
+        self._audio_timer: Optional[QTimer] = None
+        self._audio_device = QMediaDevices.defaultAudioOutput()
+        """当前预览声音使用的输出设备（``QAudioOutput`` 不会自动跟随系统切换，靠它比对）。"""
+        self._media_devices = None
+        """``QMediaDevices`` **实例**（信号只能从实例上接，且必须保住引用）。"""
+        try:
+            # 注意：`audioOutputsChanged` 是**实例信号**——写成 `QMediaDevices.audioOutputsChanged`
+            # 会抛 AttributeError（此前就是这样被 except 静默吞掉、信号从没接上，只能等 10 秒巡检）。
+            self._media_devices = QMediaDevices(self)
+            self._media_devices.audioOutputsChanged.connect(self._sync_audio_device)
+        except Exception:  # 个别平台 / 版本没有该信号：巡检仍会兜底
+            log_window.warning("未接入音频设备变化信号，改用巡检兜底", exc_info=True)
 
         self._build_ui()
         self._apply_config(config)
@@ -919,6 +971,10 @@ class PreviewWindow(QWidget):
         outer.setSpacing(4)
 
         head = QHBoxLayout()
+        # 显示 / 重新 show（切换置顶会重建窗口）时**不要抢焦点**：重建时焦点被拿走会让主界面
+        # 短暂"失灵"（用户反馈：置顶后没法正常操作主界面）。用户点击预览窗口时仍会正常激活它，
+        # 只是「显示本身」不再抢走主界面的焦点。
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.title_label = QLabel("直播预览")
         head.addWidget(self.title_label, 1)
         self.status_label = QLabel("")
@@ -1180,6 +1236,33 @@ class PreviewWindow(QWidget):
         for tile in self._tiles:
             tile.apply_audio(muted=self._mute, volume=self._volume)
 
+    def _sync_audio_device(self) -> None:
+        """让预览声音**跟随系统默认音频输出设备**。
+
+        ``QAudioOutput`` 创建后不会跟随系统切换（切到耳机后仍从旧设备出声，甚至直接没声），
+        所以默认设备一变就把每一路切过去，并重新下发音量 / 静音（切设备会重置输出状态）。
+        触发来源有两个：``QMediaDevices.audioOutputsChanged`` 信号，以及 10 秒一次的兜底巡检
+        （「设备列表没变、只是默认设备换了」时信号不一定发）。
+        """
+        device = QMediaDevices.defaultAudioOutput()
+        if device.isNull():
+            return
+        if device == self._audio_device:
+            # 默认级别看不到这条：排查「切了系统输出、预览没跟随」时打开调试日志
+            # （config.json 的 logging.level=DEBUG 或界面上勾「调试日志」），
+            # 就能判断 Qt 有没有感知到默认设备已经变了。
+            names = "、".join(tile.audio.device().description() for tile in self._tiles)
+            log_window.debug("音频设备巡检：系统默认输出「%s」，预览各路「%s」",
+                             device.description(), names)
+            return
+        self._audio_device = device
+        changed = sum(1 for tile in self._tiles if tile.set_audio_device(device))
+        if not changed:
+            return
+        self._apply_audio()
+        log_window.info("预览音频输出跟随系统切换到「%s」（%s 路）",
+                        device.description(), changed)
+
     def _reset_watch_counters(self) -> None:
         """主路变化：观看时长按新房间重新累计（同一时间只上报一个房间）。"""
         self._watch_reported = 0
@@ -1308,10 +1391,27 @@ class PreviewWindow(QWidget):
         self._apply_audio()
 
     def _on_top_toggled(self, checked: bool) -> None:
-        log_window.info("预览窗口置顶：%s", "开" if checked else "关")
+        """切换置顶：改窗口标志会隐藏并重建窗口，所以要先存几何、按切换前的可见性重新 show，
+        并保证显示时**不抢焦点**（见构造里的 ``WA_ShowWithoutActivating``）。
+
+        踩过的坑：
+        ① 判断可见性必须在 ``setWindowFlag`` **之前**——它会把窗口隐藏，之后判断恒为 False，
+           于是不 show、窗口直接消失（「取消置顶就消失」）；
+        ② 重建会把窗口重新摆到最前并**激活**自己，焦点从主界面被拿走；而置顶窗口还会把主界面
+           弹出的**右键菜单压在下面**（菜单仍抢占鼠标）——现象是「右键后菜单不显示、却在原位置
+           点到了菜单项」，接下来主界面像失灵（用户反馈）。现在切换后恢复位置尺寸、显示时不
+           激活，并且**弹出菜单自身也置顶**（见 `_on_room_context_menu`、弹幕菜单与格子菜单），
+           ``exec`` 激活后即可压在浮窗之上。
+          （试过用 Win32 ``SetWindowPos`` 绕开重建，但实测 ``WS_EX_TOPMOST`` 位未能真正清掉，
+          且它与 Qt 自己的标志不一致，后续任何 ``setWindowFlag`` 都会按旧标志覆盖回去。）
+        """
+        was_visible = self.isVisible()      # 必须在 setWindowFlag **之前**取
+        geometry = self.geometry()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(checked))
-        if self.isVisible():
-            self.show()  # 改窗口标志后需要重新 show 才生效
+        if was_visible:
+            self.setGeometry(geometry)      # 重建后位置尺寸可能被系统改掉，恢复回去
+            self.show()                     # 改窗口标志后需要重新 show 才生效
+        log_window.info("预览窗口置顶：%s", "开" if checked else "关")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
         """关闭浮窗：停所有路、回收代理，并让主界面复位按钮。"""
@@ -1413,10 +1513,15 @@ class PreviewWindow(QWidget):
             self._cpu_timer.timeout.connect(self._on_cpu_tick)
         self._cpu_timer.start(CPU_CHECK_MS)
         self._cpu_sample = (time.monotonic(), time.process_time())
+        if self._audio_timer is None:
+            self._audio_timer = QTimer(self)
+            self._audio_timer.timeout.connect(self._sync_audio_device)
+        self._audio_timer.start(AUDIO_DEVICE_CHECK_MS)
+        self._sync_audio_device()   # 打开预览时先对齐一次当前默认设备
 
     def _stop_timers(self) -> None:
         for timer in (self._refresh_timer, self._health_timer, self._cpu_timer,
-                      self._watch_timer):
+                      self._watch_timer, self._audio_timer):
             if timer is not None:
                 timer.stop()
 

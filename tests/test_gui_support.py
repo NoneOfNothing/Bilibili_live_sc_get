@@ -15,7 +15,12 @@ from blive_sc_get.api import (
     describe_send_error,
     parse_room_emoticon_packages,
 )
-from blive_sc_get.qt_app import move_items
+from blive_sc_get.qt_app import (
+    drag_source_rows,
+    move_items,
+    ordered_room_ids,
+    wheel_scroll_step,
+)
 from blive_sc_get.app_config import (
     DEFAULT_EMOTICON_TOOLTIP,
     AppConfig,
@@ -51,6 +56,78 @@ class MoveItemsTests(unittest.TestCase):
         self.assertEqual(move_items([11, 22], [], 0), [11, 22])
         self.assertEqual(move_items([11, 22], [5], 1), [11, 22])
         self.assertEqual(move_items([11, 22], [0], 99), [22, 11])
+
+
+class WheelScrollStepTests(unittest.TestCase):
+    """拖动中滚轮滚动（优化拖动体验）：向上 → 看更前面的行（负方向），一格 = 120。"""
+
+    def test_direction_and_notches(self):
+        self.assertEqual(wheel_scroll_step(120, 1), -1)
+        self.assertEqual(wheel_scroll_step(-120, 1), 1)
+        self.assertEqual(wheel_scroll_step(240, 1), -2)
+        self.assertEqual(wheel_scroll_step(-360, 10), 30)
+
+    def test_partial_notch_counts_as_one(self):
+        """触摸板 / 高精度滚轮会给出小于 120 的增量：按一格算，不能「滚了没反应」。"""
+        self.assertEqual(wheel_scroll_step(40, 1), -1)
+        self.assertEqual(wheel_scroll_step(-1, 1), 1)
+
+    def test_zero_delta_is_noop(self):
+        self.assertEqual(wheel_scroll_step(0, 1), 0)
+        self.assertEqual(wheel_scroll_step(0, 10), 0)
+
+    def test_single_step_never_zero(self):
+        """滚动条 singleStep 异常为 0 时也要能滚。"""
+        self.assertEqual(wheel_scroll_step(120, 0), -1)
+        self.assertEqual(wheel_scroll_step(-120, 0), 1)
+
+
+class DragSourceRowsTests(unittest.TestCase):
+    """拖动要按**鼠标按下的行**走（ROADMAP 75 后续）。
+
+    「受保护的跳转列」（房间号 / 主播 / 提醒）按下时不改变选中，所以只看选中集合会把
+    **上一次选中的行**拖走——用户反馈的「部分情况下拖动的是上一个选中的行」。
+    """
+
+    def test_pressed_row_wins_when_it_is_not_selected(self):
+        self.assertEqual(drag_source_rows([0], 2, 5), [2])
+        self.assertEqual(drag_source_rows([], 3, 5), [3])
+
+    def test_selection_is_kept_when_pressed_row_is_inside_it(self):
+        """按下的行本来就在选中集合里（多选拖动）→ 整体拖走，不能只拖一行。"""
+        self.assertEqual(drag_source_rows([0, 1, 2], 1, 5), [0, 1, 2])
+        self.assertEqual(drag_source_rows([2, 0, 1], 0, 5), [0, 1, 2])
+
+    def test_falls_back_to_selection_without_valid_press(self):
+        self.assertEqual(drag_source_rows([0, 1], None, 5), [0, 1])
+        self.assertEqual(drag_source_rows([0, 1], 99, 5), [0, 1])
+        self.assertEqual(drag_source_rows([], None, 5), [])
+        self.assertEqual(drag_source_rows([1, 0, 1], None, 5), [0, 1])
+
+
+class OrderedRoomIdsTests(unittest.TestCase):
+    """保存顺序 = 记忆排序：配置文件里 ``rooms`` 的顺序**就是**房间列表顺序。
+
+    因此保存前必须按当前显示顺序重排 ``entries``，否则拖动 / 手动排序 / 置顶的结果
+    重启后会被配置里的旧顺序覆盖（用户反馈「手动排序缺失记忆功能」）。
+    """
+
+    def test_reorders_entries_by_display_order(self):
+        self.assertEqual(ordered_room_ids([3, 1, 2], [1, 2, 3]), [3, 1, 2])
+        self.assertEqual(ordered_room_ids([2, 3, 1], [1, 2, 3]), [2, 3, 1])
+
+    def test_missing_rooms_are_appended(self):
+        """``order`` 里没提到的房间（刚加入还没进 ``_room_order``）补到末尾，不能丢。"""
+        self.assertEqual(ordered_room_ids([2], [1, 2, 3]), [2, 1, 3])
+        self.assertEqual(ordered_room_ids([], [7]), [7])
+
+    def test_unknown_and_duplicate_ids_are_ignored(self):
+        """已删除的房间忽略、重复的房间号去重。"""
+        self.assertEqual(ordered_room_ids([9, 2], [1, 2]), [2, 1])
+        self.assertEqual(ordered_room_ids([1, 1, 2], [1, 2]), [1, 2])
+
+    def test_empty_entries(self):
+        self.assertEqual(ordered_room_ids([1, 2], []), [])
 from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
 from blive_sc_get.gui_app import (
     DM_TEXT_MAX_LINES,

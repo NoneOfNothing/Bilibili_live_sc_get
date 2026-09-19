@@ -587,6 +587,8 @@ class DmPanel(QWidget):
         else:
             uname, content = "", ""
         menu = QMenu(self)
+        # 预览浮窗置顶时会压住这个菜单（菜单仍抢占鼠标 → 看不见却能点到），所以菜单也置顶
+        menu.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         act_reply = menu.addAction("回复该弹幕")
         act_reply.setEnabled(bool(mid))
         act_at = menu.addAction("@ 该用户")
