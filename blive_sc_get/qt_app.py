@@ -41,6 +41,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QPen,
     QFont,
     QFontMetrics,
     QTextBlockFormat,
@@ -59,8 +60,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProxyStyle,
     QPushButton,
     QSplitter,
+    QStyle,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -210,6 +213,71 @@ def compact_row_height(widget) -> int:
     return QFontMetrics(widget.font()).height() + TABLE_ROW_PADDING
 
 
+def move_items(items, src_rows, insert_at):
+    """把 ``src_rows`` 处的元素整体搬到 ``insert_at`` **之前**（插入语义，纯函数）。
+
+    ``insert_at`` 用**移动前**的下标表示「想插到哪个位置」——被拖元素自身先被抽走，
+    所以计算时要把落在它前面的源行数扣掉，否则往下拖会少挪一位。
+    """
+    picked = set(src_rows)
+    moving = [items[row] for row in sorted(picked) if 0 <= row < len(items)]
+    rest = [item for row, item in enumerate(items) if row not in picked]
+    removed_before = sum(1 for row in picked if row < insert_at)
+    pos = max(0, min(len(rest), insert_at - removed_before))
+    return rest[:pos] + moving + rest[pos:]
+
+
+DROP_EDGE_PX = 2
+"""落点判定的边缘宽度（与 Qt ``dropIndicatorPosition`` 的 ``Above``/``Below`` 阈值一致）。"""
+
+
+def drop_insert_row(table, y: int) -> int:
+    """按落点纵坐标 ``y`` 算「插到第几行之前」（纯函数，便于离线测试）。
+
+    与拖动提示线的位置**完全一致**：距该行上边界 ``DROP_EDGE_PX`` 内 → 插到该行之前，
+    距下边界同宽度内 → 插到该行之后；落在行中间（Qt 判 ``OnItem``，提示线画在该行顶边）
+    → 同样插到该行之前。落点不在任何行上（列表下方空白）→ 插到末尾。
+    """
+    row = table.rowAt(int(y))
+    if row < 0:
+        return table.rowCount()
+    rect = table.visualRect(table.model().index(row, 0))
+    if y <= rect.top() + DROP_EDGE_PX:
+        return row
+    if y >= rect.bottom() - DROP_EDGE_PX:
+        return row + 1
+    return row
+
+
+DROP_LINE_COLOR = "#2ecc71"
+"""拖动排序时「落点插入线」的颜色（与主路高亮同色系）。"""
+
+
+class DropLineStyle(QProxyStyle):
+    """把拖动落点提示画成**行间一条线**（Qt 默认在「落在行上」时会把整行框起来）。
+
+    Qt 的落点判定 ``dropIndicatorPosition`` 只把「距该行上/下边界 2px 以内」算作
+    ``AboveItem`` / ``BelowItem``（画线），落在行中间一律算 ``OnItem``（画方框——观感上像
+    选中了那一行，用户反馈「提示应该是行之间」）。而 ``OnItem`` 的实际插入位置正是**该行
+    之前**，把线画在该行顶部与之完全一致，所以这里**只改绘制、不动拖放行为**。
+    """
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:  # noqa: N802
+        if element == QStyle.PrimitiveElement.PE_IndicatorItemViewItemDrop:
+            rect = option.rect
+            if rect.isValid() and rect.width() > 0:
+                pen = QPen(QColor(DROP_LINE_COLOR))
+                pen.setWidth(2)
+                painter.save()
+                painter.setPen(pen)
+                # 线画在矩形**顶边**：Above/Below 时 Qt 给的是零高度的线位置、OnItem 时给的是
+                # 整行矩形，两种情况取 top() 的语义一致（都表示「插到这一行之前」）。
+                painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
+                painter.restore()
+                return
+        super().drawPrimitive(element, option, painter, widget)
+
+
 class ProtectedLinkTable(QTableWidget):
     """带「点击保护」的表格：点跳转列（房间号 / 主播 / 提醒）不改变选中行。
 
@@ -230,6 +298,92 @@ class ProtectedLinkTable(QTableWidget):
         self.link_columns: Tuple[int, ...] = ()
         self._press_pos: Optional[QPoint] = None
         self._press_cell: Tuple[int, int] = (-1, -1)
+        # 「点击不要自动滚动」（ROADMAP 74）：Qt 默认（autoScroll）会在 current 项变化时
+        # scrollTo 把它**完全**显示出来——点击只露出一半的行、或点击横向被裁掉的单元格时，
+        # 视图会自己跳一下。这里关掉，仅在**拖动排序 / 键盘导航**期间临时打开（见下面覆写）。
+        self.setAutoScroll(False)
+        # 拖动落点提示：把「框住整行」画成「行间一条线」（见 DropLineStyle；只改绘制，
+        # 拖放行为仍由 Qt 负责，插入位置与线的位置本来就一致）
+        self._drop_style = DropLineStyle(self.style())
+        self.setStyle(self._drop_style)
+        self.on_reordered = None
+        """拖动结束后的回调 ``(拖动前的房间号顺序, 被拖的行号, 插入行号)``（主界面注入）。
+
+        为什么不把落数据交给 Qt：``QTableWidget`` 内部移动用的是「覆盖目标单元格 / 清空源
+        单元格」语义（``dragDropOverwriteMode`` 在它身上不生效），放下后表格数据已被弄脏。
+        这里只回报「拖动前的快照 + 落点」，由主界面按**插入语义**重建行（见 :meth:`startDrag`）。
+        """
+        self._drag_rooms: List[int] = []
+        """本次拖动开始前的完整行序（房间号）——收尾重建的唯一依据。"""
+        self._drag_rows: List[int] = []
+        """本次拖动被拖动的行号。"""
+        self._drop_row: Optional[int] = None
+        """本次落点（插到第几行之前）；``None`` = 没落到本表上。"""
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self.setAutoScroll(True)   # 拖到边缘要能自动滚动
+        super().dragEnterEvent(event)
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().dragLeaveEvent(event)
+        self.setAutoScroll(False)
+
+    def room_id_at(self, row: int) -> Optional[int]:
+        """读**当前显示**在第 ``row`` 行的房间号（第 0 列文本；读不到给 ``None``）。"""
+        item = self.item(row, 0)
+        if item is None:
+            return None
+        try:
+            return int(item.text())
+        except (TypeError, ValueError):
+            return None
+
+    def startDrag(self, supported_actions) -> None:  # noqa: N802 - Qt 命名
+        """记录拖动前的行序快照；等这次拖放**彻底结束**后按插入语义重建行。
+
+        ``super().startDrag()`` 里的 ``drag->exec()`` 是**阻塞**的（一直等到松手/取消），
+        返回时 Qt 已经把它该做的都做了——包括对表格数据的改动。所以收尾放在这里最稳：
+        无论 Qt 把数据糊成什么样（覆盖目标单元格、清空甚至删掉源行），我们都用
+        「拖动前快照 + 落点」重建出正确结果，且发生在同一帧内（用户看不到中间态）。
+        """
+        self._drag_rows = sorted({index.row() for index in self.selectedIndexes()})
+        self._drag_rooms = [self.room_id_at(row) for row in range(self.rowCount())]
+        self._drop_row = None
+        try:
+            super().startDrag(supported_actions)
+        finally:
+            self._finish_drag()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """记录落点后交给基类；数据不靠它——重建在 :meth:`startDrag` 的收尾里做。"""
+        self._drop_row = drop_insert_row(self, event.position().y())
+        super().dropEvent(event)
+        self.setAutoScroll(False)
+
+    def _finish_drag(self) -> None:
+        """拖动收尾：把「拖动前快照 + 落点」回报给主界面重建（幂等，且与 Qt 的落数据无关）。
+
+        单独成方法还有个好处：**可以离线直接调它验证**——合成的 ``QDropEvent`` 交给
+        ``dropEvent()`` 会让 Qt 访问违例（实测 exit 0xC0000005），不能用来做自动化测试。
+        """
+        self.setAutoScroll(False)
+        rooms, rows, insert_at = self._drag_rooms, self._drag_rows, self._drop_row
+        self._drag_rooms, self._drag_rows, self._drop_row = [], [], None
+        rooms = [room for room in rooms if room is not None]
+        if not rooms or not callable(self.on_reordered):
+            return
+        if insert_at is None:
+            # 没落到本表上（拖到窗口外 / ESC 取消）：顺序照旧，但**仍要刷回快照状态**——
+            # Qt 可能已经把源行清空或删掉了（clearOrRemove 只认 dragDropMode）。
+            rows, insert_at = [], 0
+        self.on_reordered(rooms, rows, insert_at)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self.setAutoScroll(True)   # 方向键移动 current 时要跟随
+        try:
+            super().keyPressEvent(event)
+        finally:
+            self.setAutoScroll(False)
 
     def selectionCommand(self, index, event=None):  # noqa: N802 - Qt 命名
         # 按下与松开都要拦：Qt 在「按下未改变选中」时会在**松开时补一次选中**
@@ -660,12 +814,21 @@ class QtScMonitorApp(QMainWindow):
         self.table.setAcceptDrops(True)
         self.table.setDropIndicatorShown(True)
         self.table.setDragDropMode(QTableWidget.InternalMove)
+        # Qt 自己的落数据语义**不能用**（ROADMAP 75 的真正根因）：QTableView 上
+        # dragDropOverwriteMode **默认为 true**，放下鼠标时把被拖行的数据从落点那一列开始
+        # **覆盖到目标行**上（拖到行中间就从中间那列往后覆盖；只覆盖前几列、目标行其余列仍是
+        # 原内容——「拖动的行盖在那一格上、连带串了后面的内容」）。即使关掉它，QTableWidget 的
+        # 内部移动仍走「插入/删除 + 清空源单元格」那套，落点语义也不受我们控制。所以这里只借用
+        # Qt 的**拖动交互与落点提示**，落数据一律由 ProtectedLinkTable 在拖动收尾时按「拖动前的
+        # 快照 + 落点」重建（真正的插入语义）。
+        self.table.setDragDropOverwriteMode(False)
         self.table.linkClicked.connect(self._on_tree_cell_clicked)
         # 右键房间行：预览该房间 / 停止预览（工具栏「预览」按钮之外的第二入口）
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_room_context_menu)
-        if hasattr(self.table, "rowsMoved"):
-            self.table.rowsMoved.connect(self._on_tree_rows_moved)
+        # 拖动排序：表格只回报「拖动前的行序快照 + 落点」，由主界面按**插入语义**重建行
+        # （Qt 自己的落数据是「覆盖目标单元格 / 清空源单元格」语义，不能用，见 ProtectedLinkTable）
+        self.table.on_reordered = self._on_rows_reordered
         room_layout.addWidget(self.table, 1)
 
         # 房间操作行：备注 / 启停监听 / 删除
@@ -929,7 +1092,13 @@ class QtScMonitorApp(QMainWindow):
             table.setMaximumHeight(MAX_WIDGET_SIZE)
         self._apply_pane_ratio()
 
-    def _populate_rows(self) -> None:
+    def _populate_rows(self, *, fit_height: bool = True) -> None:
+        """按 ``_room_order`` 重建全部行。
+
+        ``fit_height=False``：只重建行、**不重排板块高度**。拖动排序后重建时必须用它——
+        ``_fit_table_height`` 会走 ``_apply_pane_ratio`` 按默认占比重新分配三个板块，
+        把用户拖好的分隔条位置**重置**，而拖动一行并没有改变行数，不该动布局。
+        """
         self.table.setRowCount(0)
         for room_id in self._room_order:
             # 与 Tk 版一致：未启用的房间默认落到 disabled，避免配色/状态误判
@@ -939,15 +1108,20 @@ class QtScMonitorApp(QMainWindow):
             self._insert_row(room_id)
         # 粉丝牌页任务列表跟随直播间列表顺序
         self.medal_tab.sync_task_rows()
-        self._fit_table_height()
+        if fit_height:
+            self._fit_table_height()
 
     def _insert_row(self, room_id: int) -> None:
+        """插入一行。**只负责行本身**——板块高度由调用方按需重排（见 ``_populate_rows``）。
+
+        这里不能再自己调 ``_fit_table_height()``：``_populate_rows(fit_height=False)``（拖动排序
+        后重建）会逐行调它，那样等于每插一行就把用户拖好的分隔条比例重置一次。
+        """
         if room_id not in self._room_order:
             self._room_order.append(room_id)
         row = self._room_order.index(room_id)
         self.table.insertRow(row)
         self._refresh_row(room_id)
-        self._fit_table_height()
 
     def _refresh_row(self, room_id: int) -> None:
         if room_id not in self._room_order:
@@ -1127,25 +1301,39 @@ class QtScMonitorApp(QMainWindow):
             return self._room_order[row]
         return None
 
-    def _on_tree_rows_moved(self, *_args) -> None:
-        """拖拽排序后按当前行序重建 _room_order 并持久化。"""
-        new_order: List[int] = []
-        for row in range(self.table.rowCount()):
-            room_id = self._room_id_at_row(row)
-            if room_id is not None and room_id not in new_order:
-                new_order.append(room_id)
-        # 补齐因增删可能遗漏但仍在 entries 中的房间
-        for rid in self.entries:
-            if rid not in new_order:
-                new_order.append(rid)
+    def _on_rows_reordered(self, rooms: List[int], src_rows: List[int],
+                           insert_at: int) -> None:
+        """拖动排序收尾（自管拖放）：按「拖动前的行序 + 落点」重建行并持久化。
+
+        ``rooms``：**拖动前**的完整行序（房间号）；``src_rows``：被拖动的行号；``insert_at``：
+        插到第几行之前——三者由 ``ProtectedLinkTable`` 在拖动结束时回报。之所以要这么绕，是
+        因为 Qt 对 ``QTableWidget`` 的内部移动用的是「覆盖目标单元格 / 清空源单元格」语义
+        （``dragDropOverwriteMode`` 在它身上不起作用），放下后表格数据已被弄脏，无法再从表格
+        读顺序，只能按拖动前的快照重建。
+
+        重建时**不重排板块高度**（``fit_height=False``）：``_fit_table_height`` 会走
+        ``_apply_pane_ratio`` 按默认占比重新分配三个区块，把用户拖好的分隔条比例重置——而拖动
+        一行并没有改变行数（用户反馈「拖动还会导致界面比例重置」）。
+        """
+        new_order = move_items(rooms, src_rows, insert_at)
+        dragged = rooms[src_rows[0]] if src_rows and src_rows[0] < len(rooms) else None
         self._room_order = new_order
         self._save_config()
         log_room.info("拖动排序完成，新顺序：%s", "、".join(str(r) for r in new_order))
-        # 重建行以刷新选中高亮顺序（保持选中房间）
-        selected = self._get_selected_room_id()
-        self._populate_rows()
-        if selected is not None and selected in self._room_order:
-            self.table.selectRow(self._room_order.index(selected))
+        selected = dragged if dragged is not None else self._get_selected_room_id()
+        # 重建行期间屏蔽选中信号：清空 → 重填 → 重新选中会连着触发几次「切换直播间」，把
+        # SC / 弹幕面板整段刷掉（拖动一行不该换房间）。
+        self.table.blockSignals(True)
+        try:
+            self._populate_rows(fit_height=False)
+        finally:
+            self.table.blockSignals(False)
+        if selected is not None and selected in new_order:
+            self.table.selectRow(new_order.index(selected))
+        if self._get_selected_room_id() != self._selected_room_id:
+            # 选中确实变了（信号被屏蔽时丢掉了触发）才补一次；没变说明面板本来就对，
+            # 不必重复拉弹幕选项、重复切预览
+            self._on_room_selected()
 
     def _open_room_link(self, room_id: int, col: int) -> None:
         """房间列→直播间地址；主播列→主播主页。"""
@@ -1307,6 +1495,7 @@ class QtScMonitorApp(QMainWindow):
             self.anchor_names[room_id] = payload["anchor_name"]
         self._save_config()
         self._insert_row(room_id)
+        self._fit_table_height()         # 多了一行：重排板块高度（_insert_row 本身不再做）
         self.medal_tab.sync_task_rows()  # 粉丝牌页新增行并保持顺序
         self._select_room(room_id)
         uid = int(payload.get("uid") or 0)

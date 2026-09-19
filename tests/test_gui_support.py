@@ -15,11 +15,42 @@ from blive_sc_get.api import (
     describe_send_error,
     parse_room_emoticon_packages,
 )
+from blive_sc_get.qt_app import move_items
 from blive_sc_get.app_config import (
     DEFAULT_EMOTICON_TOOLTIP,
     AppConfig,
     load_app_config,
 )
+
+
+class MoveItemsTests(unittest.TestCase):
+    """拖动排序的**插入**语义（ROADMAP 75）：把被拖的行整体插到落点，而不是覆盖目标行。
+
+    ``insert_at`` 用**移动前**的行号表示「插到第几行之前」（与落点提示线一致）。
+    """
+
+    def test_move_one_row_to_later_position(self):
+        # 把 11 拖到第 3 行之前（= 33 之后）
+        self.assertEqual(move_items([11, 22, 33, 44], [0], 3), [22, 33, 11, 44])
+
+    def test_move_to_front_and_back(self):
+        self.assertEqual(move_items([11, 22, 33], [2], 0), [33, 11, 22])
+        self.assertEqual(move_items([11, 22, 33], [0], 3), [22, 33, 11])
+
+    def test_dropping_on_itself_keeps_order(self):
+        """拖到自己身上（上边缘 / 下边缘）不应改变顺序——否则每次轻微抖动都会挪位。"""
+        self.assertEqual(move_items([11, 22, 33], [1], 1), [11, 22, 33])
+        self.assertEqual(move_items([11, 22, 33], [1], 2), [11, 22, 33])
+
+    def test_move_multiple_rows_together(self):
+        self.assertEqual(move_items([11, 22, 33, 44], [0, 1], 4), [33, 44, 11, 22])
+        self.assertEqual(move_items([11, 22, 33, 44], [2, 3], 0), [33, 44, 11, 22])
+
+    def test_cancelled_or_bogus_drag_keeps_order(self):
+        """拖动被取消（没有源行）或行号越界时，顺序原样返回、不抛异常。"""
+        self.assertEqual(move_items([11, 22], [], 0), [11, 22])
+        self.assertEqual(move_items([11, 22], [5], 1), [11, 22])
+        self.assertEqual(move_items([11, 22], [0], 99), [22, 11])
 from blive_sc_get.client import RECONNECT_MAX_DELAY, RoomClient, compute_reconnect_delay
 from blive_sc_get.gui_app import (
     DM_TEXT_MAX_LINES,

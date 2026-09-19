@@ -478,6 +478,122 @@ class QtPreviewWiringTests(unittest.TestCase):
         self.assertIn("is_main", _attr_names(audio), "未区分主路/副路的声音")
 
 
+class QtRoomListInteractionTests(unittest.TestCase):
+    """房间列表交互（ROADMAP 74/75）：拖动排序不得错位、点击不得自动滚动。"""
+
+    def test_reorder_uses_snapshot_and_drop_position(self):
+        """拖动排序按「拖动前的快照 + 落点」重建，不读被 Qt 弄脏的表格。
+
+        Qt 对 ``QTableWidget`` 的内部移动是「覆盖目标单元格 / 清空源单元格」语义，放下之后
+        表格数据已不可信，所以顺序只能由快照 + 落点算出来。
+        """
+        host = _tree(HOST_MODULE)
+        handler = _method(host, HOST_CLASS, "_on_rows_reordered")
+        self.assertIn("move_items", _names(handler), "未按插入语义重排")
+        self.assertNotIn("_room_id_at_row", _called_attrs(handler),
+                         "不能按行号索引旧顺序（错位的旧根因）")
+        build = _method(host, HOST_CLASS, "_build_rooms_tab")
+        self.assertIn("on_reordered", _attr_names(build), "未接线拖动收尾回调")
+        self.assertNotIn("rowsMoved", _attr_names(build),
+                         "拖动排序不应再依赖 rowsMoved（统一走自管收尾）")
+
+    def test_repopulate_after_drag_keeps_pane_ratio(self):
+        """拖动后重建行**不能**重排板块高度：否则用户拖好的分隔条比例被重置。"""
+        host = _tree(HOST_MODULE)
+        handler = _method(host, HOST_CLASS, "_on_rows_reordered")
+        self.assertNotIn("_fit_table_height", _called_attrs(handler),
+                         "拖动排序不该重排板块高度（会按默认占比重置分隔条）")
+        # _insert_row 自己不能再重排高度：否则重建时逐行触发，等于把比例重置 N 次
+        insert = _method(host, HOST_CLASS, "_insert_row")
+        self.assertNotIn("_fit_table_height", _called_attrs(insert),
+                         "_insert_row 不能自己重排板块高度（会让 fit_height=False 失效）")
+        calls = [node for node in ast.walk(handler)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "_populate_rows"]
+        self.assertTrue(calls, "未重建行")
+        for call in calls:
+            kwargs = {kw.arg: kw.value for kw in call.keywords}
+            self.assertIn("fit_height", kwargs, "重建行未显式关掉高度重排")
+            self.assertEqual(ast.literal_eval(kwargs["fit_height"]), False,
+                             "拖动后重建行必须 fit_height=False")
+
+    def test_drag_is_insert_not_overwrite(self):
+        """拖动排序必须是**插入行**：QTableView 默认的覆盖模式会把数据糊到目标行上。
+
+        覆盖模式下放下鼠标不插入新行，而是把被拖行的数据 ``setData`` 覆盖到目标行对应单元格，
+        只覆盖前几列、目标行其余列还是原内容——现象就是「拖动的行盖在拖到的那一格上，连带把
+        后面的内容也串了」。
+        """
+        host = _tree(HOST_MODULE)
+        build = _method(host, HOST_CLASS, "_build_rooms_tab")
+        calls = [node for node in ast.walk(build)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "setDragDropOverwriteMode"]
+        self.assertTrue(calls, "未关闭 QTableView 默认的拖动覆盖模式（会糊在目标行上）")
+        self.assertEqual([ast.literal_eval(c.args[0]) for c in calls], [False],
+                         "拖动覆盖模式必须显式关掉（False）才算插入行")
+
+    def test_drag_snapshot_and_finish(self):
+        """拖动要在 ``startDrag`` 记快照、在 ``drag->exec`` 结束后收尾，且落点自己算。
+
+        ``startDrag`` 里的 ``drag->exec()`` 是阻塞的，返回时这次拖放已彻底结束（含 Qt 对数据
+        的改动），所以收尾放那里最稳，且发生在同一帧内（用户看不到中间态）。
+        """
+        host = _tree(HOST_MODULE)
+        start = _method(host, "ProtectedLinkTable", "startDrag")
+        self.assertIn("super", _names(start), "未让基类执行拖放")
+        self.assertIn("_finish_drag", _called_attrs(start), "拖放结束后未收尾")
+        self.assertIn("selectedIndexes", _called_attrs(start), "未记录被拖动的行")
+        self.assertIn("_drag_rooms", _attr_names(start), "未记录拖动前的行序快照")
+        finish = _method(host, "ProtectedLinkTable", "_finish_drag")
+        self.assertIn("on_reordered", _attr_names(finish), "收尾未回报快照与落点")
+        drop = _method(host, "ProtectedLinkTable", "dropEvent")
+        self.assertIn("drop_insert_row", _names(drop), "未自己算插入行号")
+        init = _method(host, "ProtectedLinkTable", "__init__")
+        self.assertIn("on_reordered", _attr_names(init), "未初始化拖动收尾回调")
+
+    def test_drop_insert_row_matches_hint_line(self):
+        """插入行号的计算必须与提示线一致（上半/行中间 → 插到该行之前）。"""
+        host = _tree(HOST_MODULE)
+        helper = next((node for node in ast.walk(host)
+                       if isinstance(node, ast.FunctionDef) and node.name == "drop_insert_row"),
+                      None)
+        self.assertIsNotNone(helper, "未找到 drop_insert_row")
+        self.assertIn("rowAt", _called_attrs(helper), "未按落点找行")
+        self.assertIn("visualRect", _called_attrs(helper), "未按行矩形细分上/下半")
+        self.assertIn("DROP_EDGE_PX", _names(helper), "未用统一的边缘阈值")
+
+    def test_drag_hint_is_between_rows(self):
+        """拖动落点提示要画成**行间一条线**，不能框住整行（默认 OnItem 的画法）。"""
+        host = _tree(HOST_MODULE)
+        draw = _method(host, "DropLineStyle", "drawPrimitive")
+        called = _called_attrs(draw)
+        self.assertIn("drawLine", called, "未把落点提示画成线")
+        self.assertNotIn("drawRect", called, "不应再画方框")
+        self.assertIn("PE_IndicatorItemViewItemDrop", _attr_names(draw),
+                      "未拦截拖动落点提示的绘制")
+        init = _method(host, "ProtectedLinkTable", "__init__")
+        self.assertIn("setStyle", _called_attrs(init), "未给房间列表应用插入线样式")
+
+    def test_click_does_not_auto_scroll(self):
+        """点击 / 切换选中时不应自动滚动（autoScroll 关闭，仅拖动与键盘期间临时开）。"""
+        host = _tree(HOST_MODULE)
+        init = _method(host, "ProtectedLinkTable", "__init__")
+        self.assertIn("setAutoScroll", _called_attrs(init), "未关闭「点击自动滚动」")
+        values = [node.value for node in ast.walk(init) if isinstance(node, ast.Constant)]
+        self.assertIn(False, values, "应传 False 关闭 autoScroll")
+        for name in ("dragEnterEvent", "keyPressEvent"):
+            handler = _method(host, "ProtectedLinkTable", name)
+            self.assertIn("setAutoScroll", _called_attrs(handler),
+                          f"{name} 未临时恢复自动滚动（拖动/键盘会不好用）")
+        # 拖动收尾（startDrag → _finish_drag）里恢复「不自动滚动」
+        for name in ("dragLeaveEvent", "_finish_drag"):
+            handler = _method(host, "ProtectedLinkTable", name)
+            self.assertIn("setAutoScroll", _called_attrs(handler),
+                          f"{name} 未恢复「不自动滚动」")
+
+
 class QtDanmakuEmoticonSwitchTests(unittest.TestCase):
     """「弹幕表情图」开关的接线：界面勾选框 → 面板 → 渲染/还原。"""
 
