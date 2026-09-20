@@ -282,6 +282,23 @@ def build_sc_segments(time_str: str, sc: dict, deleted: bool = False,
     return segments
 
 
+def clamp_window_rect(rect, screen_w: int, screen_h: int):
+    """把窗口矩形收拢到屏幕内（ROADMAP 84 的房间独立窗口几何记忆）。
+
+    记忆的位置可能来自已经拔掉的显示器或分辨率变化的机器，照原样恢复会让窗口跑到
+    屏幕外、用户以为「窗口没打开」。``rect`` 为 ``(x, y, w, h)``；只要窗口仍有可点
+    区域留在屏幕内就原样返回，否则居中到屏幕并收缩到屏幕尺寸内。
+    """
+    x, y, w, h = (int(value) for value in rect)
+    screen_w = max(200, int(screen_w))
+    screen_h = max(150, int(screen_h))
+    if 0 <= x <= screen_w - 120 and 0 <= y <= screen_h - 60 and w > 0 and h > 0:
+        return x, y, min(w, screen_w), min(h, screen_h)
+    w = max(200, min(w, screen_w))
+    h = max(150, min(h, screen_h))
+    return max(0, (screen_w - w) // 2), max(0, (screen_h - h) // 2), w, h
+
+
 def text_scrolled_to_bottom(yview: tuple, tolerance: float = 0.001) -> bool:
     """根据 tk.Text.yview() 返回值判断视图是否位于（接近）最底部。
 
@@ -724,6 +741,8 @@ class ScMonitorApp:
         self._dm_grew_delta = 0  # 弹幕区向下扩展的像素数
         self._pane_ratio_done = False  # 三板块默认占比是否已应用（仅首次布局）
         self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
+        # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
+        self._room_windows: Dict[int, object] = {}
         # 发送弹幕相关状态（仅主线程读写）
         self._last_dm_send: Dict[int, float] = {}   # 房间号 -> 上次发送时间(monotonic)，冷却用
         self._room_id_map: Dict[int, int] = {}      # 输入房间号 -> 真实房间号
@@ -965,6 +984,8 @@ class ScMonitorApp:
         self.tree.bind("<B1-Motion>", self._on_tree_drag_motion, add=True)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release, add=True)
         self.tree.bind("<<TreeviewColumnResize>>", self._clamp_columns_soon, add=True)
+        # 右键房间行：打开该直播间的独立窗口（只含 SC + 弹幕，见 ROADMAP 84）
+        self.tree.bind("<Button-3>", self._on_tree_right_click, add=True)
 
         # 房间操作行控件：备注 / 启停监听 / 删除（启用状态由 _refresh_buttons 统一控制）
         ttk.Label(self.room_actions, text="备注:").pack(side="left")
@@ -2300,12 +2321,93 @@ class ScMonitorApp:
         self.root.geometry(geo)
         self._dm_grew = visible
 
+    # ---------- 房间独立窗口（ROADMAP 84） ----------
+
+    def register_room_window(self, window) -> None:
+        """登记房间独立窗口（一房一窗：同房间重复打开只前置已有窗口）。"""
+        self._room_windows[int(window.room_id())] = window
+
+    def unregister_room_window(self, window) -> None:
+        room_id = int(window.room_id())
+        if self._room_windows.get(room_id) is window:
+            self._room_windows.pop(room_id, None)
+
+    def room_windows_for(self, room_id) -> List[object]:
+        window = self._room_windows.get(int(room_id)) if room_id is not None else None
+        return [window] if window is not None else []
+
+    def load_room_window_geometry(self, room_id: int):
+        """读取某房间独立窗口记忆的几何（``(x, y, w, h)``；越界则收拢到屏内）。"""
+        raw = (self.ui_prefs.get("room_windows") or {}).get(str(int(room_id)))
+        if not isinstance(raw, dict):
+            return None
+        try:
+            rect = (int(raw["x"]), int(raw["y"]),
+                    int(raw["width"]), int(raw["height"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except tk.TclError:
+            return rect
+        return clamp_window_rect(rect, screen_w, screen_h)
+
+    def save_room_window_geometry(self, room_id: int, geometry: str) -> None:
+        """记住某房间独立窗口的位置尺寸（写 ``ui.room_windows``；同值不写盘）。"""
+        try:
+            size_part, *rest = str(geometry).split("+")
+            width, height = (int(value) for value in size_part.split("x"))
+            x = int(rest[0]) if len(rest) > 0 else 0
+            y = int(rest[1]) if len(rest) > 1 else 0
+        except (TypeError, ValueError):
+            return
+        memory = self.ui_prefs.get("room_windows")
+        if not isinstance(memory, dict):
+            memory = {}
+            self.ui_prefs["room_windows"] = memory
+        value = {"x": x, "y": y, "width": width, "height": height}
+        if memory.get(str(int(room_id))) == value:
+            return
+        memory[str(int(room_id))] = value
+        self._save_config()
+
+    def open_room_window(self, room_id: int) -> None:
+        """打开 / 前置某个直播间的独立窗口（房间列表右键菜单入口）。"""
+        room_id = int(room_id)
+        window = self._room_windows.get(room_id)
+        if window is not None:
+            window.deiconify()
+            window.lift()
+            log_window.info("房间 %s 的独立窗口已存在，前置显示", room_id)
+            return
+        from .tk_room_window import RoomChatWindow
+
+        window = RoomChatWindow(self, room_id)
+        window.restore_geometry()
+
+    def _close_room_windows(self) -> None:
+        """退出程序时回收所有独立窗口（各自保存几何、注销视图）。"""
+        for window in list(self._room_windows.values()):
+            window.shutdown()
+
+    def _dm_rooms(self) -> set:
+        """需要接收弹幕的房间集合：主界面（开关开启时的选中房间）+ 各独立窗口房间。
+
+        独立窗口的弹幕区恒显示，因此即使主界面「弹幕」开关关着，也照样接收其房间的
+        弹幕（否则窗口里永远没有内容）。
+        """
+        rooms = set()
+        if self.dm_var.get() and self._selected_room_id is not None:
+            rooms.add(int(self._selected_room_id))
+        rooms.update(int(room_id) for room_id in self._room_windows)
+        return rooms
+
     def _apply_dm_gate(self) -> None:
-        """按开关与当前选中房间设置各 client 的弹幕接收门控。"""
-        enabled = bool(self.dm_var.get())
-        selected = self._selected_room_id
+        """按开关与各视图绑定房间设置各 client 的弹幕接收门控（见 _dm_rooms）。"""
+        rooms = self._dm_rooms()
         for room_id, (client, _task) in self.room_tasks.items():
-            client.set_danmaku_enabled(enabled and room_id == selected)
+            client.set_danmaku_enabled(room_id in rooms)
 
     def _clear_dm_view(self) -> None:
         self.dm_text.configure(state="normal")
@@ -3656,6 +3758,10 @@ class ScMonitorApp:
             self.client_states.pop(room_id, None)
             self.live_state.pop(room_id, None)
             self._emoticon_memory.pop(room_id, None)  # 表情包记忆随房间一并清理
+            # 房间被删除：一并关掉它的独立窗口（窗口里已没有任何可显示的内容）
+            window = self._room_windows.get(int(room_id))
+            if window is not None:
+                window.shutdown()
         self._save_config()
         for room_id in valid:
             if self.tree.exists(str(room_id)):
@@ -3838,6 +3944,28 @@ class ScMonitorApp:
             self.xscroll.pack(side="bottom", fill="x")
         elif not overflow and shown:
             self.xscroll.pack_forget()
+
+    def _on_tree_right_click(self, event) -> None:
+        """房间列表右键：打开该直播间的独立窗口（不改变当前选中行）。"""
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        try:
+            room_id = int(iid)
+        except ValueError:
+            return
+        if room_id not in self.entries:
+            return
+        anchor = self.anchor_names.get(room_id) or "未知主播"
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"房间 {room_id}（{anchor}）", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="打开独立窗口",
+                         command=lambda rid=room_id: self.open_room_window(rid))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _on_room_selected(self, _event=None) -> None:
         self._flush_note()
@@ -4344,16 +4472,25 @@ class ScMonitorApp:
                 self._refresh_row(room_id)
             if room_id == self._selected_room_id:
                 self._update_sc_header(room_id)
+            for window in self.room_windows_for(room_id):
+                window.on_meta_changed()
         elif event_type == "sc":
+            windows = self.room_windows_for(room_id)
+            if room_id == self._selected_room_id or windows:
+                # 累计数：主界面选中该房间、或该房间有独立窗口时需要维护
+                self._sc_total[room_id] = self._sc_total.get(room_id, 0) + 1
             if room_id == self._selected_room_id:
                 self._append_sc(payload.get("time_received", ""), payload.get("sc") or {},
                                 pending=not payload.get("saved", True))
-                self._sc_total[room_id] = self._sc_total.get(room_id, 0) + 1
                 self._update_sc_total_label()
+            for window in windows:
+                window.on_sc(payload)
         elif event_type == "delete":
             if room_id == self._selected_room_id:
                 for sc_id in payload.get("ids", []):
                     self._mark_sc_deleted(sc_id)
+            for window in self.room_windows_for(room_id):
+                window.on_delete(payload.get("ids", []))
         elif event_type == "stopped":
             self.client_states[room_id] = "stopped"
             self._refresh_row(room_id)
@@ -4361,8 +4498,10 @@ class ScMonitorApp:
             self.client_states[room_id] = "occupied"
             self._refresh_row(room_id)
         elif event_type == "dm":
-            # 弹幕：加入待渲染批次，由 _poll_queue 周期末统一插入当前房间视图
-            self._dm_batch.append(payload)
+            # 弹幕：只有「需要显示它」的视图存在时才留（主界面当前房间 / 独立窗口），
+            # 由 _poll_queue 周期末统一插入，降低重排开销
+            if room_id == self._selected_room_id or self.room_windows_for(room_id):
+                self._dm_batch.append(payload)
         elif event_type == "online_count":
             # 同接：弹幕服务器推送的实时在线人数
             count = int(payload.get("count") or 0)
@@ -4370,12 +4509,16 @@ class ScMonitorApp:
                 self.viewers[room_id] = count
                 if room_id == self._selected_room_id:
                     self._update_sc_header(room_id)
+                for window in self.room_windows_for(room_id):
+                    window.on_meta_changed()
         elif event_type == "guards":
             num = int(payload.get("num") or -1)
             if num >= 0:
                 self.guard_num[room_id] = num
                 if room_id == self._selected_room_id:
                     self._update_sc_header(room_id)
+                for window in self.room_windows_for(room_id):
+                    window.on_meta_changed()
         elif event_type == "reconnecting":
             # 细粒度重连轨迹（默认日志级别不显示）；INFO 级轨迹由 client 自身的
             # 「连接中断 / N 秒后重连」日志给出，避免重复刷屏
@@ -4540,6 +4683,9 @@ class ScMonitorApp:
                     self._on_cookie_from_plugin_result(item[1])
                 elif kind == "dm_send_result":
                     self._on_dm_send_result(item[1])
+                    # 独立窗口发起的发送请求也要把结果回投（各窗口自行按房间过滤）
+                    for window in list(self._room_windows.values()):
+                        window.on_dm_send_result(item[1])
                 elif kind == "dm_state":
                     # 登录态变化（如刚获取 Cookie）后刷新门控并补拉可用颜色/样式；
                     # 可用表情随登录身份变化，缓存与刷新冷却一并失效
@@ -4551,8 +4697,12 @@ class ScMonitorApp:
                     self._on_dm_config(item[1])
                 elif kind == "emoticons":
                     self._on_emoticons(item[1])
+                    for window in list(self._room_windows.values()):
+                        window.on_emoticons(item[1])
                 elif kind == "emoticon_image":
                     self._on_emoticon_image(item[1])
+                    for window in list(self._room_windows.values()):
+                        window.on_emoticon_image(item[1])
                 elif kind == "medal_list":
                     self._on_medal_list(item[1])
                 elif kind == "medal_task_info":
@@ -4571,8 +4721,14 @@ class ScMonitorApp:
         if self._dm_batch:
             batch, self._dm_batch = self._dm_batch, []
             selected = self._selected_room_id
-            self._append_dm_batch(
-                [d for d in batch if d.get("room_id") == selected])
+            own = [d for d in batch if d.get("room_id") == selected]
+            if own:
+                self._append_dm_batch(own)
+            # 各房间独立窗口各收自己那一份（与主界面互不影响，见 ROADMAP 84）
+            for room_id, window in list(self._room_windows.items()):
+                sub = [d for d in batch if d.get("room_id") == room_id]
+                if sub:
+                    window.on_dm_batch(sub)
         # 用户手动滚回底部后清除未读计数（复用同一轮询，不新增定时器）
         self._sync_unseen_from_scroll()
         self.root.after(100, self._poll_queue)
@@ -4609,6 +4765,8 @@ class ScMonitorApp:
                 pass
             self._room_info_after_id = None
         self._stop_medal_tab_refresh()
+        # 先回收房间独立窗口（各自保存几何、注销视图），避免退出后残留窗口
+        self._close_room_windows()
         try:
             # 兜底：任何退出路径都把当前表情包落盘（无变化时内部会跳过写盘）
             self._remember_emoticon_page()

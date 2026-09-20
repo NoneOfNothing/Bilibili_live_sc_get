@@ -197,10 +197,14 @@ def _remember_meta(cache: dict, dmid: str, uid: int,
 class DmPanel(QWidget):
     """弹幕显示 + 发送区 + 表情面板。"""
 
-    def __init__(self, host):
+    def __init__(self, host, room_provider=None, *, always_visible: bool = False):
         super().__init__()
         self.host = host
-        self.visible = bool(host.dm_var)
+        # 本面板绑定的房间来源：主视图跟随宿主选中房间；房间独立窗口（ROADMAP 84）注入固定房间
+        self._room_provider = room_provider or (lambda: host._selected_room_id)
+        # 独立窗口的弹幕区恒显示（宿主的「显示弹幕区」开关只作用于主界面）
+        self.always_visible = bool(always_visible)
+        self.visible = True if always_visible else bool(host.dm_var)
         self._dm_unseen = 0
         self._dm_reply_target: Optional[dict] = None
         self._dm_sending = False
@@ -237,6 +241,8 @@ class DmPanel(QWidget):
 
         self._build_ui()
         self.setVisible(self.visible)
+        # 登记到宿主注册表：弹幕 / 表情 / 发送结果按房间分发给各面板（ROADMAP 84）
+        host.register_dm_panel(self)
 
     @property
     def api(self):
@@ -252,7 +258,8 @@ class DmPanel(QWidget):
 
     @property
     def selected_room(self) -> Optional[int]:
-        return self.host._selected_room_id
+        """本面板当前显示/发送的房间（主视图=宿主选中房间，独立窗口=固定房间）。"""
+        return self._room_provider()
 
     # ---------- UI ----------
 
@@ -1035,7 +1042,7 @@ class DmPanel(QWidget):
             return "未登录：请用「获取Cookie」获取已登录的 B 站 Cookie"
         if not self.api.csrf:
             return "Cookie 缺少 bili_jct，请重新「获取Cookie」"
-        if not self.host.dm_var:
+        if not self.visible:
             return "请先开启「弹幕」开关"
         if self.selected_room is None:
             return "请先选择一个直播间"

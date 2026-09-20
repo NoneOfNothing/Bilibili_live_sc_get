@@ -63,7 +63,7 @@ python -m venv .venv
 ## 4. 测试
 
 ```bash
-.venv\Scripts\python -m unittest discover -s tests -q   # 当前 250 项，全绿
+.venv\Scripts\python -m unittest discover -s tests -q   # 当前 436 项，全绿
 ```
 
 没有网络依赖。改动后**必跑**：`py_compile` + 这套 unittest；涉及 Qt 控件逻辑时先在
@@ -74,7 +74,10 @@ python -m venv .venv
 | 文件 | 作用 |
 |------|------|
 | `blive_sc_get/qt_app.py` | Qt 版主窗口（房间/S C/弹幕/粉丝牌/调试页签、事件轮询、悬浮窗、未读徽标、常驻弹幕开关） |
-| `blive_sc_get/qt_dm_panel.py` | Qt 弹幕区：显示/裁剪/点击复制/@回复/右键回复/表情悬浮提示/发送/表情面板 |
+| `blive_sc_get/qt_dm_panel.py` | Qt 弹幕区：显示/裁剪/点击复制/@回复/右键回复/表情悬浮提示/发送/表情面板（`DmPanel(host, room_provider)`：主视图跟随选中房间、独立窗口注入固定房间） |
+| `blive_sc_get/qt_sc_panel.py` | Qt SC 面板组件：SC 文本/头部/累计/未读徽标/历史分页/删除置灰/点击跳转；`ScPanel(host, room_provider)`，历史结果按 `token` 回投（ROADMAP 84 抽出的视图级组件） |
+| `blive_sc_get/qt_room_window.py` | Qt 房间独立窗口：`RoomChatWindow`=ScPanel+DmPanel，一房一窗、不抢焦点、不置顶、几何记忆、随宿主回收 |
+| `blive_sc_get/tk_room_window.py` | Tk 房间独立窗口：`RoomChatWindow(tk.Toplevel)`（自带渲染与历史小队列，不消费宿主 `ui_queue`），由宿主按房间广播事件 |
 | `blive_sc_get/qt_medal_tab.py` | Qt 粉丝牌页：列表/任务/手动+自动执行/顺序跟随/缓存粉丝牌名与等级 |
 | `blive_sc_get/qt_overlay.py` | Qt 开播悬浮窗（`Qt.Tool|FramelessWindowHint|WindowStaysOnTopHint` + `WS_EX_NOACTIVATE` 不抢焦点，自下而上堆叠） |
 | `blive_sc_get/gui_app.py` | Tk 版完整实现（功能对等参照物） |
@@ -126,7 +129,33 @@ python -m venv .venv
 - 未读徽标（SC/弹幕），开播悬浮窗（Qt 版），SC 头显粉丝牌名/等级。
 - 冒烟验证过：offscreen 实例化、开关往返、悬浮窗弹出/关闭、弹幕渲染/交互；250 单测全绿。
 
-## 9. 协作约定（请遵守）
+## 9. 房间独立窗口（ROADMAP 84，两版）
+
+房间列表右键「打开独立窗口」→ 只含该直播间 SC 区 + 弹幕区的独立窗口（一房一窗、可多个）。
+
+- **Qt**：`qt_sc_panel.ScPanel` + `qt_dm_panel.DmPanel` 组成 `qt_room_window.RoomChatWindow`。
+  宿主 `qt_app` 维护三个注册表：`_sc_panels`（token → 面板，历史结果按 token 回投）、
+  `_dm_panels`（列表）、`_room_windows`（room_id → 窗口）；`sc`/`delete` 经 `sc_panels_for`
+  分发、`dm` 由 `_dm_pending` **按房间分桶**后逐房间渲染、`status`/`online_count`/`guards`
+  经 `_refresh_sc_header` 顺带刷新窗口标题；`DmPanel.selected_room` 改为 `room_provider`
+  注入；`_dm_rooms()`（主视图选中房间 + 各窗口房间）驱动 `_apply_dm_gate`
+  （独立窗口弹幕区恒显示，主界面开关关着也收）。
+- **Tk**：`tk_room_window.RoomChatWindow` 自带一份精简渲染与**自有历史队列**
+  （`LOCAL_POLL_MS` 轮询，绝不 `get` 宿主的 `ui_queue`）；`gui_app` 在 `_on_client_event` /
+  `_poll_queue` 里按房间广播 `on_sc` / `on_delete` / `on_dm_batch` / `on_meta_changed` /
+  `on_dm_send_result` / `on_emoticons` / `on_emoticon_image`，右键入口为
+  `tree.bind("<Button-3>", ...)`（此前房间列表没有右键菜单）。
+- **几何记忆**：`data/gui_rooms.json` 的 `ui.room_windows`（`room_id -> {x,y,width,height}`），
+  解析在 `gui_config.parse_room_window_rects`，恢复前用 `clamp_window_rect`
+  （两版各一份纯函数）收拢到屏幕内；移动/缩放去抖 1 秒写盘 + 关窗立即写。**重启只恢复几何、
+  不自动重开窗口**。
+- 写操作（发弹幕/表情）沿用 `config.json` 的 `allow_write_operations` 与登录态门控。
+- **「弹幕表情图」开关**统一走 `qt_app.set_dm_emoticon_image`：主界面底部与**每个独立窗口底部**
+  各有一个勾选框，任一处切换都会广播给所有 `DmPanel` 并回写所有勾选框（`blockSignals` 防回环），
+  偏好落 `ui.dm_emoticon_image`；新开的窗口按当前偏好初始化。
+  （Tk 版不内嵌表情图，没有这个开关。）
+
+## 10. 协作约定（请遵守）
 
 - 沟通语言：中文。
 - **不修改 `README.md` 与文档性内容，除非被明确指示**；`QT_PORTING.md`/`ROADMAP.md`/`CHANGELOG.md`

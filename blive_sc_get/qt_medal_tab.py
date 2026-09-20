@@ -351,7 +351,8 @@ class MedalTab(QWidget):
         # 粉丝牌等级/名称缓存更新后，刷新各房间任务行的粉丝牌等级列
         self.sync_task_rows()
         if self.host._selected_room_id is not None:
-            self.host._update_sc_header(self.host._selected_room_id)
+            # 刷新绑定该房间的 SC 视图头部（主视图 + 该房间的独立窗口）
+            self.host._refresh_sc_header(self.host._selected_room_id)
 
     def on_medal_task_info(self, payload: dict) -> None:
         room_id = payload.get("room_id")

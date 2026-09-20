@@ -300,7 +300,8 @@ class GuiConfigTests(unittest.TestCase):
                           "notify_overlay": False, "notify_persist": True,
                           "notify_sound": "三连音", "dm_visible": True,
                           "dm_emoticon_image": True,
-                          "window_size": [0, 0]})
+                          "window_size": [0, 0],
+                          "room_windows": {}})
         # 旧配置缺字段时的缺省值
         save_room_entries(self.path, [RoomEntry(123)],
                           ui={"sort_mode": "manual", "pin_live": False})
@@ -330,7 +331,8 @@ class GuiConfigTests(unittest.TestCase):
                     "notify_overlay": True, "notify_persist": False,
                     "notify_sound": "上行双音", "dm_visible": False,
                     "dm_emoticon_image": True,
-                    "window_size": [0, 0]}
+                    "window_size": [0, 0],
+                    "room_windows": {}}
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"), expected)
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path), expected)

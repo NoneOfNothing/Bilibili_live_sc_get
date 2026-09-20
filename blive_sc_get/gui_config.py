@@ -34,11 +34,15 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     "dm_emoticon_image": True,
     # window_size：上次退出时的窗口尺寸 [宽, 高]（逻辑像素）；[0, 0] 表示尚未记忆
     "window_size": [0, 0],
+    # room_windows：房间独立窗口（ROADMAP 84）的位置尺寸记忆，
+    # {"<房间号>": {"x": .., "y": .., "width": .., "height": ..}}；只记几何，不记「是否打开」
+    "room_windows": {},
 }
 """界面偏好默认值。
 
 ``window_size`` 由 Qt 版在退出时写入、启动时恢复（Tk 版不使用，只原样写回）；
-``dm_emoticon_image`` 同理只作用于 Qt 版（Tk 版不做内嵌，恒为文字）。
+``dm_emoticon_image`` 同理只作用于 Qt 版（Tk 版不做内嵌，恒为文字）；
+``room_windows`` 两版共用（按房间记忆独立窗口几何）。
 """
 
 
@@ -162,6 +166,35 @@ def load_emoticon_memory(path: Union[str, Path]) -> Dict[int, Dict[str, object]]
     return memory
 
 
+def parse_room_window_rects(ui: object) -> Dict[str, Dict[str, int]]:
+    """解析 ``ui.room_windows``（``{"<房间号>": {x, y, width, height}}``）。
+
+    非法项（键不是房间号、宽高过小、字段类型不对）直接丢弃——几何记忆只是「便利」，
+    不值得为一条坏数据让窗口打不开。
+    """
+    if not isinstance(ui, dict):
+        return {}
+    raw = ui.get("room_windows")
+    if not isinstance(raw, dict):
+        return {}
+    result: Dict[str, Dict[str, int]] = {}
+    for key, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            room_id = int(key)
+            x = int(item.get("x", 0))
+            y = int(item.get("y", 0))
+            width = int(item.get("width", 0))
+            height = int(item.get("height", 0))
+        except (TypeError, ValueError):
+            continue
+        if width < 200 or height < 150:
+            continue
+        result[str(room_id)] = {"x": x, "y": y, "width": width, "height": height}
+    return result
+
+
 def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     """读取界面偏好；文件缺失/损坏/缺少字段时返回默认值。"""
     prefs = dict(DEFAULT_UI_PREFS)
@@ -186,4 +219,5 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     if (isinstance(size, list) and len(size) == 2
             and all(isinstance(value, int) and value > 200 for value in size)):
         prefs["window_size"] = [int(size[0]), int(size[1])]
+    prefs["room_windows"] = parse_room_window_rects(ui)
     return prefs

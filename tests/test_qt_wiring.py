@@ -20,6 +20,8 @@ HOST_CLASS = "QtScMonitorApp"
 CHILD_MODULES = {
     "qt_medal_tab.py": ("MedalTab",),
     "qt_dm_panel.py": ("DmPanel",),
+    "qt_sc_panel.py": ("ScPanel",),
+    "qt_room_window.py": ("RoomChatWindow",),
     "qt_overlay.py": ("QtToastOverlayManager", "QtToastWindow"),
 }
 
@@ -27,6 +29,7 @@ CHILD_MODULES = {
 HOST_HOLDERS = {
     "medal_tab": "qt_medal_tab.py",
     "dm_panel": "qt_dm_panel.py",
+    "sc_panel": "qt_sc_panel.py",
     "overlay": "qt_overlay.py",
 }
 
@@ -790,9 +793,12 @@ class QtDanmakuEmoticonSwitchTests(unittest.TestCase):
     def test_switch_wired_from_host_to_panel(self):
         host = _tree(HOST_MODULE)
         handler = _method(host, HOST_CLASS, "_on_dm_emoticon_image_toggled")
-        self.assertIn("set_emoticon_image_enabled", _called_attrs(handler),
-                      "勾选框未把开关状态传给弹幕面板")
-        self.assertIn("ui_prefs", _attr_names(handler), "开关状态未写入界面偏好")
+        self.assertIn("set_dm_emoticon_image", _called_attrs(handler),
+                      "勾选框未走统一入口（主界面与独立窗口的勾选框需同步）")
+        setter = _method(host, HOST_CLASS, "set_dm_emoticon_image")
+        self.assertIn("set_emoticon_image_enabled", _called_attrs(setter),
+                      "统一入口未把开关状态传给弹幕面板")
+        self.assertIn("ui_prefs", _attr_names(setter), "开关状态未写入界面偏好")
 
     def test_render_and_strip_respect_switch(self):
         tree = _tree("qt_dm_panel.py")

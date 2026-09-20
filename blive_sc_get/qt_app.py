@@ -35,6 +35,7 @@ from PySide6.QtCore import (
     QEvent,
     QItemSelectionModel,
     QPoint,
+    QRect,
     Qt,
     QTimer,
     Signal,
@@ -43,10 +44,7 @@ from PySide6.QtGui import (
     QColor,
     QPainter,
     QPen,
-    QFont,
     QFontMetrics,
-    QTextBlockFormat,
-    QTextCharFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -80,13 +78,9 @@ from .client import LIVE_STATUS_TEXT, RoomClient
 from .cookie_server import DEFAULT_COOKIE_PORT, wait_for_extension_cookie
 from .gui_app import (
     EMOTICON_REFRESH_COOLDOWN_S,
-    HISTORY_PAGE_SIZE,
     MEDAL_AUTO_INTERVAL_MS,
     PANE_RATIO,
-    SC_TITLE_MAX_LEN,
-    build_sc_segments,
     parse_add_input,
-    unseen_badge_text,
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
@@ -105,6 +99,7 @@ from .medal_tasks import (
 )
 from .medal_runner import MedalTaskRunner
 from .qt_overlay import QtToastOverlayManager
+from .qt_sc_panel import ScPanel
 from .storage import SCStorage
 from .log_setup import (
     CATEGORY_APP,
@@ -136,24 +131,7 @@ COOKIE_FILE_PATH = Path(__file__).resolve().parent.parent / COOKIE_FILE_NAME
 
 DEBUG_LOG_MAX_LINES = 4000
 
-SC_PRICE_COLORS = {
-    "time": "#888888",
-    "user": "#0055cc",
-    "del": "#aaaaaa",
-    "info": "#888888",
-    "price_0": "#1f1f1f",
-    "price_50": "#b8860b",
-    "price_100": "#cc4444",
-    "price_500": "#9932cc",
-}
-
-# QTextCharFormat 自定义属性键（存到 fragment 上，供删除定位/uid 点击）
-_SC_ID_KEY = 0x101
-_UID_KEY = 0x102
-
 QUEUE_POLL_MS = 100
-SC_AT_BOTTOM_TOLERANCE = 4
-"""滚动条距底部多少像素以内视为“吸底”。"""
 
 TABLE_ROW_PADDING = 6
 """表格行高 = 字体行高 + 该内边距。
@@ -205,6 +183,30 @@ DEFAULT_WINDOW_SIZE = (MIN_WINDOW_SIZE[0], 900)
 逻辑可用高）一屏能放下，SC / 弹幕区都不用来回滚动；更小的屏由
 ``_apply_window_geometry`` 的限制兜底。
 """
+
+
+def clamp_window_rect(rect, screens):
+    """把窗口矩形收拢到某个屏幕的可用区域内（ROADMAP 84）。
+
+    记忆的位置可能来自已经拔掉的显示器（或分辨率变化的机器），照原样恢复会让窗口跑到
+    屏幕外、用户以为「窗口没打开」。``rect`` 为 ``(x, y, w, h)``，``screens`` 为可用区域
+    （``QRect``）列表：只要与任一屏相交就原样返回（允许用户有意跨屏摆放），都不相交则
+    居中到第一块屏并收缩到屏内。
+    """
+    x, y, w, h = (int(value) for value in rect)
+    areas = [area for area in screens if area is not None and area.isValid()]
+    if not areas:
+        return x, y, w, h
+    target = QRect(x, y, w, h)
+    for area in areas:
+        if area.intersects(target):
+            return x, y, w, h
+    area = areas[0]
+    w = max(200, min(w, area.width()))
+    h = max(150, min(h, area.height()))
+    x = area.x() + max(0, (area.width() - w) // 2)
+    y = area.y() + max(0, (area.height() - h) // 2)
+    return x, y, w, h
 
 
 def compact_row_height(widget) -> int:
@@ -777,10 +779,8 @@ class QtScMonitorApp(QMainWindow):
         self.room_tasks: Dict[int, Tuple[RoomClient, asyncio.Task]] = {}
         self._room_id_map: Dict[int, int] = {}  # 输入房间号 -> 真实房间号（短号）
         self._selected_room_id: Optional[int] = None
-        self._history_gen = 0
-        self._loaded_count = 0
-        self._has_more = False
-        self._loading_more = False
+        # SC 面板注册表：token -> 面板；历史结果按 token 回投（见 qt_sc_panel / _poll_queue）
+        self._sc_panels: Dict[int, ScPanel] = {}
         self._sc_total: Dict[int, int] = {}
         self.popularity: Dict[int, int] = {}
         self.guard_num: Dict[int, int] = {}
@@ -790,8 +790,12 @@ class QtScMonitorApp(QMainWindow):
         # 与 gui_config.DEFAULT_UI_PREFS 保持一致（Tk 版键名为 dm_visible）
         self.dm_var = bool(self.ui_prefs.get("dm_visible", False))
         # 弹幕/表情的具体状态都在 DmPanel 内（宿主只持有开关与轮询聚合缓冲）
-        self._dm_pending: list = []  # 轮询周期内聚合的当前房间弹幕负载
-        self._sc_unseen = 0
+        # 轮询周期内聚合的弹幕负载：room_id -> [负载]（按房间分桶，供多视图分发）
+        self._dm_pending: Dict[int, list] = {}
+        # 弹幕面板注册表（主视图 + 各房间独立窗口），见 dm_panels_for
+        self._dm_panels: list = []
+        # 房间独立窗口（ROADMAP 84）：room_id -> RoomChatWindow（一房一窗）
+        self._room_windows: dict = {}
         # 房间号 -> {"index": 收起的表情包序号, "name": 包名}（持久化到 gui_rooms.json）
         self._emoticon_memory: Dict[int, dict] = load_emoticon_memory(self.config_path)
         # 房间号 -> 可用表情包（表情面板与「弹幕表情悬浮看原图」共用，见 Tk 版 self._emoticons）
@@ -895,7 +899,7 @@ class QtScMonitorApp(QMainWindow):
         self.resize(width, height)
 
     def _build_rooms_tab(self, tabs: QTabWidget) -> None:
-        from .qt_dm_panel import BottomHoldTextEdit, DmPanel
+        from .qt_dm_panel import DmPanel
 
         tab = QWidget()
         tabs.addTab(tab, "直播间")
@@ -1025,32 +1029,11 @@ class QtScMonitorApp(QMainWindow):
         room_layout.addLayout(actions)
         splitter.addWidget(room_panel)
 
-        # ---- SC 区 ----
-        sc_panel = QWidget()
-        sc_layout = QVBoxLayout(sc_panel)
-        sc_layout.setContentsMargins(0, 0, 0, 0)
-        # 头部：左侧直播标题 + 同接/舰长/粉丝牌，右侧累计 SC（同一行，省一行高度）
-        header_row = QHBoxLayout()
-        header_row.setSpacing(6)
-        self.sc_header = QLabel("")
-        self.sc_header.setWordWrap(False)  # 单行显示；过长与 Tk 版一样裁掉，完整内容见悬浮提示
-        header_row.addWidget(self.sc_header, 1)
-        self.sc_total_label = QLabel("")
-        self.sc_total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        header_row.addWidget(self.sc_total_label, 0)
-        sc_layout.addLayout(header_row)
-        self.sc_text = BottomHoldTextEdit()
-        self.sc_text.setReadOnly(True)
-        self.sc_text.setFont(QFont("Microsoft YaHei UI", 10))
-        self.sc_text.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.sc_text.verticalScrollBar().valueChanged.connect(self._on_sc_wheel)
-        # 点击 SC 里的用户名 → 打开其个人空间（与 Tk 版 _on_sc_click 一致）
-        self.sc_text.click_handler = self._on_sc_clicked
-        sc_layout.addWidget(self.sc_text, 1)
-        self.sc_badge = self._make_unseen_badge(self.sc_text)
-        self.sc_badge.clicked.connect(self._on_sc_badge_clicked)
-        self.sc_badge.hide()
-        splitter.addWidget(sc_panel)
+        # ---- SC 区（视图级组件：主视图跟随选中房间，见 qt_sc_panel） ----
+        self.sc_panel = ScPanel(self, lambda: self._selected_room_id)
+        # 兼容别名：弹幕区取 SC 区字体、以及其它按 sc_text 判断的旧代码路径
+        self.sc_text = self.sc_panel.sc_text
+        splitter.addWidget(self.sc_panel)
 
         # 弹幕区（显示 + 发送 + 表情面板）
         self.dm_panel = DmPanel(self)
@@ -1409,7 +1392,7 @@ class QtScMonitorApp(QMainWindow):
         self._refresh_buttons()
         if room_id is None:
             self._selected_room_id = None
-            self._clear_sc_view()
+            self.sc_panel.clear_view()
             self._clear_dm_view()
             self._apply_dm_gate()
             self._refresh_dm_send_state()
@@ -1418,9 +1401,8 @@ class QtScMonitorApp(QMainWindow):
             return
         self._selected_room_id = room_id
         self._sync_note_display(room_id)
-        self._update_sc_header(room_id)
-        self._update_sc_total_label()
-        self._load_history(room_id)
+        # SC 区（头部 / 累计 / 历史）由视图自己刷新：主视图跟随选中房间
+        self.sc_panel.apply_room(room_id)
         # 弹幕区展示的是具体房间的弹幕：切房即清空并重设接收门控
         self._clear_dm_view()
         self._apply_dm_gate()
@@ -1431,6 +1413,127 @@ class QtScMonitorApp(QMainWindow):
         self._load_dm_options_for_selected()
         self._follow_preview(room_id)  # 预览开着且开启「跟随选中房间」时切流
 
+    # ---------- SC 视图注册表 ----------
+
+    def register_sc_panel(self, panel: ScPanel) -> None:
+        """登记一个 SC 面板（主视图 / 房间独立窗口），供历史结果按 token 回投。"""
+        self._sc_panels[panel.token] = panel
+
+    def unregister_sc_panel(self, panel: ScPanel) -> None:
+        """窗口关闭时注销面板（历史结果不再回投已销毁的视图）。"""
+        self._sc_panels.pop(panel.token, None)
+        log_window.debug("注销 SC 面板（剩余 %d 个）", len(self._sc_panels))
+
+    def sc_panels_for(self, room_id) -> List[ScPanel]:
+        """当前绑定到指定房间的 SC 面板（主视图只在「选中该房间」时算在内）。"""
+        if room_id is None:
+            return []
+        return [p for p in self._sc_panels.values() if p.room_id == room_id]
+
+    def _refresh_sc_header(self, room_id: int) -> None:
+        """房间元数据（状态 / 标题 / 同接 / 舰长）变化后刷新各视图的 SC 头部与窗口标题。"""
+        for panel in self.sc_panels_for(room_id):
+            panel.update_header()
+        for window in self.room_windows_for(room_id):
+            window.update_title()
+
+    # ---------- 弹幕视图注册表 ----------
+
+    def register_dm_panel(self, panel) -> None:
+        """登记一个弹幕面板（主视图 / 房间独立窗口），事件按房间分发给各面板。"""
+        self._dm_panels.append(panel)
+
+    def unregister_dm_panel(self, panel) -> None:
+        """窗口关闭时注销面板（不再接收弹幕与表情事件）。"""
+        if panel in self._dm_panels:
+            self._dm_panels.remove(panel)
+            log_window.debug("注销弹幕面板（剩余 %d 个）", len(self._dm_panels))
+
+    def dm_panels_for(self, room_id) -> list:
+        """当前绑定到指定房间的弹幕面板（主视图只在「选中该房间」时算在内）。"""
+        if room_id is None:
+            return []
+        return [p for p in self._dm_panels if p.selected_room == room_id]
+
+    def _dm_rooms(self) -> set:
+        """需要接收弹幕的房间集合：主视图（开关开启时）+ 各独立窗口绑定的房间。
+
+        独立窗口的弹幕区**恒显示**，因此即使主界面「显示弹幕区」关着，也照样接收
+        其房间的弹幕（否则窗口里永远没有内容）。
+        """
+        rooms = set()
+        if self.dm_var and self._selected_room_id is not None:
+            rooms.add(int(self._selected_room_id))
+        for panel in self._dm_panels:
+            room_id = panel.selected_room
+            if getattr(panel, "always_visible", False) and room_id is not None:
+                rooms.add(int(room_id))
+        return rooms
+
+    # ---------- 房间独立窗口（ROADMAP 84） ----------
+
+    def register_room_window(self, window) -> None:
+        """登记一个房间独立窗口（一房一窗：同房间重复打开只前置已有窗口）。"""
+        self._room_windows[int(window.room_id())] = window
+
+    def unregister_room_window(self, window) -> None:
+        room_id = int(window.room_id())
+        if self._room_windows.get(room_id) is window:
+            self._room_windows.pop(room_id, None)
+
+    def room_windows_for(self, room_id) -> list:
+        window = self._room_windows.get(int(room_id)) if room_id is not None else None
+        return [window] if window is not None else []
+
+    def load_room_window_geometry(self, room_id):
+        """读取某房间独立窗口记忆的几何（``(x, y, w, h)``；无记忆/越界则收拢到屏内）。"""
+        raw = (self.ui_prefs.get("room_windows") or {}).get(str(int(room_id)))
+        if not isinstance(raw, dict):
+            return None
+        try:
+            rect = (int(raw["x"]), int(raw["y"]),
+                    int(raw["width"]), int(raw["height"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        screens = [screen.availableGeometry() for screen in QApplication.screens()]
+        return clamp_window_rect(rect, screens)
+
+    def save_room_window_geometry(self, room_id, rect) -> None:
+        """记住某房间独立窗口的位置尺寸（写 ``ui.room_windows``；与上次相同则不写盘）。"""
+        memory = self.ui_prefs.get("room_windows")
+        if not isinstance(memory, dict):
+            memory = {}
+            self.ui_prefs["room_windows"] = memory
+        value = {"x": int(rect.x()), "y": int(rect.y()),
+                 "width": int(rect.width()), "height": int(rect.height())}
+        if memory.get(str(int(room_id))) == value:
+            return
+        memory[str(int(room_id))] = value
+        self._save_config()
+
+    def open_room_window(self, room_id: int) -> None:
+        """打开 / 前置某个直播间的独立窗口（房间列表右键菜单入口）。"""
+        room_id = int(room_id)
+        window = self._room_windows.get(room_id)
+        if window is not None:
+            window.show()
+            window.raise_()
+            log_window.info("房间 %s 的独立窗口已存在，前置显示", room_id)
+            return
+        from .qt_room_window import RoomChatWindow
+
+        window = RoomChatWindow(self, room_id)
+        window.restore_geometry()
+        window.show()
+        # 新窗口要收该房间弹幕：更新门控，并拉取该房间可用的弹幕颜色/模式
+        self._apply_dm_gate()
+        self._load_dm_options_for(room_id)
+
+    def _close_room_windows(self) -> None:
+        """退出程序时回收所有独立窗口（各自保存几何、注销视图）。"""
+        for window in list(self._room_windows.values()):
+            window.shutdown()
+
     def _clear_dm_view(self) -> None:
         if hasattr(self, "dm_panel"):
             self.dm_panel.clear_view()
@@ -1440,25 +1543,28 @@ class QtScMonitorApp(QMainWindow):
             self.dm_panel._refresh_dm_send_state()
 
     def _apply_dm_gate(self) -> None:
-        """按弹幕开关与当前选中房间设置各 client 的弹幕接收门控。
+        """按弹幕开关与各视图绑定房间设置各 client 的弹幕接收门控。
 
-        与 Tk 版 _apply_dm_gate 一致：只有「开关开启 + 该房间被选中」才会接收
-        弹幕（落盘 + 广播 dm 事件），其余房间解析后直接丢弃。
+        与 Tk 版 _apply_dm_gate 一致：只有「需要显示弹幕的房间」才接收（落盘 +
+        广播 dm 事件），其余房间解析后直接丢弃。需要显示的房间 = 主视图（开关开启
+        时的选中房间）+ 各房间独立窗口绑定的房间（见 :meth:`_dm_rooms`）。
         未设置时 RoomClient._dm_enabled 默认 False，弹幕会全部被丢弃。
         """
-        enabled = bool(self.dm_var)
-        selected = self._selected_room_id
+        rooms = self._dm_rooms()
         for room_id, (client, _task) in self.room_tasks.items():
-            client.set_danmaku_enabled(enabled and room_id == selected)
+            client.set_danmaku_enabled(room_id in rooms)
 
-    def _load_dm_options_for_selected(self) -> None:
-        """已登录且弹幕区可见时，拉取当前房间可用的弹幕颜色/模式（尽力而为）。"""
-        room_id = self._selected_room_id
+    def _load_dm_options_for(self, room_id) -> None:
+        """已登录且该房间有可见弹幕面板时，拉取其可用弹幕颜色/模式（尽力而为）。"""
         if room_id is None or self.hub.api is None or not self.hub.api.logged_in:
             return
-        if not self.dm_var:
+        panels = [p for p in self.dm_panels_for(room_id) if getattr(p, "visible", False)]
+        if not panels:
             return
         self.hub.submit(self._async_load_dm_config(room_id))
+
+    def _load_dm_options_for_selected(self) -> None:
+        self._load_dm_options_for(self._selected_room_id)
 
     async def _async_load_dm_config(self, room_id: int) -> None:
         api = self.hub.api
@@ -1592,8 +1698,7 @@ class QtScMonitorApp(QMainWindow):
             self.live_state[room_id] = LIVE_STATUS_TEXT.get(
                 int(payload.get("live_status") or 0), "未知")
         self._refresh_row(room_id)
-        if room_id == self._selected_room_id:
-            self._update_sc_header(room_id)
+        self._refresh_sc_header(room_id)
 
     def _on_tree_cell_clicked(self, row: int, col: int) -> None:
         """房间号/主播列 → 跳浏览器；提醒列 → 切换该房间的开播提醒开关。
@@ -1739,6 +1844,10 @@ class QtScMonitorApp(QMainWindow):
             self.viewers.pop(room_id, None)
             self.guard_num.pop(room_id, None)
             self._room_id_map.pop(room_id, None)
+            # 房间被删除：一并关掉它的独立窗口（窗口里已没有任何可显示的内容）
+            window = self._room_windows.get(int(room_id))
+            if window is not None:
+                window.shutdown()
             # 表情包记忆与缓存随房间一并清理
             self._emoticon_memory.pop(room_id, None)
             self._emoticons.pop(room_id, None)
@@ -1756,7 +1865,7 @@ class QtScMonitorApp(QMainWindow):
         room_id = self._get_selected_room_id()
         if room_id is not None:
             log_data.info("手动刷新历史 SC（房间 %s）", room_id)
-            self._load_history(room_id)
+            self.sc_panel.load_history(room_id)
 
     def _flush_note(self) -> None:
         """把备注写回它所属的房间。
@@ -1837,20 +1946,35 @@ class QtScMonitorApp(QMainWindow):
         self._apply_dm_gate()
 
     def _on_dm_emoticon_image_toggled(self, checked: bool) -> None:
-        """弹幕表情图开关：内嵌图片／只显示触发词（立即生效并落盘偏好）。
-
-        关闭时会把弹幕里**已经显示**的表情图还原成「[触发词]」文字，所以行高立刻降下来，
-        不必等新弹幕；重新开启只影响后续新弹幕（历史行保持文字）。
-        """
-        self.ui_prefs["dm_emoticon_image"] = bool(checked)
-        if hasattr(self, "dm_panel"):
-            self.dm_panel.set_emoticon_image_enabled(bool(checked))
-        self._save_config()
-        log_window.info("弹幕表情图：%s", "显示" if checked else "只显示触发词")
-        self._refresh_dm_send_state()
+        """主界面「弹幕表情图」勾选框：转发到统一入口（与各独立窗口的勾选框共用）。"""
+        self.set_dm_emoticon_image(bool(checked))
         self._load_dm_options_for_selected()
         # 板块增减会打乱占比，重新按默认占比分配（与 Tk 版 _on_dm_toggled 一致）
         self._apply_pane_ratio()
+
+    def set_dm_emoticon_image(self, enabled: bool) -> None:
+        """「弹幕表情图」开关的统一入口（主界面 / 各房间独立窗口的勾选框都走这里）。
+
+        三处状态必须永远一致，所以只在这里改：① 偏好落盘；② 广播给**每一个**弹幕面板
+        （`set_emoticon_image_enabled` 会把已显示的图还原成触发词、或把触发词换回图，
+        见 qt_dm_panel）；③ 回写主界面与各独立窗口的勾选框（`blockSignals` 防回环）。
+        """
+        enabled = bool(enabled)
+        if self.ui_prefs.get("dm_emoticon_image") != enabled:
+            self.ui_prefs["dm_emoticon_image"] = enabled
+            self._save_config()
+            log_window.info("弹幕表情图：%s（%d 个弹幕面板同步）",
+                            "显示" if enabled else "只显示触发词", len(self._dm_panels))
+        for panel in list(self._dm_panels):
+            panel.set_emoticon_image_enabled(enabled)
+        for window in list(self._room_windows.values()):
+            window.set_emoticon_check(enabled)
+        check = getattr(self, "dm_emoticon_check", None)
+        if check is not None and check.isChecked() != enabled:
+            check.blockSignals(True)
+            check.setChecked(enabled)
+            check.blockSignals(False)
+        self._refresh_dm_send_state()
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         """首次显示后按 PANE_RATIO 分配板块高度（此前分割器还没有真实高度）。"""
@@ -1957,9 +2081,9 @@ class QtScMonitorApp(QMainWindow):
             return
         client = RoomClient(self.hub.api, room_id, self.hub.storage,
                             event_callback=self._client_event)
-        # 弹幕门控：只有「开关开启 + 当前选中房间」才接收/落盘弹幕
+        # 弹幕门控：只有「需要显示弹幕的房间」（主视图选中房间 + 独立窗口房间）才接收/落盘
         # （RoomClient 默认不接收，必须显式设置）
-        client.set_danmaku_enabled(bool(self.dm_var) and self._selected_room_id == room_id)
+        client.set_danmaku_enabled(room_id in self._dm_rooms())
         task = asyncio.create_task(client.run(), name=f"room-{room_id}")
         self.room_tasks[room_id] = (client, task)
         task.add_done_callback(
@@ -2040,219 +2164,6 @@ class QtScMonitorApp(QMainWindow):
 
     # ---------- SC 实时渲染与历史 ----------
 
-    def _clear_sc_view(self) -> None:
-        self.sc_text.clear()
-        self._sc_unseen = 0
-        if hasattr(self, "sc_badge"):
-            self.sc_badge.hide()
-        self._history_gen += 1
-
-    def _load_history(self, room_id: int, skip: int = 0) -> None:
-        self._history_gen += 1
-        gen = self._history_gen
-        log_data.debug("读取历史 SC：房间 %s，skip=%d", room_id, skip)
-        if self.hub.storage is None:
-            self._append_info("（后台网络初始化中，稍后会自动加载历史 SC…）")
-            return
-        storage = self.hub.storage
-        if skip == 0:
-            self._loaded_count = 0
-            self._has_more = False
-            self._loading_more = False
-            self._append_info("（正在加载历史 SC…）")
-        else:
-            self._loading_more = True
-
-        def worker() -> None:
-            try:
-                page = storage.load_sc_page(room_id, limit=HISTORY_PAGE_SIZE, skip=skip)
-                deleted = storage.load_deleted_ids(room_id)
-                total = storage.count_sc_records(room_id)
-            except Exception:
-                log_data.exception("读取历史 SC 失败 room=%s", room_id)
-                page, deleted, total = [], {}, 0
-            self.ui_queue.put(("history", {
-                "gen": gen, "room_id": room_id, "records": page, "deleted": deleted,
-                "total": total, "skip": skip,
-            }))
-
-        threading.Thread(target=worker, name=f"history-{room_id}", daemon=True).start()
-
-    def _on_history_loaded(self, payload: dict) -> None:
-        if payload["gen"] != self._history_gen:
-            return
-        if payload["room_id"] != self._selected_room_id:
-            return
-        room_id = payload["room_id"]
-        records = payload["records"]
-        deleted = payload["deleted"]
-        total = int(payload.get("total") or 0)
-        skip = int(payload.get("skip") or 0)
-        loaded_before = self._loaded_count
-        self._sc_total[room_id] = total
-        self._update_sc_total_label()
-        self._loading_more = False
-        self._loaded_count = skip + len(records)
-        self._has_more = self._loaded_count < total
-        marker = self._history_marker(self._loaded_count, total)
-        if skip == 0:
-            self._clear_sc_view()
-            if not records:
-                self._append_info("（尚无 SC 记录，收到新 SC 后会实时显示在这里）")
-                return
-            for record in records:
-                self._render_record(record, deleted)
-            self._append_info(f"（历史 {total} 条sc记录）")
-            self._prepend_info(marker)
-            self._scroll_to_bottom()
-            return
-        # 向上翻页：更早记录插在顶部
-        block = self._pack_records(records, deleted)
-        self._prepend_block(block)
-        self._prepend_info(marker)
-
-    def _pack_records(self, records: list, deleted: dict) -> list:
-        block: list = []
-        for record in records:
-            sc = record["sc"]
-            block.append((record["time_received"], sc,
-                          str(sc.get("id")) in deleted))
-        return block
-
-    def _render_record(self, record: dict, deleted: dict) -> None:
-        sc = record["sc"]
-        self._append_sc_formatted(record["time_received"], sc,
-                                  deleted=str(sc.get("id")) in deleted)
-
-    def _append_sc_formatted(self, time_str: str, sc: dict, *,
-                             deleted: bool = False, pending: bool = False,
-                             count_unseen: bool = False) -> None:
-        follow = self._sc_at_bottom()
-        segments = build_sc_segments(time_str, sc, deleted=deleted, pending=pending)
-        cursor = self.sc_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        sc_id = sc.get("id")
-        for idx, (chunk, tag) in enumerate(segments):
-            fmt = QTextCharFormat()
-            tag = (tag or "").strip()
-            seg_tags = set(tag.split()) if tag else set()
-            color = None
-            for name, color_hex in SC_PRICE_COLORS.items():
-                if name in seg_tags:
-                    color = QColor(color_hex)
-                    break
-            if color is not None:
-                fmt.setForeground(color)
-            if idx < len(segments) - 1 and sc_id is not None:
-                fmt.setProperty(_SC_ID_KEY, str(sc_id))
-            user_tag = next((t for t in seg_tags if t.startswith("uid:")), None)
-            if user_tag:
-                fmt.setProperty(_UID_KEY, int(user_tag.split(":", 1)[1]))
-            cursor.insertText(chunk, fmt)
-        # segments 末尾已含 "\n"（Qt 里会另起一个文本块），不能再 insertBlock，
-        # 否则每条 SC 后面会多出一整行空行（行距翻倍）
-        if follow:
-            self._scroll_to_bottom()
-        elif count_unseen:
-            # 用户正在向上翻阅：累加未读计数并显示「N 条新SC ↓」徽标
-            self._sc_unseen += 1
-            self._sync_unseen_badges()
-
-    def _append_info(self, text: str) -> None:
-        follow = self._sc_at_bottom()
-        cursor = self.sc_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(SC_PRICE_COLORS["info"]))
-        cursor.insertText(text + "\n", fmt)
-        if follow:
-            self._scroll_to_bottom()
-
-    def _prepend_info(self, text: str) -> None:
-        cursor = self.sc_text.textCursor()
-        cursor.movePosition(QTextCursor.Start)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(SC_PRICE_COLORS["info"]))
-        cursor.insertText(text + "\n", fmt)
-
-    def _prepend_block(self, records: list) -> None:
-        cursor = self.sc_text.textCursor()
-        cursor.movePosition(QTextCursor.Start)
-        for time_str, sc, deleted in records:
-            segments = build_sc_segments(time_str, sc, deleted=deleted)
-            sc_id = sc.get("id")
-            for idx, (chunk, tag) in enumerate(segments):
-                fmt = QTextCharFormat()
-                tag = (tag or "").strip()
-                seg_tags = set(tag.split()) if tag else set()
-                for name, color_hex in SC_PRICE_COLORS.items():
-                    if name in seg_tags:
-                        fmt.setForeground(QColor(color_hex))
-                        break
-                if idx < len(segments) - 1 and sc_id is not None:
-                    fmt.setProperty(_SC_ID_KEY, str(sc_id))
-                cursor.insertText(chunk, fmt)
-            # 同上：末尾 "\n" 已换行，勿再 insertBlock（避免空行）
-
-    def _on_sc_clicked(self, pos) -> None:
-        """点击 SC 中的用户名 → 打开其个人空间（与 Tk 版 _on_sc_click 一致）。"""
-        cursor = self.sc_text.cursorForPosition(pos)
-        uid = int(cursor.charFormat().property(_UID_KEY) or 0)
-        if uid:
-            webbrowser.open(f"https://space.bilibili.com/{uid}")
-
-    def _on_sc_wheel(self, _value: int) -> None:
-        if self.sc_text.verticalScrollBar().value() <= 0:
-            self._maybe_load_more()
-
-    def _maybe_load_more(self) -> None:
-        if (self._selected_room_id is None or not self._has_more
-                or self._loading_more or self.hub.storage is None):
-            return
-        if self.sc_text.verticalScrollBar().value() > 0:
-            return
-        self._load_history(self._selected_room_id,
-                           skip=self._loaded_count)
-
-    def _sc_at_bottom(self) -> bool:
-        bar = self.sc_text.verticalScrollBar()
-        return bar.maximum() - bar.value() <= SC_AT_BOTTOM_TOLERANCE
-
-    def _scroll_to_bottom(self) -> None:
-        bar = self.sc_text.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-    def _history_marker(self, loaded: int, total: int) -> str:
-        if loaded < total:
-            return f"（已读取共 {loaded} 条历史记录，向上滚动加载更早记录）"
-        return f"（已读取全部 {loaded} 条历史记录）"
-
-    def _update_sc_header(self, room_id: int) -> None:
-        anchor = self.anchor_names.get(room_id) or "未知主播"
-        title = self.titles.get(room_id) or ""
-        parts = [f"房间 {room_id} · {anchor}"]
-        if title:
-            if len(title) > SC_TITLE_MAX_LEN:
-                title = title[:SC_TITLE_MAX_LEN] + "…"
-            parts.append(f"标题：{title}")
-        viewers = self.viewers.get(room_id)
-        guards = self.guard_num.get(room_id)
-        if viewers:
-            parts.append(f"同接 {viewers}")
-        if guards is not None and guards >= 0:
-            parts.append(f"舰长 {guards}")
-        medal_name, medal_level = self._fan_medal_for(room_id)
-        if medal_name:
-            parts.append(f"粉丝牌 {medal_name} Lv{medal_level}")
-        text = " · ".join(parts)
-        self.sc_header.setText(text)
-        self.sc_header.setToolTip(text)  # 单行显示：过长时靠悬浮查看完整内容
-
-    def _update_sc_total_label(self) -> None:
-        room_id = self._selected_room_id
-        total = self._sc_total.get(room_id, 0)
-        self.sc_total_label.setText(f"累计 SC：{total}" if room_id else "")
-
     def _fan_medal_for(self, room_id: int) -> tuple:
         """当前房间的粉丝牌名/等级（取自粉丝牌页缓存；无则返回空）。"""
         tab = getattr(self, "medal_tab", None)
@@ -2296,18 +2207,11 @@ class QtScMonitorApp(QMainWindow):
         badge.show()
 
     def _sync_unseen_badges(self) -> None:
-        """每轮轮询：同步 SC 与弹幕区的未读徽标；滚动回底部后清零隐藏。"""
-        if self._sc_unseen and self._sc_at_bottom():
-            self._sc_unseen = 0
-        self._place_unseen_badge(
-            self.sc_badge, self.sc_text, unseen_badge_text(self._sc_unseen, "SC"))
-        if hasattr(self, "dm_panel"):
-            self.dm_panel._sync_unseen_badge()
-
-    def _on_sc_badge_clicked(self) -> None:
-        self._sc_unseen = 0
-        self._scroll_to_bottom()
-        self._sync_unseen_badges()
+        """每轮轮询：同步各视图（主界面 + 独立窗口）的 SC 与弹幕未读徽标。"""
+        for panel in list(self._sc_panels.values()):
+            panel.sync_unseen_badge()
+        for panel in list(self._dm_panels):
+            panel._sync_unseen_badge()
 
     # ---------- 队列轮询 ----------
 
@@ -2328,7 +2232,13 @@ class QtScMonitorApp(QMainWindow):
                 elif kind == "room_done":
                     self._on_room_done(item[1]["room_id"])
                 elif kind == "history":
-                    self._on_history_loaded(item[1])
+                    # 历史结果按 token 回投给发起面板：主窗口与各独立窗口互不干扰
+                    panel = self._sc_panels.get(int(item[1].get("token") or 0))
+                    if panel is not None:
+                        panel.on_history_loaded(item[1])
+                    else:
+                        log_data.debug("历史 SC 结果无对应面板（token=%s）",
+                                       item[1].get("token"))
                 elif kind == "add_result":
                     self._on_add_result(item[1])
                 elif kind == "room_info":
@@ -2340,22 +2250,23 @@ class QtScMonitorApp(QMainWindow):
                 elif kind == "dm_state":
                     self._on_dm_state(item[1])
                 elif kind == "dm_config":
-                    if hasattr(self, "dm_panel"):
-                        self.dm_panel.on_dm_config(item[1])
+                    for panel in self.dm_panels_for(item[1].get("room_id")):
+                        panel.on_dm_config(item[1])
                 elif kind == "dm_send_result":
-                    if hasattr(self, "dm_panel"):
-                        self.dm_panel.on_dm_send_result(item[1])
+                    for panel in self.dm_panels_for(item[1].get("room_id")):
+                        panel.on_dm_send_result(item[1])
                 elif kind == "emoticons":
                     payload = item[1]
                     packages = payload.get("packages") or []
                     # 刷新失败（或确实为空）时保留上次结果，不把已有表情包清空
                     if packages:
                         self._emoticons[int(payload.get("room_id") or 0)] = packages
-                    if hasattr(self, "dm_panel"):
-                        self.dm_panel.on_emoticons(payload)
+                    for panel in self.dm_panels_for(payload.get("room_id")):
+                        panel.on_emoticons(payload)
                 elif kind == "emoticon_image":
-                    if hasattr(self, "dm_panel"):
-                        self.dm_panel.on_emoticon_image(item[1])
+                    # 图片按 URL 缓存、payload 无房间号：广播给所有弹幕面板（各自按需取用）
+                    for panel in list(self._dm_panels):
+                        panel.on_emoticon_image(item[1])
                 elif kind == "preview_ready":
                     if hasattr(self, "preview"):
                         self.preview.on_streams_ready(item[1])
@@ -2386,17 +2297,15 @@ class QtScMonitorApp(QMainWindow):
         except queue.Empty:
             pass
         self._append_logs(log_lines)
-        if self._selected_room_id is not None and self._sc_total.get(self._selected_room_id):
-            self._update_sc_total_label()
-        # 记录 SC 区是否吸底（尺寸变化后据此保持贴底）
-        self.sc_text.refresh_bottom_state()
-        # 本轮累积的弹幕聚合一次渲染（仅当前选中房间）
-        if self._dm_pending and hasattr(self, "dm_panel"):
-            batch, self._dm_pending = self._dm_pending, []
-            selected = self._selected_room_id
-            batch = [d for d in batch if d.get("room_id") == selected]
-            if batch:
-                self.dm_panel.append_dm_batch(batch)
+        # SC 区：记录吸底状态（尺寸变化后据此保持贴底）+ 刷新累计标签（各视图自己维护）
+        for panel in list(self._sc_panels.values()):
+            panel.poll_tick()
+        # 本轮累积的弹幕按房间各渲染一次（每轮一次批量插入，控制重排开销）
+        if self._dm_pending:
+            pending, self._dm_pending = self._dm_pending, {}
+            for room_id, batch in pending.items():
+                for panel in self.dm_panels_for(room_id):
+                    panel.append_dm_batch(batch)
         self._sync_unseen_badges()
 
     def _append_log(self, line: str) -> None:
@@ -2469,13 +2378,13 @@ class QtScMonitorApp(QMainWindow):
         self.refresh_preview_button()
 
     def _on_room_context_menu(self, pos) -> None:
-        """房间列表右键：预览该房间 / 停止预览该房间 / 设为主路（工具栏之外的入口）。
+        """房间列表右键：打开独立窗口 / 预览该房间 / 停止预览该房间 / 设为主路。
 
         菜单只作用在**右键所在的那一行**（用 ``indexAt`` 定位，**与选中无关**）：右键本身
         不改变选中行（见 :meth:`selectionCommand`），所以 SC / 弹幕面板不会被切走、开着
         「跟随选中房间」时也不会把正在看的预览切走。多路预览时「停止预览」只停这一路（不是
         全部），「设为主路」把有声音的那一路切过去；「预览该房间」只把该房间**加入**预览，
-        同样不改选中。
+        同样不改选中；「打开独立窗口」也只开窗、不改选中。
         """
         index = self.table.indexAt(pos)
         row = index.row() if index.isValid() else -1
@@ -2492,6 +2401,9 @@ class QtScMonitorApp(QMainWindow):
         header = menu.addAction(f"房间 {room_id}" + (f"（{anchor}）" if anchor else ""))
         header.setEnabled(False)  # 仅作标题
         menu.addSeparator()
+        # 房间独立窗口（ROADMAP 84）：只显示该房间的 SC + 弹幕
+        window_action = menu.addAction("打开独立窗口")
+        menu.addSeparator()
         action = menu.addAction("停止预览该房间" if active_here else "预览该房间")
         main_action = None
         if active_here and window.main_room_id != int(room_id):
@@ -2499,6 +2411,10 @@ class QtScMonitorApp(QMainWindow):
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is None:
             log_room.debug("右键菜单已取消（房间 %s）", room_id)
+            return
+        if chosen is window_action:
+            log_room.info("右键菜单：打开房间 %s 的独立窗口", room_id)
+            self.open_room_window(room_id)   # 不改选中（否则 SC / 弹幕面板会被切走）
             return
         if main_action is not None and chosen is main_action:
             log_room.info("右键菜单：把房间 %s 设为主路（有声音）", room_id)
@@ -2585,10 +2501,11 @@ class QtScMonitorApp(QMainWindow):
         # 可用表情随登录身份变化：缓存与刷新冷却一并失效
         self._emoticons.clear()
         self._emoticon_fetched_at.clear()
-        if hasattr(self, "dm_panel"):
-            self.dm_panel.on_login_changed()
-        self._refresh_dm_send_state()
-        self._load_dm_options_for_selected()
+        # 所有弹幕视图（主界面 + 各独立窗口）一起刷新登录态与发送门控
+        for panel in list(self._dm_panels):
+            panel.on_login_changed()
+            panel._refresh_dm_send_state()
+            self._load_dm_options_for(panel.selected_room)
         # 预览清晰度档位随登录态收缩/放开（未登录只有 720P）
         window = getattr(self, "preview", None)
         if window is not None:
@@ -2678,7 +2595,7 @@ class QtScMonitorApp(QMainWindow):
         if self.entries and self._selected_room_id is None:
             self._select_room(next(iter(self.entries)))
         elif self._selected_room_id is not None:
-            self._load_history(self._selected_room_id)
+            self.sc_panel.load_history(self._selected_room_id)
         self._apply_dm_gate()
         self._refresh_dm_send_state()
         self._load_dm_options_for_selected()
@@ -2697,7 +2614,8 @@ class QtScMonitorApp(QMainWindow):
             if self.client_states[room_id] in ("starting", "running"):
                 self.client_states[room_id] = "stopped"
         self._refresh_all_rows()
-        self._append_info(f"后台初始化失败：{error}")
+        if hasattr(self, "sc_panel"):
+            self.sc_panel.append_info(f"后台初始化失败：{error}")
 
     def _on_client_event(self, event_type: str, payload: dict) -> None:
         room_id = payload.get("room_id")
@@ -2730,20 +2648,22 @@ class QtScMonitorApp(QMainWindow):
             if self.client_states.get(room_id) == "starting":
                 self.client_states[room_id] = "running"
             self._refresh_row(room_id)
-            if room_id == self._selected_room_id:
-                self._update_sc_header(room_id)
+            self._refresh_sc_header(room_id)
         elif event_type == "sc":
-            if room_id == self._selected_room_id:
-                self._append_sc_formatted(payload.get("time_received", ""),
-                                          payload.get("sc") or {},
-                                          pending=not payload.get("saved", True),
-                                          count_unseen=True)
+            # 分发给所有绑定该房间的 SC 视图（主视图 + 该房间的独立窗口）
+            panels = self.sc_panels_for(room_id)
+            if panels:
                 self._sc_total[room_id] = self._sc_total.get(room_id, 0) + 1
-                self._update_sc_total_label()
+                for panel in panels:
+                    panel.append_sc(payload.get("time_received", ""),
+                                    payload.get("sc") or {},
+                                    pending=not payload.get("saved", True),
+                                    count_unseen=True)
+                    panel.update_total()
         elif event_type == "delete":
-            if room_id == self._selected_room_id:
+            for panel in self.sc_panels_for(room_id):
                 for sc_id in payload.get("ids", []):
-                    self._mark_sc_deleted(sc_id)
+                    panel.mark_sc_deleted(sc_id)
         elif event_type == "stopped":
             self.client_states[room_id] = "stopped"
             self._refresh_row(room_id)
@@ -2754,20 +2674,19 @@ class QtScMonitorApp(QMainWindow):
                 self.occupiers[room_id] = holder
             self._refresh_row(room_id)
         elif event_type == "dm":
-            if hasattr(self, "dm_panel"):
-                self._dm_pending.append(payload)
+            # 按房间分桶：只在有视图订阅该房间时保留（没有视图的房间不累积负载）
+            if self.dm_panels_for(room_id):
+                self._dm_pending.setdefault(int(room_id), []).append(payload)
         elif event_type == "online_count":
             count = int(payload.get("count") or 0)
             if count > 0:
                 self.viewers[room_id] = count
-                if room_id == self._selected_room_id:
-                    self._update_sc_header(room_id)
+                self._refresh_sc_header(room_id)
         elif event_type == "guards":
             num = int(payload.get("num") or -1)
             if num >= 0:
                 self.guard_num[room_id] = num
-                if room_id == self._selected_room_id:
-                    self._update_sc_header(room_id)
+                self._refresh_sc_header(room_id)
         elif event_type == "reconnecting":
             log_live.debug("房间 %s 连接中断，%.1f 秒后进行第 %d 次重连",
                          room_id, float(payload.get("delay") or 0),
@@ -2781,31 +2700,6 @@ class QtScMonitorApp(QMainWindow):
             self.client_states[room_id] = "stopped"
             self._refresh_row(room_id)
             self._refresh_buttons()
-
-    def _mark_sc_deleted(self, sc_id) -> None:
-        """实时标记已删除/退款的 SC：整条置灰并在行尾追加说明。"""
-        doc = self.sc_text.document()
-        target = str(sc_id)
-        block = doc.begin()
-        while block.isValid():
-            if block.textLayout():
-                it = block.begin()
-                while not it.atEnd():
-                    frag = it.fragment()
-                    if frag.isValid() and frag.charFormat().property(_SC_ID_KEY) == target:
-                        # 整块置灰 + 行尾追加说明
-                        cursor = self.sc_text.textCursor()
-                        cursor.setPosition(block.position())
-                        cursor.select(QTextCursor.BlockUnderCursor)
-                        del_fmt = QTextCharFormat()
-                        del_fmt.setForeground(QColor(SC_PRICE_COLORS["del"]))
-                        cursor.mergeCharFormat(del_fmt)
-                        cursor.movePosition(QTextCursor.EndOfBlock)
-                        cursor.insertText("  （已删除，退款）", del_fmt)
-                        return
-                    it += 1
-            block = block.next()
-        self._append_info(f"SC {sc_id} 已被删除（退款）")
 
     # ---------- Cookie 获取 ----------
 
@@ -2994,8 +2888,10 @@ class QtScMonitorApp(QMainWindow):
         log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self._room_order))
         self._window_size_log.flush()    # 退出前把待写的窗口尺寸变化补上
         self._splitter_size_log.flush()
-        if hasattr(self, "dm_panel"):
-            self.dm_panel.destroy_popups()
+        # 先回收房间独立窗口（各自保存几何、注销视图），再销毁主界面残留的弹幕弹窗
+        self._close_room_windows()
+        for panel in list(self._dm_panels):
+            panel.destroy_popups()
         window = getattr(self, "preview", None)
         if window is not None:  # 预览浮窗：停播放、回收回环代理，并把浮窗一起关掉
             window.stop(reason="程序退出", close=True)
