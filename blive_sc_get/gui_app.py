@@ -111,8 +111,108 @@ AUTOSCROLL_SPEED = 0.5
 TREE_COLUMN_MIN_WIDTHS = {"room": 60, "anchor": 60, "status": 60, "notify": 40,
                           "title": 80, "note": 60}
 
-SORT_MODE_TEXTS = {"manual": "手动拖动", "room": "按房间号", "anchor": "按主播名",
+SORT_MODE_TEXTS = {"manual": "自定义排序", "room": "按房间号", "anchor": "按主播名",
                    "status": "按直播状态"}
+"""排序方案（下拉里的显示名）。``manual`` 即「自定义排序」：显示用户自己拖出来的顺序，
+也是唯一允许拖动调整的方案；其余方案的顺序由规则决定（ROADMAP 85）。"""
+
+SORT_MODE_HELP = {
+    "manual": "自定义排序\n\n"
+              "· 显示你自己拖出来的顺序（配置文件里保存的就是它）\n"
+              "· 按住行上下拖动即可调整；Ctrl / Shift 多选后拖动可整块移动\n"
+              "· 双击行可加入 / 停止预览\n"
+              "· 其它排序方案只影响显示，切回来仍是这个顺序",
+    "room": "按房间号\n\n"
+            "· 房间号从小到大排列\n"
+            "· 不可拖动：想调整顺序请先切到「自定义排序」",
+    "anchor": "按主播名\n\n"
+              "· 按主播昵称排列（没有主播名的排在最后，其次按房间号）\n"
+              "· 不可拖动：想调整顺序请先切到「自定义排序」",
+    "status": "按直播状态\n\n"
+              "· 正在直播：最近开播的排在最上\n"
+              "· 已下播：最近关播的靠前（越早关播越靠后）\n"
+              "· 轮播中：按未开播处理（不单独成段）\n"
+              "· 从未开播过：按「自定义排序」的顺序排在最后\n"
+              "· 收到开播 / 关播信号会自动重排\n"
+              "· 不可拖动：想调整顺序请先切到「自定义排序」",
+}
+"""排序方案的完整说明：收在排序栏的「ⓘ」按钮里（点击弹出），不再占一行显示。
+
+以前这段文案直接铺在排序栏右侧，窗口一窄就被裁掉（用户反馈「提示太长、显示不全」）。
+"""
+
+
+def update_live_activity(live_since: dict, offline_at: dict, room_id: int,
+                         is_live: bool, stamp: Optional[float] = None) -> bool:
+    """记录某房间进入 / 离开「直播中」的先后标记（就地更新两个字典），返回是否变化。
+
+    - 进入直播中：写开播标记并清掉旧的关播标记；
+    - 离开直播中：写关播标记并清掉开播标记（此后它在下播组里按关播标记倒序排）；
+    - 状态没变则**不动标记**（周期复核会反复报同一状态，若每次都刷新，「开播时间」会被
+      一路推后，排序结果就乱跳）。
+
+    ``stamp`` 越大表示越晚发生。不传时自动取「现有标记的最大值 + 1」——这样调用方不必
+    维护计数器，也避免直接拿 ``time.monotonic()`` 当标记（**Windows 上它的精度只有约
+    15 毫秒**，同一轮事件里几次开播/关播会拿到相同值，排序就分不出先后了）。
+
+    从未开播过的房间不会留下任何标记（因此排序时落在最后，按自定义顺序排列）。
+    """
+    if is_live:
+        if room_id in live_since:
+            return False
+        live_since[room_id] = float(_next_activity_stamp(live_since, offline_at)
+                                    if stamp is None else stamp)
+        offline_at.pop(room_id, None)
+        return True
+    if room_id in live_since:
+        live_since.pop(room_id, None)
+        offline_at[room_id] = float(_next_activity_stamp(live_since, offline_at)
+                                    if stamp is None else stamp)
+        return True
+    return False
+
+
+def _next_activity_stamp(live_since: dict, offline_at: dict) -> float:
+    """下一个先后标记：现有标记的最大值 + 1（严格递增，与时钟精度无关）。"""
+    values = list(live_since.values()) + list(offline_at.values())
+    return (max(values) if values else 0.0) + 1.0
+
+
+def order_room_ids(base_order, mode: str, *, live_states=None, anchor_names=None,
+                   live_since=None, offline_at=None):
+    """按排序方案算出**显示顺序**（纯函数，Tk / Qt 两版共用）。
+
+    - ``manual``（自定义排序）：原样返回 ``base_order``（用户拖出来的顺序）；
+    - ``room``：按房间号升序；
+    - ``anchor``：按主播名（无主播名的排最后，其次按房间号，与原 Tk 版一致）；
+    - ``status``（按直播状态）：
+      ① 正在直播的在前，按**开播时间倒序**（最近开播在最上；同一程序启动时就已在
+         直播、没有开播记录的，按 ``base_order`` 紧随其后）；
+      ② 其余（含**轮播中**——不特殊处理、与下播同样对待，以及从未开播的）在后，
+         有关播记录的按**关播时间倒序**（最近关播的靠前），无记录的按 ``base_order``
+         排在这一组的最后。
+    """
+    ids = list(base_order)
+    if mode == "room":
+        ids.sort()
+        return ids
+    if mode == "anchor":
+        names = anchor_names or {}
+        ids.sort(key=lambda r: (not names.get(r), names.get(r, ""), r))
+        return ids
+    if mode != "status":
+        return ids
+    states = live_states or {}
+    live_since = live_since or {}
+    offline_at = offline_at or {}
+    position = {room_id: index for index, room_id in enumerate(base_order)}
+    live = [r for r in ids if states.get(r) == "直播中"]
+    rest = [r for r in ids if states.get(r) != "直播中"]
+    live.sort(key=lambda r: (0, -float(live_since[r]), position[r])
+              if r in live_since else (1, 0.0, position[r]))
+    rest.sort(key=lambda r: (0, -float(offline_at[r]), position[r])
+              if r in offline_at else (1, 0.0, position[r]))
+    return live + rest
 
 PANE_RATIO = (2.0, 3.5, 4.5)
 """三个板块（房间列表 : 醒目留言 : 弹幕）的默认高度占比 2:3.5:4.5。
@@ -741,6 +841,11 @@ class ScMonitorApp:
         self._dm_grew_delta = 0  # 弹幕区向下扩展的像素数
         self._pane_ratio_done = False  # 三板块默认占比是否已应用（仅首次布局）
         self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
+        # 「按直播状态」排序用的时间记录（仅内存，ROADMAP 85）：
+        #   开播时刻 / 关播时刻（time.monotonic()），只记本程序观察到的状态跳变
+        self._live_since: Dict[int, float] = {}
+        self._offline_at: Dict[int, float] = {}
+        self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
         # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
         self._room_windows: Dict[int, object] = {}
         # 发送弹幕相关状态（仅主线程读写）
@@ -892,15 +997,16 @@ class ScMonitorApp:
         sort_bar.pack(side="top", fill="x", padx=6, pady=(0, 4))
         ttk.Label(sort_bar, text="排序：").pack(side="left")
         self.sort_mode_var = tk.StringVar(value=SORT_MODE_TEXTS[self.ui_prefs["sort_mode"]])
-        sort_box = ttk.Combobox(sort_bar, textvariable=self.sort_mode_var, width=10,
-                                values=list(SORT_MODE_TEXTS.values()),
-                                state="readonly")
-        sort_box.pack(side="left", padx=(0, 6))
-        self.sort_btn = ttk.Button(sort_bar, text="排序", command=self._on_sort_clicked)
-        self.sort_btn.pack(side="left", padx=(0, 8))
-        self.pin_live_var = tk.BooleanVar(value=bool(self.ui_prefs["pin_live"]))
-        ttk.Checkbutton(sort_bar, text="直播中置顶", variable=self.pin_live_var,
-                        command=self._on_pin_live_toggled).pack(side="left")
+        self.sort_box = ttk.Combobox(sort_bar, textvariable=self.sort_mode_var, width=10,
+                                     values=list(SORT_MODE_TEXTS.values()),
+                                     state="readonly")
+        self.sort_box.pack(side="left", padx=(0, 6))
+        # 切换即生效（旧版需要先点「排序」按钮；「直播中置顶」勾选框已并入「按直播状态」）
+        self.sort_box.bind("<<ComboboxSelected>>", self._on_sort_mode_changed)
+        # 说明文案较长（窗口窄时会被裁掉），收进「ⓘ」按钮：点击弹出完整说明
+        # （此处先不 pack：位置统一在整栏构建完、贴最右摆放，与 Qt 版对齐）
+        self.sort_info_btn = ttk.Button(sort_bar, text="ⓘ", width=2,
+                                        command=self._show_sort_help)
         self.notify_overlay_var = tk.BooleanVar(
             value=bool(self.ui_prefs.get("notify_overlay", True)))
         ttk.Checkbutton(sort_bar, text="悬浮窗通知", variable=self.notify_overlay_var,
@@ -923,8 +1029,9 @@ class ScMonitorApp:
         sound_box.bind("<<ComboboxSelected>>", self._on_sound_selected)
         ttk.Button(sort_bar, text="试听",
                    command=self._play_notify_sound).pack(side="left", padx=(4, 0))
-        ttk.Label(sort_bar, text="（按住行拖动可调整顺序，Ctrl 可多选）",
-                  foreground="#888888").pack(side="left", padx=(8, 0))
+        # 排序说明固定在排序栏最右（与 Qt 版一致）：点击弹出当前方案的完整说明
+        # （原先紧跟下拉的长提示已删除——两版文案只保留 SORT_MODE_HELP 这一份）
+        self.sort_info_btn.pack(side="right")
 
         columns = ("room", "anchor", "status", "notify", "title", "note")
         # 三个板块（房间列表 / SC / 弹幕）放入垂直 PanedWindow：
@@ -2162,7 +2269,11 @@ class ScMonitorApp:
             return
         iid = self.tree.identify_row(event.y)
         if iid:
-            self._drag_iid = iid
+            if self._drag_allowed():
+                self._drag_iid = iid
+            else:
+                # 非「自定义排序」时不允许拖动：顺序由规则决定，拖了也会被覆盖
+                self._warn_drag_disabled()
         if col in ("#1", "#2", "#4"):
             # 房间号 / 主播：点击跳转；提醒：切换开播提醒开关——
             # 都不改变选中直播间（否则点开关会连带把 SC/弹幕面板切走）
@@ -2226,17 +2337,55 @@ class ScMonitorApp:
                 log_room.info("房间 %s 开播提醒：%s", room_id,
                               "开" if entry.notify_live else "关")
 
-    def _on_sort_clicked(self) -> None:
-        """手动触发排序：按所选方式重排，直播中置顶开关生效，并记忆新顺序。"""
+    def _sort_mode(self) -> str:
+        """当前排序方案的内部键值（按下拉显示名反查）。"""
+        text = self.sort_mode_var.get()
+        return next((k for k, v in SORT_MODE_TEXTS.items() if v == text), "manual")
+
+    def _sort_help_text(self) -> str:
+        return SORT_MODE_HELP.get(self._sort_mode(), "")
+
+    def _show_sort_help(self) -> None:
+        """弹出当前排序方案的完整说明（排序栏放不下长文案，收进「ⓘ」按钮）。"""
+        messagebox.showinfo(f"排序：{SORT_MODE_TEXTS.get(self._sort_mode(), '')}",
+                            self._sort_help_text(), parent=self.root)
+
+    def _drag_allowed(self) -> bool:
+        """只有「自定义排序」允许拖动（其它方案的顺序由规则决定，拖了也会被覆盖）。"""
+        return self._sort_mode() == "manual"
+
+    def _on_sort_mode_changed(self, _event=None) -> None:
+        """切换排序方案：立即重排 + 落盘（不再需要「排序」按钮）。"""
+        mode = self._sort_mode()
+        self.ui_prefs["sort_mode"] = mode
         self._apply_sort()
         self._save_config()
-        log_room.info("手动触发排序（直播中置顶：%s）",
-                      "开" if self.pin_live_var.get() else "关")
+        log_room.info("排序方案切换为「%s」（%s）", SORT_MODE_TEXTS.get(mode, mode),
+                      "可拖动调整" if mode == "manual" else "由规则自动排序")
 
-    def _on_pin_live_toggled(self) -> None:
-        self.ui_prefs["pin_live"] = bool(self.pin_live_var.get())
-        self._save_config()
-        log_room.info("「直播中置顶」：%s", "开" if self.pin_live_var.get() else "关")
+    def _warn_drag_disabled(self) -> None:
+        """非自定义排序时尝试拖动：把「ⓘ」临时变成警示图标并记日志。
+
+        详细原因就在「ⓘ」的说明里（含「不可拖动」与怎么切换），所以这里不弹窗打断操作。
+        """
+        if self._drag_warn_id is not None:
+            return
+        log_room.debug("排序方案「%s」不可拖动，已忽略本次拖动（请切到「自定义排序」）",
+                       SORT_MODE_TEXTS.get(self._sort_mode(), ""))
+        self.sort_info_btn.configure(text="⚠")
+        self._drag_warn_id = self.root.after(2500, self._restore_sort_hint)
+
+    def _restore_sort_hint(self) -> None:
+        self._drag_warn_id = None
+        self.sort_info_btn.configure(text="ⓘ")
+
+    def _reorder_for_live_change(self, room_id: int, status_text: str) -> None:
+        """开播 / 关播后的实时重排（仅「按直播状态」方案；其它方案与状态无关）。"""
+        if self._sort_mode() != "status":
+            return
+        log_room.info("房间 %s %s，按直播状态重排列表", room_id,
+                      "开播" if status_text == "直播中" else "下播")
+        self._apply_sort()
 
     def _on_overlay_toggled(self) -> None:
         self.ui_prefs["notify_overlay"] = bool(self.notify_overlay_var.get())
@@ -3591,30 +3740,26 @@ class ScMonitorApp:
                      DM_TEXT_MAX_LINES)
 
     def _sorted_room_ids(self) -> List[int]:
-        mode = next(k for k, v in SORT_MODE_TEXTS.items() if v == self.sort_mode_var.get())
+        """当前排序方案下的显示顺序（由纯函数 ``order_room_ids`` 算出，两版共用）。"""
+        mode = self._sort_mode()
         self.ui_prefs["sort_mode"] = mode
-        ids = list(self.entries)
-        if mode == "room":
-            ids.sort()
-        elif mode == "anchor":
-            ids.sort(key=lambda r: (not self.anchor_names.get(r), self.anchor_names.get(r, ""), r))
-        elif mode == "status":
-            rank = {"直播中": 0, "轮播中": 1}
-            ids.sort(key=lambda r: (rank.get(self.live_state.get(r, ""), 2), r))
-        if self.pin_live_var.get():
-            live = [r for r in ids if self.live_state.get(r) == "直播中"]
-            rest = [r for r in ids if r not in live]
-            ids = live + rest
-        return ids
+        return order_room_ids(
+            list(self.entries), mode,
+            live_states=self.live_state, anchor_names=self.anchor_names,
+            live_since=self._live_since, offline_at=self._offline_at)
 
     def _apply_sort(self) -> None:
+        """按当前方案重排**显示顺序**。
+
+        ``entries`` 的顺序是**自定义顺序**（用户拖出来的、也是配置里存储的顺序），
+        只由拖动/增删房间改动——排序方案切换不得覆盖它，否则切回「自定义排序」就复原不了。
+        """
         order = self._sorted_room_ids()
         for idx, room_id in enumerate(order):
             iid = str(room_id)
             if self.tree.exists(iid):
                 self.tree.move(iid, "", idx)
-        self.entries = {rid: self.entries[rid] for rid in order if rid in self.entries}
-        self._apply_medal_task_order()  # 粉丝牌页任务列表实时跟随排序
+        self._apply_medal_task_order()  # 粉丝牌页任务列表实时跟随显示顺序
 
     def _get_selected_room_id(self) -> Optional[int]:
         selection = self.tree.selection()
@@ -3701,6 +3846,7 @@ class ScMonitorApp:
             self.anchor_names[room_id] = payload["anchor_name"]
         self._save_config()
         self._insert_row(room_id)
+        self._apply_sort()  # 新房间按当前排序方案落位（自定义排序下追加到末尾）
         self._sync_medal_task_rows()  # 粉丝牌页新增行并保持顺序
         self.tree.set(str(room_id), "title", payload.get("title") or "")
         self.tree.selection_set(str(room_id))
@@ -4441,6 +4587,10 @@ class ScMonitorApp:
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             prev_text = self.live_state.get(room_id)
             self.live_state[room_id] = status_text
+            # 记录开播/关播时刻（「按直播状态」排序用），必要时实时重排列表
+            if update_live_activity(self._live_since, self._offline_at, int(room_id),
+                                    status_text == "直播中"):
+                self._reorder_for_live_change(room_id, status_text)
             if payload.get("anchor_name"):
                 self.anchor_names[room_id] = payload["anchor_name"]
             entry = self.entries.get(room_id)
@@ -4574,8 +4724,12 @@ class ScMonitorApp:
         if anchor:
             self.anchor_names[room_id] = anchor
         if self.client_states.get(room_id) not in ("running", "starting"):
-            self.live_state[room_id] = LIVE_STATUS_TEXT.get(
-                int(payload.get("live_status") or 0), "未知")
+            status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
+            self.live_state[room_id] = status_text
+            # 只读查询也会改状态（无弹幕连接的房间）：同样记录时间并实时重排
+            if update_live_activity(self._live_since, self._offline_at, int(room_id),
+                                    status_text == "直播中"):
+                self._reorder_for_live_change(room_id, status_text)
         if self.tree.exists(str(room_id)):
             self.tree.set(str(room_id), "title", payload.get("title") or "")
             if anchor:

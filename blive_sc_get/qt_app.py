@@ -80,7 +80,11 @@ from .gui_app import (
     EMOTICON_REFRESH_COOLDOWN_S,
     MEDAL_AUTO_INTERVAL_MS,
     PANE_RATIO,
+    SORT_MODE_HELP,
+    SORT_MODE_TEXTS,
+    order_room_ids,
     parse_add_input,
+    update_live_activity,
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
@@ -356,6 +360,11 @@ class ProtectedLinkTable(QTableWidget):
         self.setDropIndicatorShown(False)
         self.on_reordered = None
         """拖动结束后的回调 ``(拖动前的房间号顺序, 被拖的行号, 插入行号)``（主界面注入）。"""
+        self.drag_enabled = True
+        """是否允许拖动排序（ROADMAP 85）：只有「自定义排序」方案下为真；其余方案的顺序
+        由规则决定，拖动会被忽略（否则用户拖了也没反应，徒增困惑）。"""
+        self.on_drag_blocked = None
+        """拖动被拒绝时的回调（主界面用它提示「请先切到自定义排序」，注入）。"""
         self._drag_armed = False
         """左键已按下、可能演变成拖动（移动够远才真的进入拖动模式）。"""
         self._dragging = False
@@ -573,6 +582,12 @@ class ProtectedLinkTable(QTableWidget):
         if (self._drag_armed and pressed is not None
                 and event.buttons() & Qt.LeftButton
                 and (pos - pressed).manhattanLength() >= QApplication.startDragDistance()):
+            if not self.drag_enabled:
+                # 当前排序方案不允许拖动：不进入拖动模式，并通知主界面提示一次
+                self._drag_armed = False
+                if self.on_drag_blocked is not None:
+                    self.on_drag_blocked()
+                return
             selected = [index.row() for index in self.selectedIndexes()]
             rows = drag_source_rows(selected, self._press_row, self.rowCount())
             if rows:
@@ -622,10 +637,6 @@ LIVE_TAG_COLORS = {
     "stopped": QColor("#c62828"),
     "disabled": QColor("#999999"),
 }
-
-SORT_MODE_TEXTS = {"manual": "手动拖动", "room": "按房间号", "anchor": "按主播名",
-                   "status": "按直播状态"}
-
 
 def _notify_sound_play(sound: str) -> None:
     """后台线程播放提示音（Beep/MessageBeep），静音或非 Windows 时跳过。"""
@@ -767,8 +778,13 @@ class QtScMonitorApp(QMainWindow):
         self.ui_prefs: dict = load_ui_prefs(self.config_path)
         self.app_config = load_app_config()
 
-        # 房间列表显示顺序（按显示顺序的房间号）
-        self._room_order: List[int] = list(self.entries.keys())
+        # 排序（ROADMAP 85）：_custom_order = 自定义顺序（用户拖出来的，也是配置里的
+        # 存储顺序）；_room_order = 当前**显示**顺序（按方案由 order_room_ids 算出）
+        self._custom_order: List[int] = list(self.entries.keys())
+        self._room_order: List[int] = list(self._custom_order)
+        # 「按直播状态」排序用的时间记录（仅内存）：开播时刻 / 关播时刻（time.monotonic）
+        self._live_since: Dict[int, float] = {}
+        self._offline_at: Dict[int, float] = {}
 
         self.client_states: Dict[int, str] = {}
         self.live_state: Dict[int, str] = {}
@@ -813,6 +829,7 @@ class QtScMonitorApp(QMainWindow):
             log_window, delay=0.6, template="分隔条位置 {first} → {last}")
         self._medal_tab_refresh_ms = 90 * 1000
         self._pane_ratio_done = False  # 三板块默认占比是否已按窗口高度应用
+        self._drag_warned = False       # 「当前排序不可拖动」提示是否正在显示（防重复刷）
         self.overlay = QtToastOverlayManager()
 
         self._setup_logging()
@@ -832,6 +849,8 @@ class QtScMonitorApp(QMainWindow):
         self._room_info_timer = QTimer(self)
         self._room_info_timer.timeout.connect(self._room_info_tick)
         self._room_info_timer.start(ROOM_INFO_REFRESH_MS)
+        # 启动就按记忆的排序方案显示顺序（「自定义排序」时即配置里的顺序）
+        self._refresh_display_order()
         self._populate_rows()
         self.hub.start()
 
@@ -925,15 +944,11 @@ class QtScMonitorApp(QMainWindow):
         sort_bar.addWidget(QLabel("排序："))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(list(SORT_MODE_TEXTS.values()))
-        self.sort_combo.setCurrentText(SORT_MODE_TEXTS.get(self.ui_prefs["sort_mode"], "手动拖动"))
+        self.sort_combo.setCurrentText(
+            SORT_MODE_TEXTS.get(self.ui_prefs["sort_mode"], SORT_MODE_TEXTS["manual"]))
+        # 切换即生效（旧版要先点「排序」按钮；「直播中置顶」勾选框已并入「按直播状态」）
+        self.sort_combo.currentTextChanged.connect(self._on_sort_mode_changed)
         sort_bar.addWidget(self.sort_combo)
-        self.sort_btn = QPushButton("排序")
-        self.sort_btn.clicked.connect(self._on_sort_clicked)
-        sort_bar.addWidget(self.sort_btn)
-        self.pin_live_check = QCheckBox("直播中置顶")
-        self.pin_live_check.setChecked(bool(self.ui_prefs.get("pin_live", False)))
-        self.pin_live_check.toggled.connect(self._on_pin_live_toggled)
-        sort_bar.addWidget(self.pin_live_check)
         self.overlay_check = QCheckBox("悬浮窗通知")
         self.overlay_check.setChecked(bool(self.ui_prefs.get("notify_overlay", True)))
         self.overlay_check.toggled.connect(self._on_overlay_toggled)
@@ -965,10 +980,14 @@ class QtScMonitorApp(QMainWindow):
         self.preview_btn.clicked.connect(self._on_preview_clicked)
         sort_bar.addWidget(self.preview_btn)
         self.refresh_preview_button()  # 初始：未选中房间时置灰
-        sort_bar.addStretch(1)  # 提示靠右：窗口变窄时先压缩提示，而不是让控件挤成一团
-        hint = QLabel("（拖动行排序，Ctrl 多选；双击行加入/停止预览）")
-        hint.setStyleSheet("color:#888888;")
-        sort_bar.addWidget(hint)
+        sort_bar.addStretch(1)  # 让说明按钮固定贴最右（窗口变窄时先压缩中间空白）
+        # 说明文案较长（窗口窄时会被裁掉），收进「ⓘ」按钮：悬浮看摘要、点击弹出完整说明
+        # （位置与 Tk 版一致：都在排序栏最右）
+        self.sort_info_btn = QPushButton("ⓘ")
+        self.sort_info_btn.setFixedWidth(28)
+        self.sort_info_btn.setToolTip(SORT_MODE_HELP.get(self.ui_prefs["sort_mode"], ""))
+        self.sort_info_btn.clicked.connect(self._show_sort_help)
+        sort_bar.addWidget(self.sort_info_btn)
         outer.addLayout(sort_bar)
 
         # 三板块垂直分割（房间列表 / SC / 弹幕占位）
@@ -1012,6 +1031,9 @@ class QtScMonitorApp(QMainWindow):
         # 拖动排序：表格只回报「拖动前的行序快照 + 落点」，由主界面按**插入语义**重建行
         # （Qt 自己的落数据是「覆盖目标单元格 / 清空源单元格」语义，不能用，见 ProtectedLinkTable）
         self.table.on_reordered = self._on_rows_reordered
+        # 只有「自定义排序」允许拖动；其它方案下拖动会被忽略并给一次提示（ROADMAP 85）
+        self.table.on_drag_blocked = self._warn_drag_disabled
+        self.table.drag_enabled = self._drag_allowed()
         room_layout.addWidget(self.table, 1)
 
         # 房间操作行：备注 / 启停监听 / 删除
@@ -1279,6 +1301,8 @@ class QtScMonitorApp(QMainWindow):
         这里不能再自己调 ``_fit_table_height()``：``_populate_rows(fit_height=False)``（拖动排序
         后重建）会逐行调它，那样等于每插一行就把用户拖好的分隔条比例重置一次。
         """
+        if room_id not in self._custom_order:
+            self._custom_order.append(room_id)
         if room_id not in self._room_order:
             self._room_order.append(room_id)
         row = self._room_order.index(room_id)
@@ -1602,6 +1626,8 @@ class QtScMonitorApp(QMainWindow):
         new_order = move_items(rooms, src_rows, insert_at)
         dragged = rooms[src_rows[0]] if src_rows and src_rows[0] < len(rooms) else None
         self._room_order = new_order
+        # 拖动只在「自定义排序」下可用（其它方案会拒绝拖动），因此两者此时一致
+        self._custom_order = list(new_order)
         self._save_config()
         log_room.info("拖动排序完成，新顺序：%s", "、".join(str(r) for r in new_order))
         selected = dragged if dragged is not None else self._get_selected_room_id()
@@ -1695,8 +1721,12 @@ class QtScMonitorApp(QMainWindow):
             self.anchor_names[room_id] = anchor
         self.titles[room_id] = str(payload.get("title") or "")
         if self.client_states.get(room_id) not in ("running", "starting"):
-            self.live_state[room_id] = LIVE_STATUS_TEXT.get(
-                int(payload.get("live_status") or 0), "未知")
+            status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
+            self.live_state[room_id] = status_text
+            # 只读查询也会改状态：同样记录时间并实时重排（「按直播状态」方案）
+            if update_live_activity(self._live_since, self._offline_at, int(room_id),
+                                    status_text == "直播中"):
+                self._reorder_for_live_change(room_id, status_text)
         self._refresh_row(room_id)
         self._refresh_sc_header(room_id)
 
@@ -1777,7 +1807,8 @@ class QtScMonitorApp(QMainWindow):
         self.titles[room_id] = payload.get("title") or ""
         if payload.get("anchor_name"):
             self.anchor_names[room_id] = payload["anchor_name"]
-        self._insert_row(room_id)        # 新房间入列表（追加到 _room_order 末尾）
+        self._insert_row(room_id)        # 新房间入列表（追加到 _custom_order 末尾）
+        self._apply_sort()               # 按当前排序方案落位（自定义排序下就停在末尾）
         self._fit_table_height()         # 多了一行：重排板块高度（_insert_row 本身不再做）
         self.medal_tab.sync_task_rows()  # 粉丝牌页新增行并保持顺序
         self._save_config()              # 再落盘：配置里 rooms 的顺序就是列表顺序
@@ -1855,6 +1886,8 @@ class QtScMonitorApp(QMainWindow):
             if room_id in self._room_order:
                 self.table.removeRow(self._room_order.index(room_id))
                 self._room_order.remove(room_id)
+            if room_id in self._custom_order:
+                self._custom_order.remove(room_id)
         self._save_config()
         self.medal_tab.sync_task_rows()  # 粉丝牌页同步移除行
         self._fit_table_height()         # 行数减少：列表高度随之收缩
@@ -1884,47 +1917,90 @@ class QtScMonitorApp(QMainWindow):
         log_room.info("房间 %s 备注已保存：%s", room_id, text or "（清空）")
         self._refresh_row(room_id)
 
-    def _on_sort_clicked(self) -> None:
+    def _sort_mode(self) -> str:
+        """当前排序方案的内部键值（按显示名反查）。"""
         text = self.sort_combo.currentText()
-        mode = next((k for k, v in SORT_MODE_TEXTS.items() if v == text), "manual")
+        return next((k for k, v in SORT_MODE_TEXTS.items() if v == text), "manual")
+
+    def _sort_help_text(self) -> str:
+        return SORT_MODE_HELP.get(self._sort_mode(), "")
+
+    def _show_sort_help(self) -> None:
+        """弹出当前排序方案的完整说明（排序栏放不下长文案，收进「ⓘ」按钮）。"""
+        QMessageBox.information(self, f"排序：{SORT_MODE_TEXTS.get(self._sort_mode(), '')}",
+                                self._sort_help_text())
+
+    def _drag_allowed(self) -> bool:
+        """只有「自定义排序」允许拖动（其它方案的顺序由规则决定，拖了也会被覆盖）。"""
+        return self._sort_mode() == "manual"
+
+    def _on_sort_mode_changed(self, _text: str = "") -> None:
+        """切换排序方案：立即重排 + 落盘 + 更新提示（不再需要「排序」按钮）。"""
+        mode = self._sort_mode()
         self.ui_prefs["sort_mode"] = mode
         self._apply_sort()
-        # 保存必须在重排**之后**：配置里 rooms 的顺序就是列表顺序，先存后排等于没记住排序
-        # （用户反馈「手动排序缺失记忆功能，重启窗口会重置排序」）
         self._save_config()
-        log_room.info("手动排序：方式 %s（显示 %s）", mode, text)
+        # 「ⓘ」的悬浮说明跟着方案走（点击弹出的完整说明见 _show_sort_help）
+        self.sort_info_btn.setToolTip(self._sort_help_text())
+        table = getattr(self, "table", None)
+        if table is not None:
+            table.drag_enabled = self._drag_allowed()
+        log_room.info("排序方案切换为「%s」（%s）", SORT_MODE_TEXTS.get(mode, mode),
+                      "可拖动调整" if mode == "manual" else "由规则自动排序")
+
+    def _refresh_display_order(self) -> None:
+        """按当前方案重算 ``_room_order``（显示顺序）；``_custom_order`` 不受影响。"""
+        mode = self._sort_mode()
+        self.ui_prefs["sort_mode"] = mode
+        self._room_order = order_room_ids(
+            [r for r in self._custom_order if r in self.entries], mode,
+            live_states=self.live_state, anchor_names=self.anchor_names,
+            live_since=self._live_since, offline_at=self._offline_at)
 
     def _apply_sort(self) -> None:
-        mode = self.ui_prefs.get("sort_mode", "manual")
-        ids = [r for r in self._room_order if r in self.entries]
-        if mode == "room":
-            ids.sort()
-        elif mode == "anchor":
-            ids.sort(key=lambda r: self.anchor_names.get(r, ""))
-        elif mode == "status":
-            # 与 Tk 版一致：直播中 → 轮播中 → 其余（同档内按房间号）
-            rank = {"直播中": 0, "轮播中": 1}
-            ids.sort(key=lambda r: (rank.get(self.live_state.get(r) or "", 2), r))
-        # manual 保持当前顺序
-        self._room_order = ids
-        self._populate_rows()
-        if self._selected_room_id and self._selected_room_id in self._room_order:
-            self._select_room(self._selected_room_id)
+        """重算显示顺序并重建行。
 
-    def _on_pin_live_toggled(self, checked: bool) -> None:
-        self.ui_prefs["pin_live"] = checked
-        log_room.info("「直播中置顶」：%s", "开" if checked else "关")
-        if checked:
-            ids = [r for r in self._room_order if r in self.entries]
-            current = self._selected_room_id
-            ids.sort(key=lambda r: (self.live_state.get(r) != "直播中",
-                                    self._room_order.index(r)))
-            self._room_order = ids
-            self._populate_rows()
-            if current and current in self._room_order:
-                self._select_room(current)
-        # 置顶会改顺序：保存必须在重排**之后**（配置里 rooms 的顺序就是列表顺序）
-        self._save_config()
+        重建沿用拖动排序收尾那一套安全做法：``fit_height=False``（不重排板块高度，
+        否则会把用户拖好的分隔条比例重置）、重建期间屏蔽选中信号（否则清空 → 重填会连着
+        触发几次「切换直播间」，把 SC / 弹幕面板整段刷掉）。
+        """
+        self._refresh_display_order()
+        self.table.blockSignals(True)
+        try:
+            self._populate_rows(fit_height=False)
+        finally:
+            self.table.blockSignals(False)
+        selected = self._selected_room_id
+        if selected is not None and selected in self._room_order:
+            self._select_room(selected)
+
+    def _reorder_for_live_change(self, room_id: int, status_text: str) -> None:
+        """开播 / 关播后的实时重排（仅「按直播状态」方案；其它方案与状态无关）。"""
+        if self._sort_mode() != "status":
+            return
+        log_room.info("房间 %s %s，按直播状态重排列表", room_id,
+                      "开播" if status_text == "直播中" else "下播")
+        self._apply_sort()
+
+    def _warn_drag_disabled(self) -> None:
+        """非自定义排序时尝试拖动：把「ⓘ」临时变成警示图标并记日志。
+
+        详细原因就在「ⓘ」的说明里（含「不可拖动」与怎么切换），所以这里不弹窗打断操作。
+        """
+        if self._drag_warned:
+            return
+        self._drag_warned = True
+        log_room.debug("排序方案「%s」不可拖动，已忽略本次拖动（请切到「自定义排序」）",
+                       SORT_MODE_TEXTS.get(self._sort_mode(), ""))
+        self.sort_info_btn.setText("⚠")
+        self.sort_info_btn.setToolTip("当前排序方案不可拖动，请先切到「自定义排序」")
+        QTimer.singleShot(2500, self._restore_sort_hint)
+
+    def _restore_sort_hint(self) -> None:
+        self._drag_warned = False
+        if hasattr(self, "sort_info_btn"):
+            self.sort_info_btn.setText("ⓘ")
+            self.sort_info_btn.setToolTip(self._sort_help_text())
 
     def _on_overlay_toggled(self, checked: bool) -> None:
         self.ui_prefs["notify_overlay"] = checked
@@ -2629,6 +2705,10 @@ class QtScMonitorApp(QMainWindow):
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             prev_text = self.live_state.get(room_id)
             self.live_state[room_id] = status_text
+            # 记录开播/关播时刻（「按直播状态」排序用），必要时实时重排列表
+            if update_live_activity(self._live_since, self._offline_at, int(room_id),
+                                    status_text == "直播中"):
+                self._reorder_for_live_change(room_id, status_text)
             # 直播标题单独存：状态列显示直播状态，标题列显示标题（勿混用）
             self.titles[room_id] = payload.get("title") or ""
             if payload.get("anchor_name"):
@@ -2854,16 +2934,14 @@ class QtScMonitorApp(QMainWindow):
     # ---------- 保存 ----------
 
     def _save_config(self) -> None:
-        """保存配置：先把房间按**当前显示顺序**重排，再写盘（记忆排序）。
+        """保存配置：按**自定义顺序**写盘（记忆用户自己拖出来的顺序）。
 
-        配置文件里 ``rooms`` 的顺序就是房间列表顺序（启动时 ``_room_order`` 由
-        ``entries.keys()`` 初始化），所以不重排就等于「排序不记忆」——拖动 / 手动排序 /
-        「直播中置顶」的结果重启后全丢（用户反馈「手动排序缺失记忆功能，重启窗口会重置
-        排序」）。Tk 版在拖动结束时重排了 ``entries``，Qt 版此前漏了这一步；放在这里统一做：
-        任何改变顺序的路径都要经过 ``_save_config``，不必逐个补。
+        配置里 ``rooms`` 的顺序 = 启动时的自定义顺序，因此这里必须写 ``_custom_order``
+        而不是当前显示顺序（ROADMAP 85）：按房间号 / 主播名 / 直播状态这些方案只影响
+        显示，若把它们的顺序写进配置，切回「自定义排序」就复原不了了。
         """
-        order = ordered_room_ids(self._room_order, self.entries)
-        self._room_order = order
+        order = ordered_room_ids(self._custom_order, self.entries)
+        self._custom_order = order
         if order != list(self.entries):
             self.entries = {room_id: self.entries[room_id] for room_id in order}
         save_room_entries(self.config_path, self.entries.values(), ui=self.ui_prefs,

@@ -292,19 +292,18 @@ class GuiConfigTests(unittest.TestCase):
 
     def test_ui_prefs_roundtrip(self):
         save_room_entries(self.path, [RoomEntry(123)],
-                          ui={"sort_mode": "status", "pin_live": True,
-                              "notify_overlay": False, "notify_persist": True,
+                          ui={"sort_mode": "status", "notify_overlay": False,
+                              "notify_persist": True,
                               "notify_sound": "三连音", "dm_visible": True})
         self.assertEqual(load_ui_prefs(self.path),
-                         {"sort_mode": "status", "pin_live": True,
-                          "notify_overlay": False, "notify_persist": True,
+                         {"sort_mode": "status", "notify_overlay": False,
+                          "notify_persist": True,
                           "notify_sound": "三连音", "dm_visible": True,
                           "dm_emoticon_image": True,
                           "window_size": [0, 0],
                           "room_windows": {}})
         # 旧配置缺字段时的缺省值
-        save_room_entries(self.path, [RoomEntry(123)],
-                          ui={"sort_mode": "manual", "pin_live": False})
+        save_room_entries(self.path, [RoomEntry(123)], ui={"sort_mode": "manual"})
         prefs = load_ui_prefs(self.path)
         self.assertTrue(prefs["notify_overlay"])
         self.assertFalse(prefs["notify_persist"])
@@ -326,8 +325,17 @@ class GuiConfigTests(unittest.TestCase):
             '{"rooms": [], "ui": {"notify_system": false}}', encoding="utf-8")
         self.assertFalse(load_ui_prefs(self.path)["notify_overlay"])
 
+    def test_ui_prefs_migrates_legacy_pin_live(self):
+        """旧配置的「直播中置顶」勾选框（ROADMAP 85 起并入「按直播状态」排序方案）。"""
+        self.path.write_text(
+            '{"rooms": [], "ui": {"sort_mode": "manual", "pin_live": true}}',
+            encoding="utf-8")
+        self.assertEqual(load_ui_prefs(self.path)["sort_mode"], "status")
+        self.path.write_text('{"rooms": [], "ui": {"pin_live": false}}', encoding="utf-8")
+        self.assertEqual(load_ui_prefs(self.path)["sort_mode"], "manual")
+
     def test_ui_prefs_defaults(self):
-        expected = {"sort_mode": "manual", "pin_live": False,
+        expected = {"sort_mode": "manual",
                     "notify_overlay": True, "notify_persist": False,
                     "notify_sound": "上行双音", "dm_visible": False,
                     "dm_emoticon_image": True,
@@ -1171,21 +1179,20 @@ class EmoticonMemoryTests(unittest.TestCase):
     def test_roundtrip_with_rooms_and_ui(self):
         memory = {1: {"index": 2, "name": "房间专属"}, 2: {"index": 0, "name": ""}}
         save_room_entries(self.path, [RoomEntry(1), RoomEntry(2)],
-                          ui={"sort_mode": "manual", "pin_live": True},
+                          ui={"sort_mode": "manual"},
                           emoticon=memory)
         self.assertEqual(load_emoticon_memory(self.path), memory)
         # 房间列表与界面偏好不受影响
         self.assertEqual(load_room_entries(self.path), [RoomEntry(1), RoomEntry(2)])
         prefs = load_ui_prefs(self.path)
         self.assertEqual(prefs["sort_mode"], "manual")
-        self.assertTrue(prefs["pin_live"])
 
     def test_other_saves_do_not_drop_memory(self):
         memory = {7: {"index": 3, "name": "粉丝团"}}
         save_room_entries(self.path, [RoomEntry(7)], ui={}, emoticon=memory)
         # 不传 emoticon 的其他保存动作（改备注、排序等）不应抹掉记忆
         save_room_entries(self.path, [RoomEntry(7, note="备注")],
-                          ui={"pin_live": True})
+                          ui={"sort_mode": "status"})
         self.assertEqual(load_emoticon_memory(self.path), memory)
         self.assertEqual(load_room_entries(self.path)[0].note, "备注")
 

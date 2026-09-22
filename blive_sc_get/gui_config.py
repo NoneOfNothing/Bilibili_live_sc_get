@@ -15,6 +15,13 @@ from .log_categories import CATEGORY_DATA, get_logger
 logger = get_logger(CATEGORY_DATA, __name__)
 
 SORT_MODES = ("manual", "room", "anchor", "status")
+"""排序方案白名单。
+
+``manual`` 即界面上的「自定义排序」（显示用户拖动/手动调整得到的顺序）；
+``status`` 即「按直播状态」——直播中的按开播时间倒序，下播的（含轮播中，不做特殊
+处理）按关播时间倒序，随开播/关播信号实时重排。ROADMAP 85 起「直播中置顶」不再是
+独立开关，而是并入 ``status``。
+"""
 
 # notify_overlay：开播时是否弹右下角自绘悬浮窗（全局主开关；每房间提醒列独立控制是否提醒）
 # notify_persist：悬浮窗是否常驻（不自动关闭，需点击才消失；仅在 notify_overlay 开启时生效）
@@ -24,7 +31,6 @@ DEFAULT_NOTIFY_SOUND = "上行双音"
 
 DEFAULT_UI_PREFS: Dict[str, object] = {
     "sort_mode": "manual",
-    "pin_live": False,
     "notify_overlay": True,
     "notify_persist": False,
     "notify_sound": DEFAULT_NOTIFY_SOUND,
@@ -40,6 +46,8 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
 }
 """界面偏好默认值。
 
+``sort_mode`` 记忆上次选的排序方案（两版共用；ROADMAP 85 起「直播中置顶」并入
+「按直播状态」，旧配置的 ``pin_live`` 会在读取时迁移过去）。
 ``window_size`` 由 Qt 版在退出时写入、启动时恢复（Tk 版不使用，只原样写回）；
 ``dm_emoticon_image`` 同理只作用于 Qt 版（Tk 版不做内嵌，恒为文字）；
 ``room_windows`` 两版共用（按房间记忆独立窗口几何）。
@@ -207,7 +215,10 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
         return prefs
     if ui.get("sort_mode") in SORT_MODES:
         prefs["sort_mode"] = ui["sort_mode"]
-    prefs["pin_live"] = bool(ui.get("pin_live", False))
+    if ui.get("pin_live"):
+        # 旧版「直播中置顶」勾选框：ROADMAP 85 起并入「按直播状态」排序方案（一次性迁移）
+        prefs["sort_mode"] = "status"
+        logger.info("旧配置的「直播中置顶」已并入「按直播状态」排序方案")
     prefs["notify_overlay"] = bool(ui.get(
         "notify_overlay", ui.get("notify_system", True)))  # 兼容旧键名
     prefs["notify_persist"] = bool(ui.get("notify_persist", False))

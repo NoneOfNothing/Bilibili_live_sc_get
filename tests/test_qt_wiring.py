@@ -700,15 +700,17 @@ class QtRoomListInteractionTests(unittest.TestCase):
         self.assertIn("DROP_EDGE_PX", _names(helper), "未用统一的边缘阈值")
 
     def test_saved_order_matches_display_order(self):
-        """保存时必须按**显示顺序**重排房间，否则拖动 / 手动排序重启后会丢（记忆排序）。
+        """保存时必须按**自定义顺序**重排房间（ROADMAP 85）。
 
-        配置文件里 ``rooms`` 的顺序就是列表顺序（启动时 ``_room_order`` 由 ``entries.keys()``
-        初始化），所以排完不落盘 = 没记住。
+        配置里 ``rooms`` 的顺序是启动时的**自定义顺序**（用户拖出来的），其它排序方案
+        （按房间号 / 主播名 / 直播状态）只是显示层——若把显示顺序写进配置，切回
+        「自定义排序」就复原不了了。
         """
         host = _tree(HOST_MODULE)
         save = _method(host, HOST_CLASS, "_save_config")
-        self.assertIn("ordered_room_ids", _names(save), "保存前未按显示顺序重排房间")
-        self.assertIn("_room_order", _attr_names(save), "未使用当前显示顺序")
+        self.assertIn("ordered_room_ids", _names(save), "保存前未按顺序重排房间")
+        self.assertIn("_custom_order", _attr_names(save), "未使用自定义顺序")
+        self.assertNotIn("_room_order", _attr_names(save), "不该把显示顺序写进配置")
         self.assertIn("save_room_entries", _names(save), "未真正写盘")
 
     def test_wheel_works_while_dragging(self):
@@ -741,20 +743,22 @@ class QtRoomListInteractionTests(unittest.TestCase):
     def test_order_changing_actions_save_after_reordering(self):
         """改顺序的动作必须在**重排之后**保存，否则顺序不落盘（排序不记忆）。
 
-        配置里 ``rooms`` 的顺序就是列表顺序：先 ``_save_config()`` 再重排，等于存了个旧顺序，
-        重启自然被重置。
+        ROADMAP 85 后改顺序的路径有三条：拖动收尾（`move_items` 算出新顺序）、
+        切换排序方案（`_apply_sort` 重排显示）、新增房间（`_insert_row` 追加）。
         """
         host = _tree(HOST_MODULE)
 
         def first_line(node, attr):
             lines = [call.lineno for call in ast.walk(node)
                      if isinstance(call, ast.Call)
-                     and isinstance(call.func, ast.Attribute)
-                     and call.func.attr == attr]
+                     and ((isinstance(call.func, ast.Attribute)
+                           and call.func.attr == attr)
+                          or (isinstance(call.func, ast.Name)
+                              and call.func.id == attr))]
             return min(lines) if lines else None
 
-        for name, reorder in (("_on_sort_clicked", "_apply_sort"),
-                              ("_on_pin_live_toggled", "_populate_rows"),
+        for name, reorder in (("_on_rows_reordered", "move_items"),
+                              ("_on_sort_mode_changed", "_apply_sort"),
                               ("_on_add_result", "_insert_row")):
             handler = _method(host, HOST_CLASS, name)
             save = first_line(handler, "_save_config")
@@ -763,6 +767,50 @@ class QtRoomListInteractionTests(unittest.TestCase):
             self.assertIsNotNone(after, f"{name} 未重排行序（{reorder}）")
             self.assertGreater(save, after,
                                f"{name} 必须先把顺序排好再保存（现在是先保存后重排）")
+
+    def test_sort_mode_switch_applies_and_saves(self):
+        """排序方案切换即生效（ROADMAP 85）：去掉「排序」按钮与置顶勾选框。"""
+        host = _tree(HOST_MODULE)
+        build = _method(host, HOST_CLASS, "_build_rooms_tab")
+        attrs = _attr_names(build)
+        self.assertIn("_on_sort_mode_changed", attrs, "排序下拉未接切换处理")
+        self.assertNotIn("_on_sort_clicked", attrs, "「排序」按钮应已移除")
+        self.assertNotIn("pin_live_check", attrs, "「直播中置顶」勾选框应已移除")
+        # 排序说明收进「ⓘ」按钮：长文案不再铺在栏里（窗口窄时会被裁掉）
+        self.assertIn("sort_info_btn", attrs, "排序栏缺少「ⓘ」说明按钮")
+        self.assertIn("_show_sort_help", attrs, "「ⓘ」按钮未接说明弹窗")
+        self.assertNotIn("sort_hint", attrs, "长提示文案应已收进「ⓘ」按钮")
+        help_fn = _method(host, HOST_CLASS, "_show_sort_help")
+        self.assertIn("QMessageBox", _names(help_fn), "点击「ⓘ」应弹出完整说明")
+        handler = _method(host, HOST_CLASS, "_on_sort_mode_changed")
+        called = _called_attrs(handler)
+        self.assertIn("_apply_sort", called, "切换方案后未立即重排")
+        self.assertIn("_save_config", called, "切换方案后未落盘（重启要记忆排序选择）")
+        self.assertIn("drag_enabled", _attr_names(handler), "未同步拖动可用性")
+
+    def test_drag_disabled_outside_custom_order(self):
+        """非「自定义排序」时拖动被忽略并提示（避免「拖了没反应」）。"""
+        host = _tree(HOST_MODULE)
+        move = _method(host, "ProtectedLinkTable", "mouseMoveEvent")
+        self.assertIn("drag_enabled", _attr_names(move), "拖动前未检查是否允许拖动")
+        self.assertIn("on_drag_blocked", _attr_names(move), "拖动被拒时未通知主界面")
+        helper = _method(host, HOST_CLASS, "_drag_allowed")
+        consts = {node.value for node in ast.walk(helper) if isinstance(node, ast.Constant)}
+        self.assertIn("manual", consts, "只有「自定义排序」应允许拖动")
+        warn = _method(host, HOST_CLASS, "_warn_drag_disabled")
+        self.assertIn("sort_info_btn", _attr_names(warn), "拖动被拒时未提示用户")
+
+    def test_live_status_sort_is_realtime_and_keeps_custom_order(self):
+        """「按直播状态」实时重排；保存始终按自定义顺序（切回自定义排序能复原）。"""
+        host = _tree(HOST_MODULE)
+        client_event = _method(host, HOST_CLASS, "_on_client_event")
+        self.assertIn("update_live_activity", _names(client_event),
+                      "status 事件未记录开播/关播时刻")
+        self.assertIn("_reorder_for_live_change", _called_attrs(client_event),
+                      "开播/关播后未实时重排")
+        reorder = _method(host, HOST_CLASS, "_reorder_for_live_change")
+        consts = {node.value for node in ast.walk(reorder) if isinstance(node, ast.Constant)}
+        self.assertIn("status", consts, "只有「按直播状态」方案需要实时重排")
 
     def test_drag_hint_is_between_rows(self):
         """插入位置提示由表格**自己画**成一行细线（不再有 Qt 那套「框住整行」）。"""

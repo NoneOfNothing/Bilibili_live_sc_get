@@ -63,7 +63,7 @@ python -m venv .venv
 ## 4. 测试
 
 ```bash
-.venv\Scripts\python -m unittest discover -s tests -q   # 当前 436 项，全绿
+.venv\Scripts\python -m unittest discover -s tests -q   # 当前 456 项，全绿
 ```
 
 没有网络依赖。改动后**必跑**：`py_compile` + 这套 unittest；涉及 Qt 控件逻辑时先在
@@ -155,7 +155,33 @@ python -m venv .venv
   偏好落 `ui.dm_emoticon_image`；新开的窗口按当前偏好初始化。
   （Tk 版不内嵌表情图，没有这个开关。）
 
-## 10. 协作约定（请遵守）
+## 10. 排序方案（ROADMAP 85，两版共用同一份逻辑）
+
+- 排序栏只有**下拉**与**最右的一个「ⓘ」按钮**（**选中即生效**，不再有「排序」按钮与
+  「直播中置顶」勾选框），选择记在 `ui.sort_mode`；旧配置的 `pin_live=true` 在
+  `gui_config.load_ui_prefs` 里迁移为 `status`。
+- **排序说明收在「ⓘ」按钮里**（两版位置一致：排序栏最右）：文案是共用的 `SORT_MODE_HELP`
+  （多行，逐条写清该方案规则与能不能拖动），点击弹出完整说明（Qt `QMessageBox` / Tk
+  `messagebox.showinfo`，标题带方案名），Qt 另有悬浮提示。**长文案不再铺在栏里**——原先那行
+  随方案变化的提示在窗口变窄时会被裁掉（用户实测反馈「太长、显示不全」）。
+- **两层顺序**：`自定义顺序`（用户拖出来的，**唯一持久化**到 `gui_rooms.json` 的 `rooms`）与
+  `显示顺序`（= 自定义顺序 + 方案规则合成）。Qt 里分别是 `_custom_order` / `_room_order`
+  （`_save_config` 只写前者）；Tk 里是 `entries` 顺序（自定义）与 tree 行序（显示）。
+- **规则**（纯函数 `gui_app.order_room_ids`）：`manual` 原样返回；`room` 按房间号；`anchor`
+  按主播名（无名者最后）；`status` = 正在直播的按**开播先后倒序** + 已下播的按**关播先后倒序**
+  + 从未开播的按自定义顺序，**轮播中按未开播处理**（不单独成段）。
+- **实时重排**：开播/关播跳变（弹幕推送与 `_on_room_info` 的只读刷新都算）经
+  `gui_app.update_live_activity` 记录先后标记后重排，且**仅 `status` 方案**重排。
+  标记**不用时钟**：Windows 上 `time.monotonic()` 精度约 15ms，同一轮事件里几次状态变化会
+  撞成同值（实测踩到），改为「现有标记最大值 + 1」的自增标记。
+- **拖动只在 `manual`（自定义排序）可用**：Qt 看 `ProtectedLinkTable.drag_enabled` +
+  `on_drag_blocked`；Tk 看 `_drag_allowed()`（在 `_on_tree_press` 里就拦下，不记录拖动行）。
+  被拒时把「ⓘ」临时变成「⚠」（Qt 同步把悬浮提示改为「当前排序方案不可拖动，请先切到「自定义排序」」）
+  并记 debug 日志，2.5 秒后恢复——原因就在按钮里，不弹窗打断。
+- 测试：`tests/test_sort_modes.py`（排序合成、时间记录、文案），`tests/test_qt_wiring.py`
+  另有接线检查（切换即生效并落盘、禁用拖动、保存按自定义顺序）。
+
+## 11. 协作约定（请遵守）
 
 - 沟通语言：中文。
 - **不修改 `README.md` 与文档性内容，除非被明确指示**；`QT_PORTING.md`/`ROADMAP.md`/`CHANGELOG.md`
