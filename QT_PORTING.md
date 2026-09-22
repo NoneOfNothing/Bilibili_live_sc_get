@@ -65,7 +65,7 @@
 | 2.13 | 三板块默认占比 2:3.5:4.5 | `PANE_RATIO` + `_apply_default_pane_ratio` | `PANE_RATIO` + `_apply_pane_ratio()`（首次显示与弹幕区显隐时重算） | ✅ |
 | 2.14 | 拖动窗口时暂停 SC 换行（卡顿缓解） | `_on_root_configure`/`_restore_sc_wrap` | 未移植：Qt 的文本重排由原生实现，实测无需该优化 | n/a |
 | 2.8 | 未读计数徽标（SC/弹幕，滚回底清除） | `_unseen_badge_text`/`_sync_unseen_from_scroll` | `sc_badge`/`dm_badge` + `_sync_unseen_badges` | ✅ |
-| 2.9 | SC 头显粉丝牌名/等级 | `_update_sc_header` | 含房间/主播/标题/同接/舰长/粉丝牌（读 medal_tab 缓存） | ✅ |
+| 2.9 | SC 头显粉丝牌名/等级 | `_update_sc_header` | 含房间/主播/标题/同接/舰长/已播时长/粉丝牌（读 medal_tab 缓存） | ✅ |
 
 ### Cookie / 调试
 

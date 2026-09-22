@@ -69,7 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .api import ApiError, BilibiliLiveAPI, describe_send_error
+from .api import LIVE_STARTED_AT_KEY, ApiError, BilibiliLiveAPI, describe_send_error
 from .app_config import load_app_config
 from .browser_cookie import get_bilibili_cookie
 from .browser_rooms import is_room_being_recorded, read_room_lock_holder
@@ -85,6 +85,7 @@ from .gui_app import (
     order_room_ids,
     parse_add_input,
     update_live_activity,
+    update_live_started_at,
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
@@ -785,6 +786,9 @@ class QtScMonitorApp(QMainWindow):
         # 「按直播状态」排序用的时间记录（仅内存）：开播时刻 / 关播时刻（time.monotonic）
         self._live_since: Dict[int, float] = {}
         self._offline_at: Dict[int, float] = {}
+        # 「已播时长」的起点（epoch 秒，与上面的排序标记**职责分离**）：优先取接口给的
+        # 真实开播时刻，接口没有时回退为本地观测到的开播时刻；下播即清空
+        self.live_started_at: Dict[int, float] = {}
 
         self.client_states: Dict[int, str] = {}
         self.live_state: Dict[int, str] = {}
@@ -1687,6 +1691,7 @@ class QtScMonitorApp(QMainWindow):
             "anchor_name": anchor,
             "title": info.get("title") or "",
             "live_status": int(info.get("live_status") or 0),
+            "live_started_at": info.get(LIVE_STARTED_AT_KEY),
         }))
 
     def _room_info_tick(self) -> None:
@@ -1727,6 +1732,10 @@ class QtScMonitorApp(QMainWindow):
             if update_live_activity(self._live_since, self._offline_at, int(room_id),
                                     status_text == "直播中"):
                 self._reorder_for_live_change(room_id, status_text)
+            # 只读路径同样维护「已播时长」的起点（这类房间收不到弹幕 status 事件）
+            update_live_started_at(self.live_started_at, int(room_id),
+                                   status_text == "直播中",
+                                   payload.get("live_started_at"))
         self._refresh_row(room_id)
         self._refresh_sc_header(room_id)
 
@@ -1788,6 +1797,7 @@ class QtScMonitorApp(QMainWindow):
             "live_status": int(info.get("live_status") or 0),
             "anchor_name": anchor,
             "uid": anchor_uid,
+            "live_started_at": info.get(LIVE_STARTED_AT_KEY),
         }))
 
     def _on_add_result(self, payload: dict) -> None:
@@ -1804,6 +1814,10 @@ class QtScMonitorApp(QMainWindow):
                                           uid=int(payload.get("uid") or 0))
         self.client_states[room_id] = "starting"
         self.live_state[room_id] = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
+        # 新加的房间可能本来就在直播：立刻记下「已播」起点，不必等首次 status 事件
+        update_live_started_at(self.live_started_at, room_id,
+                               self.live_state[room_id] == "直播中",
+                               payload.get("live_started_at"))
         self.titles[room_id] = payload.get("title") or ""
         if payload.get("anchor_name"):
             self.anchor_names[room_id] = payload["anchor_name"]
@@ -2709,6 +2723,11 @@ class QtScMonitorApp(QMainWindow):
             if update_live_activity(self._live_since, self._offline_at, int(room_id),
                                     status_text == "直播中"):
                 self._reorder_for_live_change(room_id, status_text)
+            # 「已播时长」的起点（与上面的排序标记无关）：接口给的真实开播时刻优先，
+            # 没有则在本程序首次看到「直播中」时记本地观测，下播清空
+            update_live_started_at(self.live_started_at, int(room_id),
+                                   status_text == "直播中",
+                                   payload.get("live_started_at"))
             # 直播标题单独存：状态列显示直播状态，标题列显示标题（勿混用）
             self.titles[room_id] = payload.get("title") or ""
             if payload.get("anchor_name"):

@@ -12,6 +12,7 @@ import json
 import re
 import time
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -194,6 +195,63 @@ LIKE_INTERACT_URL = (
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 HOMEPAGE_URL = "https://www.bilibili.com/"
 BUVID_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+
+LIVE_STARTED_AT_KEY = "live_started_at"
+"""归一化后的开播时刻（epoch 秒）写在房间信息 dict 的这个键上。
+
+各接口给的形态不同（H5 是秒级时间戳、``get_info`` 是北京时间字符串），统一由
+:func:`parse_live_started_at` 归一化，上层（client / 两版 UI）只认这一个键。
+"""
+
+_LIVE_TIME_PLACEHOLDER = "0000-00-00 00:00:00"
+"""``room/v1/Room/get_info`` 未开播时给的开播时间占位值。"""
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+"""B 站 ``live_time`` 字符串是**北京时间**：解析时必须显式附加时区，否则非东八区
+环境算出来的「已播时长」会整体偏移 8 小时。"""
+
+LIVE_STARTED_FUTURE_TOLERANCE_S = 120.0
+"""开播时刻最多允许比本地时间晚这么多秒（容忍轻微时钟偏差），再多视为异常丢弃。"""
+
+
+def parse_live_started_at(raw: object, *, now: Optional[float] = None) -> Optional[int]:
+    """接口给的开播时刻 → epoch 秒；占位值 / 非法值 / 明显在未来 → ``None``（纯函数）。
+
+    实测（2026-09-22，本地 17 个直播间）两种形态：
+
+    - H5 ``getH5InfoByRoom`` → ``room_info.live_start_time``：**秒级时间戳**
+      （直播中 ``1790066140``、未开播与轮播均为 ``0``）；
+    - ``room/v1/Room/get_info`` → ``live_time``：**北京时间字符串**
+      （直播中 ``"2026-09-22 16:35:40"``、未开播为 ``"0000-00-00 00:00:00"``）。
+      （``getRoomInfoOld`` 实测返回 ``code=-400``，不可用，故不作回退源。）
+
+    两者换算一致（上述两值对应同一时刻）。取不到一律 ``None``，由调用方回退
+    「本地观测到的开播时刻」——**不要在这里编造时间**，否则时长会凭空开始计时。
+    """
+    if isinstance(raw, bool):  # bool 是 int 的子类，先挡掉
+        return None
+    moment: Optional[float] = None
+    if isinstance(raw, (int, float)):
+        moment = float(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text or text == _LIVE_TIME_PLACEHOLDER:
+            return None
+        try:
+            moment = float(text)  # 少数接口会把时间戳装在字符串里
+        except ValueError:
+            try:
+                stamp = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None  # 含全零占位在内的非法日期（strptime 对 0000 年直接失败）
+            moment = stamp.replace(tzinfo=_BEIJING_TZ).timestamp()
+    if moment is None or moment <= 0:
+        return None
+    current = time.time() if now is None else float(now)
+    if moment > current + LIVE_STARTED_FUTURE_TOLERANCE_S:
+        return None  # 超出时钟偏差的「未来开播」必是异常数据
+    return int(moment)
+
 
 MEDAL_PANEL_PAGE_SIZE = 10
 """粉丝勋章列表分页大小；接口上限为 10，超出会报参数异常。"""
@@ -604,6 +662,8 @@ class BilibiliLiveAPI:
         info = data.get("data") or {}
         if not info.get("room_id"):
             raise ApiError("获取房间信息", data.get("code"), "响应缺少 room_id")
+        # 开播时刻归一化成 epoch 秒（本接口给的是北京时间字符串，未开播为全零占位）
+        info[LIVE_STARTED_AT_KEY] = parse_live_started_at(info.get("live_time"))
         return info
 
     async def get_live_stream_urls(self, room_id: int, *,
@@ -750,6 +810,14 @@ class BilibiliLiveAPI:
                 current = str(info.get("title") or "").strip()
                 if h5_title and len(h5_title) > len(current):
                     info["title"] = h5_title
+                # 开播时刻：H5 给的是**秒级时间戳**（无时区歧义），优先于 get_info 的
+                # 北京时间字符串；未开播/轮播两处分别给 0 与全零占位，都解析为 None，
+                # 此时保留 get_info 的结果（同样是 None）。
+                h5_room = h5_data.get("room_info") or {}
+                h5_started = parse_live_started_at(
+                    h5_room.get("live_start_time") or h5_data.get("live_start_time"))
+                if h5_started is not None:
+                    info[LIVE_STARTED_AT_KEY] = h5_started
         except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
             logger.debug("获取 H5 房间信息失败，沿用 get_info 标题: %s", exc)
         return info

@@ -11,7 +11,12 @@ from typing import Callable, Optional, Set
 
 import aiohttp
 
-from .api import ApiError, BilibiliLiveAPI, RISK_CONTROL_CODES
+from .api import (
+    LIVE_STARTED_AT_KEY,
+    ApiError,
+    BilibiliLiveAPI,
+    RISK_CONTROL_CODES,
+)
 from .log_categories import CATEGORY_LIVE, get_logger
 from .protocol import (
     Operation,
@@ -77,6 +82,12 @@ STATUS_RECONCILE_INTERVAL = 5 * 60.0
 """
 
 LIVE_STATUS_TEXT = {0: "未开播", 1: "直播中", 2: "轮播中"}
+
+LIVE_STATUS_LIVE = 1
+"""「直播中」的状态码：只有它才有「开播时刻」可言（未开播/轮播都把起点清空）。"""
+
+_UNSET = object()
+"""哨兵：区分「本次调用不更新开播时刻」与「显式传 ``None`` 置空」。"""
 
 
 def compute_reconcile_delay(*, base: float = STATUS_RECONCILE_INTERVAL,
@@ -153,6 +164,9 @@ class RoomClient:
         self._last_status: Optional[int] = None  # 最近一次广播的直播状态（推送去重用）
         self._dm_enabled = False  # 弹幕接收开关（GUI 按当前选中房间设置）
         self._title = ""  # 最近一次已知的直播标题（离线兜底 emit 用）
+        self._live_started_at: Optional[int] = None
+        """最近一次已知的开播时刻（epoch 秒）：由接口给出（H5 时间戳优先），
+        未开播 / 轮播中一律为 None（UI 侧据此决定是否显示「已播」）。"""
         self._uid = 0  # 最近一次已知的主播 uid
         self._offline_confirm_task: Optional[asyncio.Task] = None
 
@@ -247,7 +261,8 @@ class RoomClient:
             # 主播名基本不变，取一次即可；失败留空，下次重连再试
             self._anchor_name = await self._api.get_anchor_name(int(room_info.get("uid") or 0))
         self._emit_status(live_status, room_info.get("title") or "",
-                          int(room_info.get("uid") or 0))
+                          int(room_info.get("uid") or 0),
+                          room_info.get(LIVE_STARTED_AT_KEY))
 
         danmu_info = await self._api.get_danmu_info(self._room_id)
         # 舰长数：非关键数据，失败不影响监听（v2 接口需要主播 uid）
@@ -588,7 +603,8 @@ class RoomClient:
         status_text = LIVE_STATUS_TEXT.get(live_status, "未知")
         title = info.get("title") or ""
         self._log.info("房间状态更新（%s）：%s，标题：%s", reason, status_text, title or "未知")
-        self._emit_status(live_status, title, int(info.get("uid") or 0))
+        self._emit_status(live_status, title, int(info.get("uid") or 0),
+                          info.get(LIVE_STARTED_AT_KEY))
         return True
 
     async def _status_reconcile_loop(self) -> None:
@@ -603,14 +619,28 @@ class RoomClient:
                 self._log.debug("周期状态复核失败: %s", exc)
 
     def _emit_status(self, live_status: int, title: Optional[str] = None,
-                     uid: Optional[int] = None) -> None:
-        """统一构造并广播 status 事件，同时维护本地缓存（离线兜底 emit 依赖）。"""
+                     uid: Optional[int] = None,
+                     live_started_at: object = _UNSET) -> None:
+        """统一构造并广播 status 事件，同时维护本地缓存（离线兜底 emit 依赖）。
+
+        ``live_started_at``：接口给出的开播时刻（epoch 秒）。**不传**表示「本次没有
+        新值」，沿用缓存——开播信号常早于接口刷新到达（推送是权威信号），此时缓存还是
+        ``None``，UI 侧会回退成「本地观测到的开播时刻」，等接口刷新再把起点校正为真实
+        开播时间。传 ``None`` 表示显式清空。
+
+        非「直播中」一律清空起点：下播/轮播后开播时刻不再有意义，UI 侧据此隐藏
+        「已播」字段，不必自己判断状态。
+        """
         live_status = int(live_status)
         self._last_status = live_status
         if title is not None:
             self._title = title
         if uid is not None:
             self._uid = uid
+        if live_started_at is not _UNSET:
+            self._live_started_at = live_started_at
+        if live_status != LIVE_STATUS_LIVE:
+            self._live_started_at = None
         self._log.debug("广播状态：%s（直播间 %s）",
                         LIVE_STATUS_TEXT.get(live_status, "未知"), self._room_id)
         self._emit("status", {
@@ -620,6 +650,7 @@ class RoomClient:
             "live_status": live_status,
             "anchor_name": self._anchor_name,
             "uid": self._uid,
+            "live_started_at": self._live_started_at,
         })
 
     @staticmethod

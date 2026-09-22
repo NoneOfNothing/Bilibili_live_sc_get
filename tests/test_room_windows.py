@@ -250,5 +250,29 @@ class TkRoomWindowWiringTests(unittest.TestCase):
         self.assertNotIn("ui_queue", _attr_names(tree))
 
 
+class RoomWindowLiveDurationTests(unittest.TestCase):
+    """房间独立窗口的「已播」时长：头部渲染 + 宿主每秒刷新入口。"""
+
+    def test_window_header_has_duration_and_refresh_entry(self):
+        tree = ast.parse(_source("tk_room_window.py"))
+        header = _method(tree, "RoomChatWindow", "_update_sc_header")
+        self.assertIn("live_duration_text", _names(header), "窗口头部未拼「已播」时长")
+        self.assertIn("live_started_at", _attr_names(header), "窗口头部未读取直播起点")
+        refresh = _method(tree, "RoomChatWindow", "refresh_header")
+        self.assertIn("_update_sc_header", _called_attrs(refresh),
+                      "窗口缺少「只刷头部」的入口（每秒刷新会连窗口标题一起重设）")
+
+    def test_host_ticks_window_header_every_second(self):
+        """宿主每秒刷新必须覆盖房间独立窗口，否则窗口里的时长不会跳。"""
+        host = ast.parse(_source("gui_app.py"))
+        tick = _method(host, "ScMonitorApp", "_tick_live_duration")
+        self.assertIn("refresh_header", _called_attrs(tick),
+                      "宿主每秒刷新未覆盖房间独立窗口")
+        self.assertIn("live_started_at", _attr_names(tick), "每秒刷新未检查起点")
+        poll = _method(host, "ScMonitorApp", "_poll_queue")
+        self.assertIn("_tick_live_duration", _called_attrs(poll),
+                      "每秒刷新未挂到现有轮询上")
+
+
 if __name__ == "__main__":
     unittest.main()

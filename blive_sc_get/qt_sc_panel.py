@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import webbrowser
 from typing import Callable, Optional
 
@@ -26,8 +27,10 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from .gui_app import (
     HISTORY_PAGE_SIZE,
+    LIVE_DURATION_REFRESH_S,
     SC_TITLE_MAX_LEN,
     build_sc_segments,
+    live_duration_text,
     unseen_badge_text,
 )
 from .log_categories import CATEGORY_DATA, get_logger
@@ -68,6 +71,7 @@ class ScPanel(QWidget):
         self._has_more = False
         self._loading_more = False
         self._sc_unseen = 0
+        self._header_tick = 0.0  # 头部行上次因「已播」刷新时刻（秒级节流用）
         self._build_ui()
         host.register_sc_panel(self)
 
@@ -114,11 +118,32 @@ class ScPanel(QWidget):
     # ---------- 每轮轮询 ----------
 
     def poll_tick(self) -> None:
-        """100ms 轮询：记录吸底状态 + 刷新累计 SC（只在选中/绑定房间有记录时改文案）。"""
+        """100ms 轮询：记录吸底状态 + 刷新累计 SC + 每秒刷新「已播」时长。
+
+        「已播」按秒跳动，用同一轮询做 1 秒节流（不新增定时器）；只在直播中且有起点时
+        才重设头部文本，其余房间一次 ``setText`` 都不做。
+        """
         self.sc_text.refresh_bottom_state()
         room_id = self.room_id
         if room_id is not None and self.host._sc_total.get(room_id):
             self.update_total()
+        self._tick_header(room_id)
+
+    def _tick_header(self, room_id: Optional[int]) -> None:
+        """每秒刷新一次头部行（让「已播」的秒数往前走）。
+
+        状态变化本身由宿主即时刷新头部（``_refresh_sc_header``），这里只补「时间在走」
+        这一件事，因此不需要在毫秒级轮询里反复重设文本。
+        """
+        now = time.monotonic()
+        if now - self._header_tick < LIVE_DURATION_REFRESH_S:
+            return
+        self._header_tick = now
+        if room_id is None or self.host.live_state.get(room_id) != "直播中":
+            return
+        if self.host.live_started_at.get(room_id) is None:
+            return
+        self.update_header()
 
     def sync_unseen_badge(self) -> None:
         """同步未读徽标：回到底部即清零隐藏。"""
@@ -358,6 +383,11 @@ class ScPanel(QWidget):
             parts.append(f"同接 {viewers}")
         if guards is not None and guards >= 0:
             parts.append(f"舰长 {guards}")
+        # 「已播 01:23:45」：仅直播中且有起点时出现（与 Tk 版同一套判断与格式）
+        duration = live_duration_text(self.host.live_started_at.get(room_id),
+                                      self.host.live_state.get(room_id) == "直播中")
+        if duration:
+            parts.append(duration)
         medal_name, medal_level = self.host._fan_medal_for(room_id)
         if medal_name:
             parts.append(f"粉丝牌 {medal_name} Lv{medal_level}")

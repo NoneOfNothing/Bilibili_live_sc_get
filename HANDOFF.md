@@ -181,7 +181,34 @@ python -m venv .venv
 - 测试：`tests/test_sort_modes.py`（排序合成、时间记录、文案），`tests/test_qt_wiring.py`
   另有接线检查（切换即生效并落盘、禁用拖动、保存按自定义顺序）。
 
-## 11. 协作约定（请遵守）
+## 11. 直播时长显示（ROADMAP 86，两版）
+
+SC 头部信息行新增 `已播 01:23:45`（排在「舰长」之后、粉丝牌之前），**仅「直播中且已拿到起点」时出现**。
+
+- **数据来源（已实测）**：`api.parse_live_started_at`（纯函数）把接口给的开播时刻归一化为 epoch 秒，
+  写回房间信息 dict 的 `LIVE_STARTED_AT_KEY = "live_started_at"`。两种形态：
+  H5 `getH5InfoByRoom` 的 `room_info.live_start_time` 是**秒级时间戳**（**优先**，且
+  `get_full_room_info` 本来就在调它 → 零额外请求）；`room/v1/Room/get_info` 的 `live_time` 是
+  **北京时间字符串**（回退，解析必须显式按 UTC+8，否则非东八区会整体偏 8 小时）；
+  候选 `getRoomInfoOld` 实测 `code=-400`、不可用。占位 `"0000-00-00 00:00:00"`、`0`、非法、
+  未来 2 分钟以上一律 `None`（**不在解析层编造时间**，否则时长会凭空开始计时）。
+- **传输**：`client._emit_status` 把 `live_started_at` 放进 status 事件且**非直播中自动清空**；
+  两版只读查询路径（`_async_fetch_room_info` / `_async_fetch_uid`）的 `room_info` 事件也带上它，
+  两条来源共用同一个键。
+- **起点维护**：两版共用纯函数 `gui_app.update_live_started_at`，宿主字典 `live_started_at`
+  （Qt / Tk 各一份）。规则：接口值优先并可**校正**先到的本地观测（开播推送常早于接口刷新）；
+  **同状态重复上报不漂移**（周期复核每 5 分钟一次，若每次重记，起点会被一路推后、时长永远从零开始）；
+  下播清空。**与排序用的 `_live_since`（自增标记）完全分离，互不影响**。
+- **渲染**：共享纯函数 `live_duration_text` / `format_live_duration`（固定两位补零、超 24 小时按
+  累计小时、负数钳 0；未直播或无起点返回 `None`）；渲染点为 Qt `qt_sc_panel.ScPanel.update_header`
+  与 Tk `gui_app._update_sc_header` + `tk_room_window.RoomChatWindow._update_sc_header`。
+- **每秒跳动**：复用现有 100ms 轮询做 1 秒节流，不新增定时器——Qt `ScPanel.poll_tick` → `_tick_header`、
+  Tk `gui_app._tick_live_duration`（在 `_poll_queue` 里调用）；只刷「直播中且有起点」的当前房间与各
+  独立窗口（Tk 走 `RoomChatWindow.refresh_header`，只刷头部、不重设窗口标题）。
+- 测试：`tests/test_gui_support.py`（解析 / 起点维护 / 格式化 / 显示门控）、`tests/test_qt_wiring.py`
+  与 `tests/test_room_windows.py`（接线 + 每秒节流 + 非直播中清空）。
+
+## 12. 协作约定（请遵守）
 
 - 沟通语言：中文。
 - **不修改 `README.md` 与文档性内容，除非被明确指示**；`QT_PORTING.md`/`ROADMAP.md`/`CHANGELOG.md`

@@ -863,3 +863,71 @@ class QtDanmakuEmoticonSwitchTests(unittest.TestCase):
                       "关闭时未还原已显示的图片")
         self.assertIn("_refill_dm_emoticon_images", _called_attrs(setter),
                       "重新开启时未把已有触发词换回图片")
+
+
+class QtLiveDurationWiringTests(unittest.TestCase):
+    """「已播」时长：头部渲染、每秒刷新与两条状态来源的接线（两版都要有）。"""
+
+    def test_header_renders_live_duration(self):
+        """头部要拼「已播 HH:MM:SS」，并以「直播中 + 有起点」为门控。
+
+        未开播 / 轮播 / 刚启动无数据时该字段完全不出现，头部那一行与没有该功能时
+        保持一致（用户明确要求）。
+        """
+        tree = _tree("qt_sc_panel.py")
+        header = _method(tree, "ScPanel", "update_header")
+        self.assertIn("live_duration_text", _names(header), "头部未拼「已播」时长")
+        self.assertIn("live_started_at", _attr_names(header), "未读取直播起点")
+        self.assertIn("live_state", _attr_names(header), "未按直播状态门控")
+
+    def test_poll_tick_refreshes_header_every_second(self):
+        """秒数要自己往前跳：复用宿主 100ms 轮询做 1 秒节流，不新增定时器。"""
+        tree = _tree("qt_sc_panel.py")
+        poll = _method(tree, "ScPanel", "poll_tick")
+        self.assertIn("_tick_header", _called_attrs(poll), "轮询未刷新「已播」时长")
+        tick = _method(tree, "ScPanel", "_tick_header")
+        self.assertIn("LIVE_DURATION_REFRESH_S", _names(tick), "未做 1 秒节流")
+        self.assertIn("update_header", _called_attrs(tick), "节流到点后未刷新头部")
+
+    def test_start_maintained_in_both_hosts(self):
+        """起点由共享纯函数维护（接口值可校正本地观测），两版两处都要调用。"""
+        for module, cls in (("qt_app.py", HOST_CLASS), ("gui_app.py", "ScMonitorApp")):
+            with self.subTest(module=module):
+                tree = _tree(module)
+                self.assertIn("live_started_at", _self_attr_names(tree, cls),
+                              f"{module} 未持有「已播」起点字典")
+                for method in ("_on_client_event", "_on_room_info"):
+                    node = _method(tree, cls, method)
+                    self.assertIn("update_live_started_at", _names(node),
+                                  f"{module}.{method} 未维护「已播」起点")
+
+    def test_live_started_at_travels_with_events(self):
+        """客户端把开播时刻放进 status 事件；两版只读查询也要带上它。
+
+        只读路径（被占用 / 已停用监听的房间）收不到弹幕 status 事件，漏了它就永远
+        看不到时长。
+        """
+        emit = _method(_tree("client.py"), "RoomClient", "_emit_status")
+        consts = {sub.value for sub in ast.walk(emit) if isinstance(sub, ast.Constant)}
+        self.assertIn("live_started_at", consts, "status 事件未带开播时刻")
+        self.assertIn("_live_started_at", _attr_names(emit), "未取缓存的开播时刻")
+        for module, cls, method in (("qt_app.py", HOST_CLASS, "_async_fetch_room_info"),
+                                    ("gui_app.py", "ScMonitorApp", "_async_fetch_uid")):
+            with self.subTest(module=module):
+                node = _method(_tree(module), cls, method)
+                consts = {sub.value for sub in ast.walk(node)
+                          if isinstance(sub, ast.Constant)}
+                self.assertIn("live_started_at", consts,
+                              f"{module}.{method} 未把开播时刻带进 room_info 事件")
+
+    def test_non_live_status_clears_start(self):
+        """非「直播中」必须把起点清空（下播后不该继续显示时长）。"""
+        emit = _method(_tree("client.py"), "RoomClient", "_emit_status")
+        cleared = [node for node in ast.walk(emit)
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Attribute)
+                           and target.attr == "_live_started_at"
+                           and isinstance(node.value, ast.Constant)
+                           and node.value.value is None
+                           for target in node.targets)]
+        self.assertTrue(cleared, "非直播中时未清空开播时刻")

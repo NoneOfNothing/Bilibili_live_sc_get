@@ -47,6 +47,7 @@ from .gui_app import (
     dm_trim_index,
     emoticon_from_packages,
     emoticon_tooltip_text,
+    live_duration_text,
     text_scrolled_to_bottom,
     unseen_badge_text,
 )
@@ -291,6 +292,13 @@ class RoomChatWindow(tk.Toplevel):
         self.title(self._title_text())
         self._update_sc_header()
 
+    def refresh_header(self) -> None:
+        """只刷头部信息行（宿主每秒调用，让「已播」的秒数往前跳）。
+
+        与 :meth:`on_meta_changed` 分开：那个还会重设窗口标题，没必要每秒做一次。
+        """
+        self._update_sc_header()
+
     def on_dm_send_result(self, payload: dict) -> None:
         # 只认自己发起的那一次（payload 的房间号是真实房间号，短号场景需映射）
         expected = self.host._room_id_map.get(self._room_id, self._room_id)
@@ -435,6 +443,12 @@ class RoomChatWindow(tk.Toplevel):
             parts.append(f"同接 {viewers}")
         if self._room_id in self.host.guard_num:
             parts.append(f"舰长 {self.host.guard_num[self._room_id]}")
+        # 「已播 01:23:45」：仅直播中且有起点时出现（与主界面头部同一套判断）
+        duration = live_duration_text(
+            self.host.live_started_at.get(self._room_id),
+            self.host.live_state.get(self._room_id) == "直播中")
+        if duration:
+            parts.append(duration)
         entry = self.host.entries.get(self._room_id)
         medal_name, level = self.host._medal_info_for(
             self._room_id, int(entry.uid) if entry else 0)

@@ -13,7 +13,14 @@ from blive_sc_get.api import (
     ApiError,
     BilibiliLiveAPI,
     describe_send_error,
+    parse_live_started_at,
     parse_room_emoticon_packages,
+)
+from blive_sc_get.gui_app import (
+    format_live_duration,
+    live_duration_text,
+    update_live_activity,
+    update_live_started_at,
 )
 from blive_sc_get.qt_app import (
     drag_source_rows,
@@ -1308,6 +1315,112 @@ class LiveSignalInterruptWiringTests(unittest.TestCase):
                 self.assertIsNotNone(node, f"{module}.{method} 不存在")
                 self.assertIn("auto", self._keyword_names(node),
                               f"{module}.{method} 未向 complete_room 传 auto= 标记")
+
+
+class ParseLiveStartedAtTests(unittest.TestCase):
+    """开播时刻归一化：接口实测两种形态（北京时间字符串 / 秒级时间戳）。"""
+
+    # 接口实测值（2026-09-22）：字符串与时间戳是同一时刻，当前时刻比它晚 100 秒
+    NOW = 1790066240
+    EXPECTED = 1790066140
+
+    def test_two_source_shapes_agree(self):
+        """``get_info`` 的北京时间字符串与 H5 的时间戳必须解析成同一时刻。
+
+        字符串是北京时间（UTC+8），若不显式附加时区，非东八区环境会整体偏 8 小时。
+        """
+        self.assertEqual(parse_live_started_at("2026-09-22 16:35:40", now=self.NOW),
+                         self.EXPECTED)
+        self.assertEqual(parse_live_started_at(self.EXPECTED, now=self.NOW),
+                         self.EXPECTED)
+        self.assertEqual(parse_live_started_at(str(self.EXPECTED), now=self.NOW),
+                         self.EXPECTED)
+
+    def test_placeholder_and_invalid_are_none(self):
+        """占位值 / 0 / 空 / 非法 / bool 一律 None（由调用方回退本地观测）。"""
+        for raw in ("0000-00-00 00:00:00", 0, -5, "", None, "不是时间", True):
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_live_started_at(raw, now=self.NOW))
+
+    def test_future_value_beyond_tolerance_is_rejected(self):
+        """超出时钟偏差的「未来开播」是异常数据；容差内（轻微偏差）仍接受。"""
+        self.assertIsNone(parse_live_started_at("2026-09-22 16:47:20", now=self.NOW))
+        self.assertEqual(parse_live_started_at("2026-09-22 16:37:30", now=self.NOW),
+                         self.EXPECTED + 110)
+
+
+class UpdateLiveStartedAtTests(unittest.TestCase):
+    """直播起点维护：接口值优先、本地观测不漂移、下播清空（两版共用）。"""
+
+    def test_observation_recorded_once_and_never_drifts(self):
+        store = {}
+        self.assertTrue(update_live_started_at(store, 1, True, None, now=1000.0))
+        self.assertEqual(store, {1: 1000.0})
+        # 周期复核会反复上报同一状态：起点不能被一路推后，否则时长永远从头开始
+        self.assertFalse(update_live_started_at(store, 1, True, None, now=2000.0))
+        self.assertEqual(store, {1: 1000.0})
+
+    def test_api_value_wins_and_upgrades_observation(self):
+        # 开播信号常早于接口刷新到达：先记本地观测，接口回来再校正为真实开播时刻
+        store = {}
+        update_live_started_at(store, 1, True, None, now=1000.0)
+        self.assertTrue(update_live_started_at(store, 1, True, 500.0, now=2000.0))
+        self.assertEqual(store, {1: 500.0})
+        # 同一个接口值重复上报不重复写
+        self.assertFalse(update_live_started_at(store, 1, True, 500.0, now=3000.0))
+
+    def test_offline_and_repeat_clear(self):
+        store = {1: 500.0}
+        self.assertTrue(update_live_started_at(store, 1, False, now=600.0))
+        self.assertEqual(store, {})
+        self.assertFalse(update_live_started_at(store, 1, False, now=700.0))
+
+    def test_invalid_api_value_falls_back_to_observation(self):
+        """接口给了 0 / 占位（解析后为 None）时按「没有接口值」处理，不能拿 0 当起点。"""
+        store = {}
+        self.assertTrue(update_live_started_at(store, 1, True, 0, now=1000.0))
+        self.assertEqual(store, {1: 1000.0})
+
+    def test_sorting_marks_are_independent(self):
+        """「已播」起点与排序用的先后标记互不影响（后者是自增整数，不能混用）。"""
+        live_since: dict = {}
+        offline_at: dict = {}
+        update_live_activity(live_since, offline_at, 1, True)
+        started: dict = {}
+        update_live_started_at(started, 1, True, 1790066140, now=1790066240.0)
+        self.assertEqual(live_since, {1: 1.0})
+        self.assertEqual(started, {1: 1790066140.0})
+
+
+class FormatLiveDurationTests(unittest.TestCase):
+    """时长文本：固定两位补零，超 24 小时按累计小时，负数钳到 0。"""
+
+    def test_pads_to_two_digits(self):
+        for seconds, expected in ((0, "00:00:00"), (59, "00:00:59"),
+                                  (60, "00:01:00"), (3599, "00:59:59"),
+                                  (3600, "01:00:00"), (86399, "23:59:59")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_live_duration(seconds), expected)
+
+    def test_over_24_hours_keeps_counting_hours(self):
+        self.assertEqual(format_live_duration(90000), "25:00:00")
+
+    def test_negative_and_fraction_are_clamped(self):
+        self.assertEqual(format_live_duration(-5), "00:00:00")
+        self.assertEqual(format_live_duration(12.7), "00:00:12")
+
+
+class LiveDurationTextTests(unittest.TestCase):
+    """头部片段：只有「直播中且有起点」才出现，其余情况该字段完全不显示。"""
+
+    def test_shown_only_when_live_with_start(self):
+        self.assertEqual(live_duration_text(1790066140, True, now=1790066240.0),
+                         "已播 00:01:40")
+
+    def test_hidden_when_not_live_or_no_start(self):
+        self.assertIsNone(live_duration_text(1790066140, False, now=1790066240.0))
+        self.assertIsNone(live_duration_text(None, True, now=1790066240.0))
+        self.assertIsNone(live_duration_text(None, False, now=1790066240.0))
 
 
 if __name__ == "__main__":

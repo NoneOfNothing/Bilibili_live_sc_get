@@ -36,7 +36,7 @@ try:  # 播放系统提示音用（仅 Windows）
 except ImportError:
     winsound = None
 
-from .api import ApiError, BilibiliLiveAPI, describe_send_error
+from .api import LIVE_STARTED_AT_KEY, ApiError, BilibiliLiveAPI, describe_send_error
 from .app_config import load_app_config
 from .browser_cookie import get_bilibili_cookie
 from .cookie_server import DEFAULT_COOKIE_PORT, wait_for_extension_cookie
@@ -176,6 +176,69 @@ def _next_activity_stamp(live_since: dict, offline_at: dict) -> float:
     """下一个先后标记：现有标记的最大值 + 1（严格递增，与时钟精度无关）。"""
     values = list(live_since.values()) + list(offline_at.values())
     return (max(values) if values else 0.0) + 1.0
+
+
+def update_live_started_at(started_at: dict, room_id: int, is_live: bool,
+                           api_started_at: Optional[float] = None,
+                           now: Optional[float] = None) -> bool:
+    """维护「直播起点」（epoch 秒，就地更新字典），返回是否有变化（纯函数，两版共用）。
+
+    与 :func:`update_live_activity`（排序用的**先后标记**）职责分离：那个只排先后、
+    值是自增整数；这个才是「已播时长」的起点，二者互不影响。
+
+    规则：
+
+    - 非「直播中」（未开播 / 轮播）→ 清掉记录：下播后不该继续显示时长；
+    - 直播中且有接口给的真实开播时刻 → 一律采用，可把先前的本地观测**校正**为真实
+      开播时间（开播信号常早于接口刷新到达：先按观测计时，等接口回来再校正）；
+    - 直播中但没有接口值 → 已有记录就**不动**：周期状态复核会反复上报同一状态，若每次
+      都重记，起点会被一路往后推、时长永远从零开始；只有还没有记录时才写入 ``now``
+      作为「本地观测到的开播时刻」；
+    - ``now`` 用 ``time.time()``（墙钟，跨会话有意义），**不要**用 ``time.monotonic()``。
+    """
+    if not is_live:
+        return started_at.pop(room_id, None) is not None
+    current = time.time() if now is None else float(now)
+    if api_started_at is not None and float(api_started_at) > 0:
+        started = float(api_started_at)
+    elif started_at.get(room_id) is not None:
+        return False
+    else:
+        started = current
+    if started_at.get(room_id) == started:
+        return False
+    started_at[room_id] = started
+    return True
+
+
+def format_live_duration(seconds: float) -> str:
+    """已播秒数 → ``"01:23:45"``（固定两位补零，纯函数，两版共用）。
+
+    超过 24 小时按累计小时继续（如 ``"26:03:11"``），不做「x 天」换算；负数钳到 0
+    （起点比当前时刻晚时不能显示负时长）。注意与 ``qt_preview.format_duration``
+    （预览用的不补零格式 ``12:34`` / ``1:02:03``）区分——那个不改动，避免影响预览。
+    """
+    total = int(max(0.0, float(seconds)))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+LIVE_DURATION_REFRESH_S = 1.0
+"""「已播」字段的刷新间隔（秒）：按格式要求精确到秒，故每秒跳一次。"""
+
+
+def live_duration_text(started_at: Optional[float], is_live: bool,
+                       now: Optional[float] = None) -> Optional[str]:
+    """头部信息行用的「已播」片段；不该显示时返回 ``None``（纯函数，两版共用）。
+
+    只有「正在直播」且拿到了起点才显示——未开播 / 轮播中 / 刚启动还没数据时，头部
+    那一行与没有该功能时完全一致。
+    """
+    if not is_live or started_at is None:
+        return None
+    current = time.time() if now is None else float(now)
+    return f"已播 {format_live_duration(current - float(started_at))}"
 
 
 def order_room_ids(base_order, mode: str, *, live_states=None, anchor_names=None,
@@ -845,6 +908,10 @@ class ScMonitorApp:
         #   开播时刻 / 关播时刻（time.monotonic()），只记本程序观察到的状态跳变
         self._live_since: Dict[int, float] = {}
         self._offline_at: Dict[int, float] = {}
+        # 「已播时长」的起点（epoch 秒，与上面的排序标记**职责分离**）：优先取接口给的
+        # 真实开播时刻，接口没有时回退为本地观测到的开播时刻；下播即清空
+        self.live_started_at: Dict[int, float] = {}
+        self._live_duration_tick = 0.0  # 「已播」字段上次刷新时刻（秒级节流用）
         self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
         # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
         self._room_windows: Dict[int, object] = {}
@@ -3827,6 +3894,7 @@ class ScMonitorApp:
             "live_status": int(info.get("live_status") or 0),
             "anchor_name": anchor,
             "uid": anchor_uid,
+            "live_started_at": info.get(LIVE_STARTED_AT_KEY),
         }))
 
     def _on_add_result(self, payload: dict) -> None:
@@ -3842,6 +3910,10 @@ class ScMonitorApp:
                                           uid=int(payload.get("uid") or 0))
         self.client_states[room_id] = "starting"
         self.live_state[room_id] = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
+        # 新加的房间可能本来就在直播：立刻记下「已播」起点，不必等首次 status 事件
+        update_live_started_at(self.live_started_at, room_id,
+                               self.live_state[room_id] == "直播中",
+                               payload.get("live_started_at"))
         if payload.get("anchor_name"):
             self.anchor_names[room_id] = payload["anchor_name"]
         self._save_config()
@@ -4157,6 +4229,12 @@ class ScMonitorApp:
             parts.append(f"同接 {self.viewers[room_id]}")
         if room_id in self.guard_num:
             parts.append(f"舰长 {self.guard_num[room_id]}")
+        # 「已播 01:23:45」：仅直播中且有起点时出现，其余情况（未开播 / 轮播 / 刚启动
+        # 还没数据）这一行与没有该功能时完全一致
+        duration = live_duration_text(self.live_started_at.get(room_id),
+                                      self.live_state.get(room_id) == "直播中")
+        if duration:
+            parts.append(duration)
         entry = self.entries.get(room_id)
         medal_name, level = self._medal_info_for(
             room_id, int(entry.uid) if entry else 0)
@@ -4591,6 +4669,11 @@ class ScMonitorApp:
             if update_live_activity(self._live_since, self._offline_at, int(room_id),
                                     status_text == "直播中"):
                 self._reorder_for_live_change(room_id, status_text)
+            # 「已播时长」的起点（与上面的排序标记无关）：接口给的真实开播时刻优先，
+            # 没有则在本程序首次看到「直播中」时记本地观测，下播清空
+            update_live_started_at(self.live_started_at, int(room_id),
+                                   status_text == "直播中",
+                                   payload.get("live_started_at"))
             if payload.get("anchor_name"):
                 self.anchor_names[room_id] = payload["anchor_name"]
             entry = self.entries.get(room_id)
@@ -4702,6 +4785,7 @@ class ScMonitorApp:
             "anchor_name": anchor,
             "title": info.get("title") or "",
             "live_status": int(info.get("live_status") or 0),
+            "live_started_at": info.get(LIVE_STARTED_AT_KEY),
         }))
 
     def _on_room_info(self, payload: dict) -> None:
@@ -4730,6 +4814,10 @@ class ScMonitorApp:
             if update_live_activity(self._live_since, self._offline_at, int(room_id),
                                     status_text == "直播中"):
                 self._reorder_for_live_change(room_id, status_text)
+            # 只读路径同样维护「已播时长」的起点（这类房间收不到弹幕 status 事件）
+            update_live_started_at(self.live_started_at, int(room_id),
+                                   status_text == "直播中",
+                                   payload.get("live_started_at"))
         if self.tree.exists(str(room_id)):
             self.tree.set(str(room_id), "title", payload.get("title") or "")
             if anchor:
@@ -4885,7 +4973,31 @@ class ScMonitorApp:
                     window.on_dm_batch(sub)
         # 用户手动滚回底部后清除未读计数（复用同一轮询，不新增定时器）
         self._sync_unseen_from_scroll()
+        self._tick_live_duration()
         self.root.after(100, self._poll_queue)
+
+    def _tick_live_duration(self) -> None:
+        """每秒刷新一次「已播」字段（复用 100ms 轮询做节流，不新增定时器）。
+
+        只刷「正在直播且有起点」的房间，且只含主界面当前选中房间与各房间独立窗口：
+        未开播 / 轮播 / 无起点的房间一次 ``configure`` 都不会做。状态变化本身仍走
+        ``_update_sc_header`` 的即时调用，这里只为让秒数自己往前跳。
+        """
+        now = time.monotonic()
+        if now - self._live_duration_tick < LIVE_DURATION_REFRESH_S:
+            return
+        self._live_duration_tick = now
+        room_ids = [self._selected_room_id]
+        room_ids.extend(self._room_windows)
+        for room_id in room_ids:
+            if room_id is None or self.live_state.get(room_id) != "直播中":
+                continue
+            if self.live_started_at.get(room_id) is None:
+                continue
+            if room_id == self._selected_room_id:
+                self._update_sc_header(room_id)
+            for window in self.room_windows_for(room_id):
+                window.refresh_header()
 
     def _on_close(self) -> None:
         if not messagebox.askokcancel("退出", "确定退出？将停止所有房间的监听。"):
