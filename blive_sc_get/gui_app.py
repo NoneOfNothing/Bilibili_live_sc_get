@@ -56,6 +56,7 @@ from .medal_tasks import (
 from .gui_config import (
     NOTIFY_SOUNDS,
     RoomEntry,
+    format_live_mark,
     load_emoticon_memory,
     load_room_entries,
     load_ui_prefs,
@@ -134,6 +135,7 @@ SORT_MODE_HELP = {
               "· 轮播中：按未开播处理（不单独成段）\n"
               "· 从未开播过：按「自定义排序」的顺序排在最后\n"
               "· 收到开播 / 关播信号会自动重排\n"
+              "· 开播 / 关播时间会记在本地，重启后仍按同样的先后排序\n"
               "· 不可拖动：想调整顺序请先切到「自定义排序」",
 }
 """排序方案的完整说明：收在排序栏的「ⓘ」按钮里（点击弹出），不再占一行显示。
@@ -142,40 +144,93 @@ SORT_MODE_HELP = {
 """
 
 
-def update_live_activity(live_since: dict, offline_at: dict, room_id: int,
-                         is_live: bool, stamp: Optional[float] = None) -> bool:
-    """记录某房间进入 / 离开「直播中」的先后标记（就地更新两个字典），返回是否变化。
+LIVE_MARK_MAX_AGE_S = 24 * 3600
+"""持久化的开播 / 关播时间最多信 24 小时。
 
-    - 进入直播中：写开播标记并清掉旧的关播标记；
-    - 离开直播中：写关播标记并清掉开播标记（此后它在下播组里按关播标记倒序排）；
-    - 状态没变则**不动标记**（周期复核会反复报同一状态，若每次都刷新，「开播时间」会被
-      一路推后，排序结果就乱跳）。
+单场直播极少播满一整天，更旧的时间只可能是**上次会话**留下的、与当前这一场无关的记录
+——继续沿用会让「已播」显示成几十小时，也会把排序带偏，故读取时直接丢弃。
+"""
 
-    ``stamp`` 越大表示越晚发生。不传时自动取「现有标记的最大值 + 1」——这样调用方不必
-    维护计数器，也避免直接拿 ``time.monotonic()`` 当标记（**Windows 上它的精度只有约
-    15 毫秒**，同一轮事件里几次开播/关播会拿到相同值，排序就分不出先后了）。
 
-    从未开播过的房间不会留下任何标记（因此排序时落在最后，按自定义顺序排列）。
+def prune_live_marks(marks: dict, now: Optional[float] = None,
+                     max_age_s: float = LIVE_MARK_MAX_AGE_S) -> Dict[int, float]:
+    """丢掉过旧的持久化时间标记（纯函数，两版共用，启动时调用）。
+
+    只保留「距今不超过 ``max_age_s``」且不是未来时间的记录；房间号统一成 ``int``、时间
+    统一成 ``float``，其余（非法键值、0、负数）一律丢弃——配置文件是用户可编辑的，
+    坏数据不能把排序带崩。
+    """
+    current = time.time() if now is None else float(now)
+    result: Dict[int, float] = {}
+    for key, value in (marks or {}).items():
+        try:
+            room_id = int(key)
+            moment = float(value)
+        except (TypeError, ValueError):
+            continue
+        if moment <= 0 or moment > current + 60.0:  # 未来时间：时钟回拨或脏数据
+            continue
+        if current - moment > max_age_s:
+            continue
+        result[room_id] = moment
+    return result
+
+
+def restore_live_marks(ui_prefs: dict, *, now: Optional[float] = None
+                       ) -> Tuple[Dict[int, float], Dict[int, float]]:
+    """从 ui 段恢复「按直播状态」的时间基准，并记录恢复情况（两版共用）。
+
+    返回 ``(开播时刻, 关播时刻)`` 两个字典。过旧 / 未来 / 非法的记录由
+    :func:`prune_live_marks` 丢掉——**这里专门记一条日志**：万一顺序没恢复成预期，从日志
+    就能分清是「历史记录被丢了」还是「本地压根没存过」，不用去猜。
+    """
+    raw_live = ui_prefs.get("live_started_at") or {}
+    raw_offline = ui_prefs.get("live_offline_at") or {}
+    live = prune_live_marks(raw_live, now=now)
+    offline = prune_live_marks(raw_offline, now=now)
+    dropped = (len(raw_live) - len(live)) + (len(raw_offline) - len(offline))
+    if not live and not offline:
+        log_data.debug("「按直播状态」排序：本地没有可用的开播/关播时间记录%s",
+                       f"（丢弃 {dropped} 条过期/非法记录）" if dropped else "")
+        return live, offline
+    log_data.info("已恢复「按直播状态」排序的时间基准：开播 %d 个、关播 %d 个%s",
+                  len(live), len(offline),
+                  f"，丢弃过期/非法记录 {dropped} 条" if dropped else "")
+    if dropped:
+        log_data.debug("丢弃后保留的记录：开播 %s，关播 %s", live, offline)
+    return live, offline
+
+
+def update_offline_at(offline_at: dict, room_id: int, is_live: bool,
+                      now: Optional[float] = None, *, was_live: bool = False) -> bool:
+    """维护「最近关播时刻」（epoch 秒，就地更新字典），返回是否有变化（纯函数，两版共用）。
+
+    「按直播状态」排序里，已下播的房间按**关播先后倒序**（最近关播的靠前），时间来源就是它。
+    开播时间**不用**这个字典：它直接复用 :func:`update_live_started_at` 维护的
+    ``live_started_at``（那才是「真实开播时刻」：接口值优先、可校正本地观测、下播清空）。
+    两者一起让排序在**重启后依然有效**——它们都会写进 `gui_rooms.json` 的 ui 段。
+
+    - 下播（``is_live=False`` 且 ``was_live=True``，即确实观察到「直播中 → 非直播中」
+      的跳变）：写入 ``now``（墙钟），并保证**严格递增**——同一轮事件里几个房间同时下播时
+      ``time.time()`` 可能给出相同值（Windows 时钟粒度约 1~15 毫秒），排序就分不出先后，
+      此时改用「现有最大值 + 1 毫秒」，对判定先后足够且不偏离真实时间；
+    - 直播中：清掉该房间的记录（关播时间只对已下播的房间有意义）；
+    - **没有跳变就不动**：``was_live=False`` 时可能是「从未开播的房间」（不该留下关播记录）
+      或「周期复核在反复上报同一状态」（不该把关播时间一路推后）。启动时房间本来就已下播
+      的情形也走这里——那时的先后顺序由**上次持久化的记录**给出，不需要重新计时。
+
+    ``was_live`` 由调用方按上一轮状态传入（UI 层手上就有 ``prev_text``）。
+    ``now`` 用 ``time.time()``（墙钟，跨会话有意义），**不要**用 ``time.monotonic()``。
     """
     if is_live:
-        if room_id in live_since:
-            return False
-        live_since[room_id] = float(_next_activity_stamp(live_since, offline_at)
-                                    if stamp is None else stamp)
-        offline_at.pop(room_id, None)
-        return True
-    if room_id in live_since:
-        live_since.pop(room_id, None)
-        offline_at[room_id] = float(_next_activity_stamp(live_since, offline_at)
-                                    if stamp is None else stamp)
-        return True
-    return False
-
-
-def _next_activity_stamp(live_since: dict, offline_at: dict) -> float:
-    """下一个先后标记：现有标记的最大值 + 1（严格递增，与时钟精度无关）。"""
-    values = list(live_since.values()) + list(offline_at.values())
-    return (max(values) if values else 0.0) + 1.0
+        return offline_at.pop(room_id, None) is not None
+    if not was_live:
+        return False
+    current = time.time() if now is None else float(now)
+    if offline_at:
+        current = max(current, max(offline_at.values()) + 1e-3)
+    offline_at[room_id] = current
+    return True
 
 
 def update_live_started_at(started_at: dict, room_id: int, is_live: bool,
@@ -183,8 +238,15 @@ def update_live_started_at(started_at: dict, room_id: int, is_live: bool,
                            now: Optional[float] = None) -> bool:
     """维护「直播起点」（epoch 秒，就地更新字典），返回是否有变化（纯函数，两版共用）。
 
-    与 :func:`update_live_activity`（排序用的**先后标记**）职责分离：那个只排先后、
-    值是自增整数；这个才是「已播时长」的起点，二者互不影响。
+    这个字典同时承担两件事（原本是分开的两份数据，现已合并——「已播时长」要的正是
+    「真实开播时刻」，而「按直播状态」排序要的也正是它）：
+
+    - 「已播」显示：秒数由 ``now - live_started_at`` 得出；
+    - 「按直播状态」排序：正在直播的房间按它倒序（最近开播的在上）；
+
+    并且它会被**持久化**（`gui_rooms.json` 的 ui 段），所以**重启后排序依然有效**：启动时
+    就在直播的房间直接用上次记录的真实开播时间（等价于「用已播时长反推开播时间」），
+    接口一旦返回就校正为最新值。关播时刻另由 :func:`update_offline_at` 维护。
 
     规则：
 
@@ -205,6 +267,8 @@ def update_live_started_at(started_at: dict, room_id: int, is_live: bool,
         return False
     else:
         started = current
+        log_room.debug("房间 %s 未拿到接口开播时刻，改记本地观测 %s（接口返回后会校正）",
+                       room_id, format_live_mark(started))
     if started_at.get(room_id) == started:
         return False
     started_at[room_id] = started
@@ -249,11 +313,13 @@ def order_room_ids(base_order, mode: str, *, live_states=None, anchor_names=None
     - ``room``：按房间号升序；
     - ``anchor``：按主播名（无主播名的排最后，其次按房间号，与原 Tk 版一致）；
     - ``status``（按直播状态）：
-      ① 正在直播的在前，按**开播时间倒序**（最近开播在最上；同一程序启动时就已在
-         直播、没有开播记录的，按 ``base_order`` 紧随其后）；
+      ① 正在直播的在前，按**开播时间倒序**（最近开播在最上）。``live_since`` 传的是
+         各房间的**真实开播时刻**（接口值优先，见 :func:`update_live_started_at`），
+         且**持久化在本地**——因此重启后顺序不变；启动时才进入直播、当时还没有记录的
+         房间按 ``base_order`` 紧随其后，等接口/信号给出开播时刻后自动排到正确位置；
       ② 其余（含**轮播中**——不特殊处理、与下播同样对待，以及从未开播的）在后，
-         有关播记录的按**关播时间倒序**（最近关播的靠前），无记录的按 ``base_order``
-         排在这一组的最后。
+         有关播记录的按**关播时间倒序**（最近关播的靠前，``offline_at`` 同样持久化），
+         无记录的按 ``base_order`` 排在这一组的最后。
     """
     ids = list(base_order)
     if mode == "room":
@@ -904,13 +970,12 @@ class ScMonitorApp:
         self._dm_grew_delta = 0  # 弹幕区向下扩展的像素数
         self._pane_ratio_done = False  # 三板块默认占比是否已应用（仅首次布局）
         self._dm_batch: List[dict] = []  # 待渲染的当前房间弹幕（轮询周期内聚合）
-        # 「按直播状态」排序用的时间记录（仅内存，ROADMAP 85）：
-        #   开播时刻 / 关播时刻（time.monotonic()），只记本程序观察到的状态跳变
-        self._live_since: Dict[int, float] = {}
-        self._offline_at: Dict[int, float] = {}
-        # 「已播时长」的起点（epoch 秒，与上面的排序标记**职责分离**）：优先取接口给的
-        # 真实开播时刻，接口没有时回退为本地观测到的开播时刻；下播即清空
-        self.live_started_at: Dict[int, float] = {}
+        # 「按直播状态」排序与「已播」显示共用的时间基准（**都会持久化**到 gui_rooms.json
+        # 的 ui 段，因此重启后排序依然有效）：
+        #   live_started_at：各房间的真实开播时刻（接口值优先，回退本地观测；下播清空）
+        #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
+        # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
+        self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
         self._live_duration_tick = 0.0  # 「已播」字段上次刷新时刻（秒级节流用）
         self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
         # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
@@ -2586,6 +2651,8 @@ class ScMonitorApp:
         if memory.get(str(int(room_id))) == value:
             return
         memory[str(int(room_id))] = value
+        log_window.debug("记住房间 %s 的独立窗口几何：%dx%d+%d+%d", room_id,
+                         width, height, x, y)
         self._save_config()
 
     def open_room_window(self, room_id: int) -> None:
@@ -2622,8 +2689,13 @@ class ScMonitorApp:
     def _apply_dm_gate(self) -> None:
         """按开关与各视图绑定房间设置各 client 的弹幕接收门控（见 _dm_rooms）。"""
         rooms = self._dm_rooms()
-        for room_id, (client, _task) in self.room_tasks.items():
-            client.set_danmaku_enabled(room_id in rooms)
+        # 只在门控真的变化时记一条：切房 / 开关弹幕区 / 开关独立窗口都会走到这里
+        changed = [room_id for room_id, (client, _task) in self.room_tasks.items()
+                   if client.set_danmaku_enabled(room_id in rooms)]
+        if changed:
+            log_live.debug("弹幕接收门控变化：%s（当前接收 %d 个房间：%s）",
+                           "、".join(str(r) for r in sorted(changed)), len(rooms),
+                           "、".join(str(r) for r in sorted(rooms)) or "无")
 
     def _clear_dm_view(self) -> None:
         self.dm_text.configure(state="normal")
@@ -3813,7 +3885,7 @@ class ScMonitorApp:
         return order_room_ids(
             list(self.entries), mode,
             live_states=self.live_state, anchor_names=self.anchor_names,
-            live_since=self._live_since, offline_at=self._offline_at)
+            live_since=self.live_started_at, offline_at=self._offline_at)
 
     def _apply_sort(self) -> None:
         """按当前方案重排**显示顺序**。
@@ -3837,6 +3909,16 @@ class ScMonitorApp:
         return [int(iid) for iid in self.tree.selection()]
 
     def _save_config(self) -> None:
+        """保存配置：把「按直播状态」的时间基准一并写进 ui 段（重启后排序才有依据）。
+
+        ``live_started_at`` / ``_offline_at`` 是运行期维护的字典，但排序要在**下次启动**时
+        仍然有效，所以每次保存都同步过去。它们只在开播 / 关播（以及接口校正开播时刻）时
+        变化，不会带来频繁写盘。
+        """
+        self.ui_prefs["live_started_at"] = {str(k): float(v)
+                                           for k, v in self.live_started_at.items()}
+        self.ui_prefs["live_offline_at"] = {str(k): float(v)
+                                           for k, v in self._offline_at.items()}
         save_room_entries(self.config_path, self.entries.values(), ui=self.ui_prefs,
                           emoticon=self._emoticon_memory)
 
@@ -3911,9 +3993,11 @@ class ScMonitorApp:
         self.client_states[room_id] = "starting"
         self.live_state[room_id] = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
         # 新加的房间可能本来就在直播：立刻记下「已播」起点，不必等首次 status 事件
-        update_live_started_at(self.live_started_at, room_id,
-                               self.live_state[room_id] == "直播中",
-                               payload.get("live_started_at"))
+        if update_live_started_at(self.live_started_at, room_id,
+                                  self.live_state[room_id] == "直播中",
+                                  payload.get("live_started_at")):
+            log_room.debug("新加房间 %s 已在直播：已记下开播时刻 %s（随本次保存落盘）",
+                           room_id, format_live_mark(self.live_started_at.get(room_id)))
         if payload.get("anchor_name"):
             self.anchor_names[room_id] = payload["anchor_name"]
         self._save_config()
@@ -3975,6 +4059,11 @@ class ScMonitorApp:
             self.entries.pop(room_id, None)
             self.client_states.pop(room_id, None)
             self.live_state.pop(room_id, None)
+            # 排序/「已播」的时间基准随房间清理（有记录才记日志，避免删一堆无记录的房间时刷屏）
+            had_live = self.live_started_at.pop(room_id, None) is not None
+            had_offline = self._offline_at.pop(room_id, None) is not None
+            if had_live or had_offline:
+                log_room.debug("房间 %s 的排序时间基准已随删除清理", room_id)
             self._emoticon_memory.pop(room_id, None)  # 表情包记忆随房间一并清理
             # 房间被删除：一并关掉它的独立窗口（窗口里已没有任何可显示的内容）
             window = self._room_windows.get(int(room_id))
@@ -4665,15 +4754,23 @@ class ScMonitorApp:
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             prev_text = self.live_state.get(room_id)
             self.live_state[room_id] = status_text
-            # 记录开播/关播时刻（「按直播状态」排序用），必要时实时重排列表
-            if update_live_activity(self._live_since, self._offline_at, int(room_id),
-                                    status_text == "直播中"):
+            # 排序 / 「已播」共用的时间基准（两版共用纯函数）：开播时刻写 live_started_at
+            # （接口真实值优先、回退本地观测、下播清空），关播时刻写 _offline_at。
+            # **任一变化都要落盘**——否则重启后时间基准丢失、顺序被打乱（用户反馈）。
+            started_changed = update_live_started_at(
+                self.live_started_at, int(room_id), status_text == "直播中",
+                payload.get("live_started_at"))
+            offline_changed = update_offline_at(
+                self._offline_at, int(room_id), status_text == "直播中",
+                was_live=prev_text == "直播中")
+            if started_changed or offline_changed:
+                log_room.info("房间 %s 直播状态 %s（原 %s）：排序时间基准已更新并落盘"
+                              "（开播 %s｜关播 %s）",
+                              room_id, status_text, prev_text or "未知",
+                              format_live_mark(self.live_started_at.get(int(room_id))),
+                              format_live_mark(self._offline_at.get(int(room_id))))
+                self._save_config()
                 self._reorder_for_live_change(room_id, status_text)
-            # 「已播时长」的起点（与上面的排序标记无关）：接口给的真实开播时刻优先，
-            # 没有则在本程序首次看到「直播中」时记本地观测，下播清空
-            update_live_started_at(self.live_started_at, int(room_id),
-                                   status_text == "直播中",
-                                   payload.get("live_started_at"))
             if payload.get("anchor_name"):
                 self.anchor_names[room_id] = payload["anchor_name"]
             entry = self.entries.get(room_id)
@@ -4808,16 +4905,24 @@ class ScMonitorApp:
         if anchor:
             self.anchor_names[room_id] = anchor
         if self.client_states.get(room_id) not in ("running", "starting"):
+            prev_text = self.live_state.get(room_id)
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             self.live_state[room_id] = status_text
-            # 只读查询也会改状态（无弹幕连接的房间）：同样记录时间并实时重排
-            if update_live_activity(self._live_since, self._offline_at, int(room_id),
-                                    status_text == "直播中"):
+            # 只读查询也会改状态（无弹幕连接的房间）：同样维护时间基准并实时重排
+            started_changed = update_live_started_at(
+                self.live_started_at, int(room_id), status_text == "直播中",
+                payload.get("live_started_at"))
+            offline_changed = update_offline_at(
+                self._offline_at, int(room_id), status_text == "直播中",
+                was_live=prev_text == "直播中")
+            if started_changed or offline_changed:
+                log_room.info("房间 %s 直播状态 %s（原 %s，只读查询）：排序时间基准已更新"
+                              "并落盘（开播 %s｜关播 %s）",
+                              room_id, status_text, prev_text or "未知",
+                              format_live_mark(self.live_started_at.get(int(room_id))),
+                              format_live_mark(self._offline_at.get(int(room_id))))
+                self._save_config()
                 self._reorder_for_live_change(room_id, status_text)
-            # 只读路径同样维护「已播时长」的起点（这类房间收不到弹幕 status 事件）
-            update_live_started_at(self.live_started_at, int(room_id),
-                                   status_text == "直播中",
-                                   payload.get("live_started_at"))
         if self.tree.exists(str(room_id)):
             self.tree.set(str(room_id), "title", payload.get("title") or "")
             if anchor:

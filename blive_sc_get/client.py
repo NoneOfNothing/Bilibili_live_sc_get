@@ -17,6 +17,7 @@ from .api import (
     BilibiliLiveAPI,
     RISK_CONTROL_CODES,
 )
+from .gui_config import format_live_mark
 from .log_categories import CATEGORY_LIVE, get_logger
 from .protocol import (
     Operation,
@@ -170,12 +171,18 @@ class RoomClient:
         self._uid = 0  # 最近一次已知的主播 uid
         self._offline_confirm_task: Optional[asyncio.Task] = None
 
-    def set_danmaku_enabled(self, enabled: bool) -> None:
+    def set_danmaku_enabled(self, enabled: bool) -> bool:
         """开关弹幕接收（GUI 按当前选中房间设置；bool 赋值线程安全）。
 
         开启后收到的弹幕会落盘并广播 dm 事件；关闭则解析后直接丢弃。
+        返回**是否发生变化**：宿主据此只在门控真的变了时记一条日志（切房、开关弹幕区、
+        开关房间独立窗口都会调用本方法，无条件记会刷屏）。
         """
-        self._dm_enabled = bool(enabled)
+        enabled = bool(enabled)
+        if enabled == self._dm_enabled:
+            return False
+        self._dm_enabled = enabled
+        return True
 
     def _emit(self, event_type: str, payload: dict) -> None:
         """向外部（如 GUI）推送事件；回调异常不影响监听本身。"""
@@ -256,7 +263,9 @@ class RoomClient:
         live_status = self._resolve_status(
             int(room_info.get("live_status") or 0), "连接时")
         status_text = LIVE_STATUS_TEXT.get(live_status, "未知")
-        self._log.info("房间 %s（%s）标题：%s", self._room_id, status_text, room_info.get("title") or "未知")
+        self._log.info("房间 %s（%s）标题：%s，开播时刻：%s", self._room_id, status_text,
+                       room_info.get("title") or "未知",
+                       format_live_mark(room_info.get(LIVE_STARTED_AT_KEY)))
         if not self._anchor_name:
             # 主播名基本不变，取一次即可；失败留空，下次重连再试
             self._anchor_name = await self._api.get_anchor_name(int(room_info.get("uid") or 0))
@@ -602,7 +611,8 @@ class RoomClient:
             int(info.get("live_status") or 0), reason)
         status_text = LIVE_STATUS_TEXT.get(live_status, "未知")
         title = info.get("title") or ""
-        self._log.info("房间状态更新（%s）：%s，标题：%s", reason, status_text, title or "未知")
+        self._log.info("房间状态更新（%s）：%s，标题：%s，开播时刻：%s", reason, status_text,
+                       title or "未知", format_live_mark(info.get(LIVE_STARTED_AT_KEY)))
         self._emit_status(live_status, title, int(info.get("uid") or 0),
                           info.get(LIVE_STARTED_AT_KEY))
         return True
@@ -641,8 +651,9 @@ class RoomClient:
             self._live_started_at = live_started_at
         if live_status != LIVE_STATUS_LIVE:
             self._live_started_at = None
-        self._log.debug("广播状态：%s（直播间 %s）",
-                        LIVE_STATUS_TEXT.get(live_status, "未知"), self._room_id)
+        self._log.debug("广播状态：%s（直播间 %s，开播时刻 %s）",
+                        LIVE_STATUS_TEXT.get(live_status, "未知"), self._room_id,
+                        format_live_mark(self._live_started_at))
         self._emit("status", {
             "room_id": self._room_id,
             "input_room_id": self._room_id_input,

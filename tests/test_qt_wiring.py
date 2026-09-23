@@ -801,13 +801,15 @@ class QtRoomListInteractionTests(unittest.TestCase):
         self.assertIn("sort_info_btn", _attr_names(warn), "拖动被拒时未提示用户")
 
     def test_live_status_sort_is_realtime_and_keeps_custom_order(self):
-        """「按直播状态」实时重排；保存始终按自定义顺序（切回自定义排序能复原）。"""
+        """「按直播状态」实时重排；时间基准变化后立刻落盘（否则重启后顺序被打乱）。"""
         host = _tree(HOST_MODULE)
         client_event = _method(host, HOST_CLASS, "_on_client_event")
-        self.assertIn("update_live_activity", _names(client_event),
-                      "status 事件未记录开播/关播时刻")
+        for name in ("update_live_started_at", "update_offline_at"):
+            self.assertIn(name, _names(client_event), f"status 事件未维护 {name}")
         self.assertIn("_reorder_for_live_change", _called_attrs(client_event),
                       "开播/关播后未实时重排")
+        self.assertIn("_save_config", _called_attrs(client_event),
+                      "时间基准变化后未落盘（重启会丢，顺序被打乱）")
         reorder = _method(host, HOST_CLASS, "_reorder_for_live_change")
         consts = {node.value for node in ast.walk(reorder) if isinstance(node, ast.Constant)}
         self.assertIn("status", consts, "只有「按直播状态」方案需要实时重排")
@@ -931,3 +933,104 @@ class QtLiveDurationWiringTests(unittest.TestCase):
                            and node.value.value is None
                            for target in node.targets)]
         self.assertTrue(cleared, "非直播中时未清空开播时刻")
+
+
+class QtLiveMarkPersistenceWiringTests(unittest.TestCase):
+    """「按直播状态」的时间基准要**持久化**：两版都要启动读回、保存写盘、排序直接用。"""
+
+    def test_host_restores_and_saves_marks(self):
+        host = _tree(HOST_MODULE)
+        init = _method(host, HOST_CLASS, "__init__")
+        self.assertIn("restore_live_marks", _names(init), "启动未恢复时间基准")
+        self.assertIn("live_started_at", _self_attr_names(host, HOST_CLASS),
+                      "宿主未持有开播时刻字典")
+        self.assertIn("_offline_at", _self_attr_names(host, HOST_CLASS),
+                      "宿主未持有开播时刻字典")
+        save = _method(host, HOST_CLASS, "_save_config")
+        save_consts = {node.value for node in ast.walk(save)
+                       if isinstance(node, ast.Constant)}
+        for key in ("live_started_at", "live_offline_at"):
+            self.assertIn(key, save_consts, f"保存未写入 ui.{key}")
+
+    def test_mark_changes_are_logged(self):
+        """时间基准变化要留痕：两版都记「房间、原状态、开播/关播时刻」。
+
+        顺序没排成预期时，靠这条日志能看出「时间基准是什么时候、因何变成这样的」。
+        """
+        for module, cls in ((HOST_MODULE, HOST_CLASS), ("gui_app.py", "ScMonitorApp")):
+            with self.subTest(module=module):
+                tree = _tree(module)
+                for method in ("_on_client_event", "_on_room_info"):
+                    node = _method(tree, cls, method)
+                    self.assertIn("format_live_mark", _names(node),
+                                  f"{module}.{method} 未记录开播/关播时刻")
+                    self.assertIn("log_room", _names(node),
+                                  f"{module}.{method} 未记录时间基准变化")
+                add = _method(tree, cls, "_on_add_result")
+                self.assertIn("log_room", _names(add),
+                              f"{module}._on_add_result 未记录「新加房间已在直播」")
+
+    def test_restore_and_delete_are_logged(self):
+        """启动恢复（含丢弃条数）与删房清理也要有日志。"""
+        host = _tree(HOST_MODULE)
+        delete = _method(host, HOST_CLASS, "_on_delete")
+        self.assertIn("log_room", _names(delete), "_on_delete 未记录时间基准清理")
+        # restore_live_marks 自己记恢复日志（两版共用，故检查 gui_app 的实现）
+        gui = _tree("gui_app.py")
+        restore = next((node for node in ast.walk(gui)
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "restore_live_marks"), None)
+        self.assertIsNotNone(restore, "未找到 restore_live_marks")
+        self.assertIn("log_data", _names(restore), "启动恢复未记日志")
+
+
+class LiveMarkLoggingWiringTests(unittest.TestCase):
+    """开播时刻在**数据层**也要留痕：接口解析结果与状态广播都带上它。
+
+    排序依据出问题时，从日志能一路追到「接口给的是什么、广播出去的是什么」。
+    """
+
+    def test_api_logs_parsed_live_start(self):
+        api = _tree("api.py")
+        room_info = _method(api, "BilibiliLiveAPI", "get_room_info")
+        self.assertIn("logger", _names(room_info), "解析开播时刻后未记日志")
+        full = _method(api, "BilibiliLiveAPI", "get_full_room_info")
+        self.assertIn("logger", _names(full), "H5 与 get_info 的开播时刻取舍未记日志")
+
+    def test_client_logs_live_start(self):
+        client = _tree("client.py")
+        for method in ("_emit_status", "_run_once", "_refresh_room_status"):
+            with self.subTest(method=method):
+                node = _method(client, "RoomClient", method)
+                self.assertIn("format_live_mark", _names(node),
+                              f"client.{method} 的日志未带开播时刻")
+
+
+class DanmakuGateLoggingTests(unittest.TestCase):
+    """弹幕接收门控变化要留痕（「窗口里没弹幕」这类问题全靠它定位）。"""
+
+    def test_gate_change_is_logged(self):
+        for module, cls in ((HOST_MODULE, HOST_CLASS), ("gui_app.py", "ScMonitorApp")):
+            with self.subTest(module=module):
+                node = _method(_tree(module), cls, "_apply_dm_gate")
+                self.assertIn("log_live", _names(node), f"{module} 门控变化未记日志")
+                self.assertIn("set_danmaku_enabled", _called_attrs(node),
+                              f"{module} 未按需开关客户端的弹幕接收")
+
+    def test_sort_uses_real_start_time(self):
+        """排序直接用真实开播时刻（``live_started_at``）；旧的运行时自增标记已弃用。"""
+        host = _tree(HOST_MODULE)
+        order = _method(host, HOST_CLASS, "_refresh_display_order")
+        self.assertIn("live_started_at", _attr_names(order),
+                      "排序未使用真实开播时刻（应按它倒序）")
+        self.assertNotIn("_live_since", _self_attr_names(host, HOST_CLASS),
+                         "运行期的自增标记应已弃用（改用真实时间 + 持久化）")
+
+    def test_room_delete_clears_marks(self):
+        """删房时清掉时间基准，避免残留记录影响后续排序。"""
+        for module, cls in ((HOST_MODULE, HOST_CLASS), ("gui_app.py", "ScMonitorApp")):
+            with self.subTest(module=module):
+                delete = _method(_tree(module), cls, "_on_delete")
+                for attr in ("live_started_at", "_offline_at"):
+                    self.assertIn(attr, _attr_names(delete),
+                                  f"{module}._on_delete 未清理 {attr}")

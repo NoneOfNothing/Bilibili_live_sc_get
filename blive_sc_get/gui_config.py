@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Union
 
@@ -43,6 +44,12 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     # room_windows：房间独立窗口（ROADMAP 84）的位置尺寸记忆，
     # {"<房间号>": {"x": .., "y": .., "width": .., "height": ..}}；只记几何，不记「是否打开」
     "room_windows": {},
+    # live_started_at / live_offline_at：「按直播状态」排序的时间基准（ROADMAP 87）——
+    # 各房间的**真实开播时刻**与**最近关播时刻**（epoch 秒），{"<房间号>": 时刻}。
+    # 持久化后重启仍按同样的先后排序（此前只存在内存里，重启即丢，顺序被打乱）；
+    # 启动读取时会丢弃过旧 / 非法的记录（见 gui_app.prune_live_marks）。
+    "live_started_at": {},
+    "live_offline_at": {},
 }
 """界面偏好默认值。
 
@@ -203,6 +210,45 @@ def parse_room_window_rects(ui: object) -> Dict[str, Dict[str, int]]:
     return result
 
 
+def parse_room_time_map(raw: object) -> Dict[int, float]:
+    """解析「房间号 → 时刻（epoch 秒）」映射（纯函数，便于离线测试）。
+
+    供 ``ui.live_started_at`` / ``ui.live_offline_at`` 使用——它们记录「按直播状态」排序
+    所需的时间基准，**持久化后重启仍能按同样的先后排序**。配置文件是用户可编辑的，所以
+    这里只做宽松解析：房间号须能转 ``int``、时刻须能转成正的 ``float``，其余（非 dict、
+    非数字、0、负数）一律丢弃。**过旧记录的过滤不在这里**——那是业务规则，见
+    ``gui_app.prune_live_marks``（读取后立即调用）。
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: Dict[int, float] = {}
+    for key, value in raw.items():
+        try:
+            room_id = int(key)
+            moment = float(value)
+        except (TypeError, ValueError):
+            continue
+        if moment <= 0:
+            continue
+        result[room_id] = moment
+    return result
+
+
+def format_live_mark(moment: Optional[float]) -> str:
+    """时间标记 → 日志里的本地时间串（如 ``2026-09-22 16:35:40``）；无效给 ``—``（纯函数）。
+
+    放在本模块而不是 ``gui_app``：``client`` 也要用它记状态日志，而 client 不能导入
+    gui_app（gui_app 反过来导入 client，会形成循环导入）。``gui_app.format_live_mark``
+    仍然可用（那里把它重新导出了）。
+    """
+    if moment is None:
+        return "—"
+    try:
+        return datetime.fromtimestamp(float(moment)).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return "—"
+
+
 def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     """读取界面偏好；文件缺失/损坏/缺少字段时返回默认值。"""
     prefs = dict(DEFAULT_UI_PREFS)
@@ -231,4 +277,7 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
             and all(isinstance(value, int) and value > 200 for value in size)):
         prefs["window_size"] = [int(size[0]), int(size[1])]
     prefs["room_windows"] = parse_room_window_rects(ui)
+    # 「按直播状态」排序的时间基准（ROADMAP 87）：重启后据此恢复上次的先后顺序
+    prefs["live_started_at"] = parse_room_time_map(ui.get("live_started_at"))
+    prefs["live_offline_at"] = parse_room_time_map(ui.get("live_offline_at"))
     return prefs

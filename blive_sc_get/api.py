@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
+from .gui_config import format_live_mark
 from .log_categories import CATEGORY_DATA, get_logger
 from .medal_tasks import (
     dedupe_medals,
@@ -664,6 +665,8 @@ class BilibiliLiveAPI:
             raise ApiError("获取房间信息", data.get("code"), "响应缺少 room_id")
         # 开播时刻归一化成 epoch 秒（本接口给的是北京时间字符串，未开播为全零占位）
         info[LIVE_STARTED_AT_KEY] = parse_live_started_at(info.get("live_time"))
+        logger.debug("房间 %s 开播时刻（get_info 的 live_time=%r）→ %s", info.get("room_id"),
+                     info.get("live_time"), format_live_mark(info.get(LIVE_STARTED_AT_KEY)))
         return info
 
     async def get_live_stream_urls(self, room_id: int, *,
@@ -818,6 +821,12 @@ class BilibiliLiveAPI:
                     h5_room.get("live_start_time") or h5_data.get("live_start_time"))
                 if h5_started is not None:
                     info[LIVE_STARTED_AT_KEY] = h5_started
+                    logger.debug("房间 %s 开播时刻改用 H5 时间戳：%s",
+                                 info.get("room_id"), format_live_mark(h5_started))
+                else:
+                    logger.debug("房间 %s 的 H5 未给出开播时刻，沿用 get_info 的结果：%s",
+                                 info.get("room_id"),
+                                 format_live_mark(info.get(LIVE_STARTED_AT_KEY)))
         except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
             logger.debug("获取 H5 房间信息失败，沿用 get_info 标题: %s", exc)
         return info

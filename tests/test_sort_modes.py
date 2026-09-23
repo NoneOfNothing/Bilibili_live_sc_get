@@ -1,62 +1,137 @@
-"""排序方案（ROADMAP 85）的离线测试：显示顺序合成与开播/关播时间记录。
+"""排序方案（ROADMAP 85 / 87）的离线测试：顺序合成、开播/关播时间记录与**持久化**。
 
-两版共用同一份纯函数（``gui_app.order_room_ids`` / ``gui_app.update_live_activity``），
-所以这里覆盖的就是界面最终看到的顺序——不启动任何 GUI。
+两版共用同一份纯函数（``gui_app.order_room_ids`` / ``update_live_started_at`` /
+``update_offline_at`` / ``prune_live_marks``），所以这里覆盖的就是界面最终看到的顺序
+——不启动任何 GUI。
 """
 
+import ast
 import unittest
 from pathlib import Path
 
 from blive_sc_get.gui_app import (
+    LIVE_MARK_MAX_AGE_S,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
     order_room_ids,
-    update_live_activity,
+    prune_live_marks,
+    update_live_started_at,
+    update_offline_at,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = [11, 22, 33, 44]
 
 
-class UpdateLiveActivityTests(unittest.TestCase):
-    """开播 / 关播时刻的记录（「按直播状态」排序的时间来源）。"""
+class UpdateOfflineAtTests(unittest.TestCase):
+    """关播时刻的记录（「已下播的按关播先后倒序」的时间来源，真实墙钟）。
 
-    def test_enter_and_leave_records_time_once(self):
-        live, offline = {}, {}
-        self.assertTrue(update_live_activity(live, offline, 1, True, 10.0))
-        self.assertEqual(live, {1: 10.0})
-        # 状态没变（周期复核会反复报同一状态）：不刷新时间，否则开播时间被一路推后
-        self.assertFalse(update_live_activity(live, offline, 1, True, 20.0))
-        self.assertEqual(live, {1: 10.0})
-        self.assertTrue(update_live_activity(live, offline, 1, False, 30.0))
-        self.assertEqual(live, {})
+    开播时刻不在这里：它由 ``update_live_started_at`` 维护（**真实开播时间**，接口值优先、
+    可校正本地观测、下播清空），排序时直接复用同一个字典。两者一起被持久化，因此重启后
+    顺序不变（见 ``LiveMarkPersistenceTests``）。
+    """
+
+    def test_leave_records_time_once(self):
+        offline = {}
+        self.assertTrue(update_offline_at(offline, 1, False, 30.0, was_live=True))
+        self.assertEqual(offline, {1: 30.0})
+        # 状态没变（周期复核会反复报同一状态，此时上一轮已是未开播）：不刷新，
+        # 否则关播时间被一路推后
+        self.assertFalse(update_offline_at(offline, 1, False, 40.0))
         self.assertEqual(offline, {1: 30.0})
 
     def test_never_live_room_keeps_no_record(self):
-        live, offline = {}, {}
-        self.assertFalse(update_live_activity(live, offline, 5, False, 10.0))
-        self.assertEqual((live, offline), ({}, {}))
+        """没观察到「直播中 → 未开播」跳变（从未开播 / 启动时就已下播）：不留记录。
 
-    def test_relive_clears_offline_time(self):
-        live, offline = {}, {1: 30.0}
-        self.assertTrue(update_live_activity(live, offline, 1, True, 40.0))
-        self.assertEqual(live, {1: 40.0})
+        启动时就已下播的房间，其先后顺序由**上次持久化的记录**给出（见
+        ``LiveMarkPersistenceTests``），不该按本次启动时刻重新计时。
+        """
+        offline = {}
+        self.assertFalse(update_offline_at(offline, 5, False, 10.0))
         self.assertEqual(offline, {})
 
-    def test_stamp_auto_increases_without_clock(self):
-        """先后标记自动递增：不再依赖时钟。
+    def test_live_clears_offline_time(self):
+        """重新开播：关播记录清掉（它只对已下播的房间有意义）。"""
+        offline = {1: 30.0}
+        self.assertTrue(update_offline_at(offline, 1, True, 40.0))
+        self.assertEqual(offline, {})
+        self.assertFalse(update_offline_at(offline, 1, True, 50.0))
 
-        实测坑：Windows 上 ``time.monotonic()`` 精度只有约 15 毫秒，同一轮事件里几次
-        开播/关播会拿到**相同**的时间戳，排序就分不出先后（冒烟时踩到）。
+    def test_same_round_still_orderable(self):
+        """同一轮里几个房间同时下播：时钟可能给出相同值，此时仍要能分出先后。
+
+        Windows 上时钟粒度约 1~15 毫秒，``time.time()`` 在同一轮事件里可能撞值，排序就
+        分不出先后；这里改用「现有最大值 + 1 毫秒」代替，偏移只有毫秒级、不偏离真实时间。
         """
+        offline = {}
+        for room_id in (1, 2, 3):
+            update_offline_at(offline, room_id, False, 100.0, was_live=True)
+        self.assertGreater(offline[2], offline[1], "后下播的时间应更大")
+        self.assertGreater(offline[3], offline[2])
+        self.assertLess(offline[3] - 100.0, 0.01, "偏移应只有毫秒级")
+
+
+class LiveMarkPersistenceTests(unittest.TestCase):
+    """排序依据必须**持久化**：重启后仍按上次的开播 / 关播先后排序（用户反馈的核心问题）。"""
+
+    NOW = 100000.0
+
+    def test_restart_keeps_order(self):
+        """模拟「运行 → 落盘 → 重启」：重启后的显示顺序与重启前一致。"""
+        base = [11, 22, 33, 44]
         live, offline = {}, {}
-        update_live_activity(live, offline, 1, True)
-        update_live_activity(live, offline, 2, True)
-        self.assertGreater(live[2], live[1], "后开播的标记应更大")
-        update_live_activity(live, offline, 2, False)
-        self.assertGreater(offline[2], live[1], "关播标记应大于此前的开播标记")
-        update_live_activity(live, offline, 3, True)
-        self.assertGreater(live[3], offline[2], "再次开播应拿到更大的标记")
+        # 运行期：33 先开播、11 后开播（最近开播的在最上）；22 刚下播
+        update_live_started_at(live, 33, True, self.NOW - 7200, now=self.NOW)
+        update_live_started_at(live, 11, True, self.NOW - 600, now=self.NOW)
+        update_offline_at(offline, 22, False, self.NOW - 120, was_live=True)
+        states = {33: "直播中", 11: "直播中", 22: "未开播"}
+        before = order_room_ids(base, "status", live_states=states,
+                                live_since=live, offline_at=offline)
+        self.assertEqual(before, [11, 33, 22, 44])
+
+        # 落盘（gui_rooms.json 的 ui 段用字符串键）→ 重启读取
+        saved_live = {str(k): v for k, v in live.items()}
+        saved_offline = {str(k): v for k, v in offline.items()}
+        live2 = prune_live_marks(saved_live, now=self.NOW)
+        offline2 = prune_live_marks(saved_offline, now=self.NOW)
+        self.assertEqual(live2, live)
+        self.assertEqual(offline2, offline)
+
+        after = order_room_ids(base, "status", live_states=states,
+                               live_since=live2, offline_at=offline2)
+        self.assertEqual(after, before, "重启后顺序被打乱")
+
+    def test_stale_and_invalid_marks_are_dropped(self):
+        """过旧 / 未来 / 非法的记录一律丢弃：上次会话的陈旧时间不能把排序带偏。"""
+        now = 1000000.0
+        marks = {
+            "1": now - 60,                        # 有效
+            "2": now - LIVE_MARK_MAX_AGE_S - 1,   # 过旧（不可能是同一场直播）
+            "3": now + 3600,                      # 未来（时钟回拨或脏数据）
+            "4": 0,                               # 无意义
+            "5": -5,                              # 负数
+            "abc": now,                           # 键不是房间号
+            "6": "not-a-time",                    # 值不是数字
+        }
+        self.assertEqual(prune_live_marks(marks, now=now), {1: now - 60})
+
+    def test_empty_and_none_are_safe(self):
+        self.assertEqual(prune_live_marks({}), {})
+        self.assertEqual(prune_live_marks(None), {})
+
+    def test_observation_fallback_is_logged(self):
+        """没有接口开播时刻、回退「本地观测」时要留痕。
+
+        这条日志能让用户知道：该房间的「已播」时长与排序时间是**估算**的，接口一旦
+        返回就会校正。
+        """
+        tree = ast.parse((ROOT / "blive_sc_get" / "gui_app.py").read_text(encoding="utf-8"))
+        node = next((item for item in ast.walk(tree) if isinstance(item, ast.FunctionDef)
+                     and item.name == "update_live_started_at"), None)
+        self.assertIsNotNone(node, "未找到 update_live_started_at")
+        self.assertIn("log_room", {sub.id for sub in ast.walk(node)
+                                   if isinstance(sub, ast.Name)},
+                      "回退本地观测未记日志")
 
 
 class OrderRoomIdsTests(unittest.TestCase):
@@ -131,14 +206,15 @@ class OrderRoomIdsTests(unittest.TestCase):
         """一轮开播/关播后：显示顺序随信号变化，但自定义顺序（base_order）不被改写。"""
         base = [11, 22, 33]
         live, offline = {}, {}
-        update_live_activity(live, offline, 11, True, 10.0)
-        update_live_activity(live, offline, 33, True, 20.0)
+        update_live_started_at(live, 11, True, 10.0)
+        update_live_started_at(live, 33, True, 20.0)
         states = {11: "直播中", 33: "直播中", 22: "未开播"}
         self.assertEqual(
             order_room_ids(base, "status", live_states=states,
                            live_since=live, offline_at=offline),
             [33, 11, 22])
-        update_live_activity(live, offline, 33, False, 30.0)
+        update_live_started_at(live, 33, False)
+        update_offline_at(offline, 33, False, 30.0, was_live=True)
         states[33] = "未开播"
         self.assertEqual(
             order_room_ids(base, "status", live_states=states,

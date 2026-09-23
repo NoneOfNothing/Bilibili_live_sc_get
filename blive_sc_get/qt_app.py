@@ -82,10 +82,12 @@ from .gui_app import (
     PANE_RATIO,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    format_live_mark,
     order_room_ids,
     parse_add_input,
-    update_live_activity,
+    restore_live_marks,
     update_live_started_at,
+    update_offline_at,
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
@@ -783,12 +785,12 @@ class QtScMonitorApp(QMainWindow):
         # 存储顺序）；_room_order = 当前**显示**顺序（按方案由 order_room_ids 算出）
         self._custom_order: List[int] = list(self.entries.keys())
         self._room_order: List[int] = list(self._custom_order)
-        # 「按直播状态」排序用的时间记录（仅内存）：开播时刻 / 关播时刻（time.monotonic）
-        self._live_since: Dict[int, float] = {}
-        self._offline_at: Dict[int, float] = {}
-        # 「已播时长」的起点（epoch 秒，与上面的排序标记**职责分离**）：优先取接口给的
-        # 真实开播时刻，接口没有时回退为本地观测到的开播时刻；下播即清空
-        self.live_started_at: Dict[int, float] = {}
+        # 「按直播状态」排序与「已播」显示共用的时间基准（**都会持久化**到 gui_rooms.json
+        # 的 ui 段，因此重启后排序依然有效）：
+        #   live_started_at：各房间的真实开播时刻（接口值优先，回退本地观测；下播清空）
+        #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
+        # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
+        self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
 
         self.client_states: Dict[int, str] = {}
         self.live_state: Dict[int, str] = {}
@@ -1537,6 +1539,8 @@ class QtScMonitorApp(QMainWindow):
         if memory.get(str(int(room_id))) == value:
             return
         memory[str(int(room_id))] = value
+        log_window.debug("记住房间 %s 的独立窗口几何：%dx%d+%d+%d", room_id,
+                         value["width"], value["height"], value["x"], value["y"])
         self._save_config()
 
     def open_room_window(self, room_id: int) -> None:
@@ -1579,8 +1583,13 @@ class QtScMonitorApp(QMainWindow):
         未设置时 RoomClient._dm_enabled 默认 False，弹幕会全部被丢弃。
         """
         rooms = self._dm_rooms()
-        for room_id, (client, _task) in self.room_tasks.items():
-            client.set_danmaku_enabled(room_id in rooms)
+        # 只在门控真的变化时记一条：切房 / 开关弹幕区 / 开关独立窗口都会走到这里
+        changed = [room_id for room_id, (client, _task) in self.room_tasks.items()
+                   if client.set_danmaku_enabled(room_id in rooms)]
+        if changed:
+            log_live.debug("弹幕接收门控变化：%s（当前接收 %d 个房间：%s）",
+                           "、".join(str(r) for r in sorted(changed)), len(rooms),
+                           "、".join(str(r) for r in sorted(rooms)) or "无")
 
     def _load_dm_options_for(self, room_id) -> None:
         """已登录且该房间有可见弹幕面板时，拉取其可用弹幕颜色/模式（尽力而为）。"""
@@ -1726,16 +1735,24 @@ class QtScMonitorApp(QMainWindow):
             self.anchor_names[room_id] = anchor
         self.titles[room_id] = str(payload.get("title") or "")
         if self.client_states.get(room_id) not in ("running", "starting"):
+            prev_text = self.live_state.get(room_id)
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             self.live_state[room_id] = status_text
-            # 只读查询也会改状态：同样记录时间并实时重排（「按直播状态」方案）
-            if update_live_activity(self._live_since, self._offline_at, int(room_id),
-                                    status_text == "直播中"):
+            # 只读查询也会改状态（无弹幕连接的房间）：同样维护时间基准并实时重排
+            started_changed = update_live_started_at(
+                self.live_started_at, int(room_id), status_text == "直播中",
+                payload.get("live_started_at"))
+            offline_changed = update_offline_at(
+                self._offline_at, int(room_id), status_text == "直播中",
+                was_live=prev_text == "直播中")
+            if started_changed or offline_changed:
+                log_room.info("房间 %s 直播状态 %s（原 %s，只读查询）：排序时间基准已更新"
+                              "并落盘（开播 %s｜关播 %s）",
+                              room_id, status_text, prev_text or "未知",
+                              format_live_mark(self.live_started_at.get(int(room_id))),
+                              format_live_mark(self._offline_at.get(int(room_id))))
+                self._save_config()
                 self._reorder_for_live_change(room_id, status_text)
-            # 只读路径同样维护「已播时长」的起点（这类房间收不到弹幕 status 事件）
-            update_live_started_at(self.live_started_at, int(room_id),
-                                   status_text == "直播中",
-                                   payload.get("live_started_at"))
         self._refresh_row(room_id)
         self._refresh_sc_header(room_id)
 
@@ -1815,9 +1832,11 @@ class QtScMonitorApp(QMainWindow):
         self.client_states[room_id] = "starting"
         self.live_state[room_id] = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
         # 新加的房间可能本来就在直播：立刻记下「已播」起点，不必等首次 status 事件
-        update_live_started_at(self.live_started_at, room_id,
-                               self.live_state[room_id] == "直播中",
-                               payload.get("live_started_at"))
+        if update_live_started_at(self.live_started_at, room_id,
+                                  self.live_state[room_id] == "直播中",
+                                  payload.get("live_started_at")):
+            log_room.debug("新加房间 %s 已在直播：已记下开播时刻 %s（随本次保存落盘）",
+                           room_id, format_live_mark(self.live_started_at.get(room_id)))
         self.titles[room_id] = payload.get("title") or ""
         if payload.get("anchor_name"):
             self.anchor_names[room_id] = payload["anchor_name"]
@@ -1882,6 +1901,11 @@ class QtScMonitorApp(QMainWindow):
             self.entries.pop(room_id, None)
             self.client_states.pop(room_id, None)
             self.live_state.pop(room_id, None)
+            # 排序/「已播」的时间基准随房间清理（有记录才记日志，避免删一堆无记录的房间时刷屏）
+            had_live = self.live_started_at.pop(room_id, None) is not None
+            had_offline = self._offline_at.pop(room_id, None) is not None
+            if had_live or had_offline:
+                log_room.debug("房间 %s 的排序时间基准已随删除清理", room_id)
             self.titles.pop(room_id, None)
             self.occupiers.pop(room_id, None)
             self.anchor_names.pop(room_id, None)
@@ -1969,7 +1993,7 @@ class QtScMonitorApp(QMainWindow):
         self._room_order = order_room_ids(
             [r for r in self._custom_order if r in self.entries], mode,
             live_states=self.live_state, anchor_names=self.anchor_names,
-            live_since=self._live_since, offline_at=self._offline_at)
+            live_since=self.live_started_at, offline_at=self._offline_at)
 
     def _apply_sort(self) -> None:
         """重算显示顺序并重建行。
@@ -2719,15 +2743,23 @@ class QtScMonitorApp(QMainWindow):
             status_text = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
             prev_text = self.live_state.get(room_id)
             self.live_state[room_id] = status_text
-            # 记录开播/关播时刻（「按直播状态」排序用），必要时实时重排列表
-            if update_live_activity(self._live_since, self._offline_at, int(room_id),
-                                    status_text == "直播中"):
+            # 排序 / 「已播」共用的时间基准（两版共用纯函数）：开播时刻写 live_started_at
+            # （接口真实值优先、回退本地观测、下播清空），关播时刻写 _offline_at。
+            # **任一变化都要落盘**——否则重启后时间基准丢失、顺序被打乱（用户反馈）。
+            started_changed = update_live_started_at(
+                self.live_started_at, int(room_id), status_text == "直播中",
+                payload.get("live_started_at"))
+            offline_changed = update_offline_at(
+                self._offline_at, int(room_id), status_text == "直播中",
+                was_live=prev_text == "直播中")
+            if started_changed or offline_changed:
+                log_room.info("房间 %s 直播状态 %s（原 %s）：排序时间基准已更新并落盘"
+                              "（开播 %s｜关播 %s）",
+                              room_id, status_text, prev_text or "未知",
+                              format_live_mark(self.live_started_at.get(int(room_id))),
+                              format_live_mark(self._offline_at.get(int(room_id))))
+                self._save_config()
                 self._reorder_for_live_change(room_id, status_text)
-            # 「已播时长」的起点（与上面的排序标记无关）：接口给的真实开播时刻优先，
-            # 没有则在本程序首次看到「直播中」时记本地观测，下播清空
-            update_live_started_at(self.live_started_at, int(room_id),
-                                   status_text == "直播中",
-                                   payload.get("live_started_at"))
             # 直播标题单独存：状态列显示直播状态，标题列显示标题（勿混用）
             self.titles[room_id] = payload.get("title") or ""
             if payload.get("anchor_name"):
@@ -2959,6 +2991,11 @@ class QtScMonitorApp(QMainWindow):
         而不是当前显示顺序（ROADMAP 85）：按房间号 / 主播名 / 直播状态这些方案只影响
         显示，若把它们的顺序写进配置，切回「自定义排序」就复原不了了。
         """
+        # 「按直播状态」的时间基准一并落盘：下次启动要读回来（否则重启后排序被打乱）
+        self.ui_prefs["live_started_at"] = {str(k): float(v)
+                                           for k, v in self.live_started_at.items()}
+        self.ui_prefs["live_offline_at"] = {str(k): float(v)
+                                           for k, v in self._offline_at.items()}
         order = ordered_room_ids(self._custom_order, self.entries)
         self._custom_order = order
         if order != list(self.entries):

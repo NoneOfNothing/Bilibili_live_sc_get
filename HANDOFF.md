@@ -154,6 +154,9 @@ python -m venv .venv
   各有一个勾选框，任一处切换都会广播给所有 `DmPanel` 并回写所有勾选框（`blockSignals` 防回环），
   偏好落 `ui.dm_emoticon_image`；新开的窗口按当前偏好初始化。
   （Tk 版不内嵌表情图，没有这个开关。）
+- **日志**：打开 / 前置 / 关闭窗口各有 info；几何记忆的**写入与恢复**各记 debug（「位置没记住」
+  时直接对日志）；**弹幕接收门控**（哪些房间在收弹幕）在**变化时**记一条 debug——
+  `client.set_danmaku_enabled` 返回「是否变化」，宿主据此汇总，排查「独立窗口里没弹幕」靠它。
 
 ## 10. 排序方案（ROADMAP 85，两版共用同一份逻辑）
 
@@ -178,8 +181,21 @@ python -m venv .venv
   `on_drag_blocked`；Tk 看 `_drag_allowed()`（在 `_on_tree_press` 里就拦下，不记录拖动行）。
   被拒时把「ⓘ」临时变成「⚠」（Qt 同步把悬浮提示改为「当前排序方案不可拖动，请先切到「自定义排序」」）
   并记 debug 日志，2.5 秒后恢复——原因就在按钮里，不弹窗打断。
-- 测试：`tests/test_sort_modes.py`（排序合成、时间记录、文案），`tests/test_qt_wiring.py`
-  另有接线检查（切换即生效并落盘、禁用拖动、保存按自定义顺序）。
+- **时间基准是「真实墙钟 + 持久化」（ROADMAP 87，修掉「重启后顺序被打乱」）**：
+  `live_started_at`（**真实开播时刻**，与第 11 节的「已播」共用同一字典：接口值优先、
+  可校正本地观测、下播清空）与 `_offline_at`（关播时刻，纯函数 `update_offline_at`）
+  都写进 `gui_rooms.json` 的 `ui.live_started_at` / `ui.live_offline_at`，启动时经
+  `prune_live_marks` 读回（丢弃 >24 小时 / 未来 / 非法记录）。排序时 `live_since`
+  直接传 `live_started_at`，**旧的自增标记 `_live_since` 已整体弃用**。
+  因此**重启后顺序不变**；启动时就已在直播的房间等于用「已播」时长**反推**了开播时间。
+  `update_offline_at` 靠 `was_live` 只认「直播中 → 非直播中」的真实跳变（重复上报不推后、
+  从未开播不留记录），同一轮撞值用「现有最大值 + 1 毫秒」保证仍可排序。
+  **日志**：启动恢复由 `restore_live_marks` 记一条（恢复条数 + 丢弃的过期/非法条数，
+  无记录时降 debug）；时间基准每次变化记一条（房间号、原状态、开播/关播时刻、已落盘）；
+  新加房间已在直播、删房清理各记一条 debug。时间串统一走 `format_live_mark`。
+- 测试：`tests/test_sort_modes.py`（排序合成、开播/关播时间、持久化与脏数据过滤、文案），
+  `tests/test_qt_wiring.py` 另有接线检查（切换即生效并落盘、禁用拖动、保存按自定义顺序、
+  时间基准的读回/落盘/删房清理）。
 
 ## 11. 直播时长显示（ROADMAP 86，两版）
 

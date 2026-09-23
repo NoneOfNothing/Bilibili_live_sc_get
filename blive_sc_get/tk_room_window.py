@@ -539,6 +539,8 @@ class RoomChatWindow(tk.Toplevel):
         self._loading_more = False
         self._loaded_count = skip + len(records)
         self._has_more = self._loaded_count < total
+        log_data.debug("独立窗口历史 SC 加载完成：房间 %s，本次 %d 条，累计 %d/%d",
+                       room_id, len(records), self._loaded_count, total)
         marker = self._history_marker(self._loaded_count, total)
         text = self.sc_text
         text.configure(state="normal")
@@ -1138,6 +1140,8 @@ class RoomChatWindow(tk.Toplevel):
         rect = self.host.load_room_window_geometry(self._room_id)
         if rect is not None:
             self.geometry(f"{rect[2]}x{rect[3]}+{rect[0]}+{rect[1]}")
+            log_window.debug("恢复房间 %s 的窗口几何：%sx%s+%s+%s", self._room_id,
+                             rect[2], rect[3], rect[0], rect[1])
             return
         width, height = DEFAULT_SIZE
         origin_x, origin_y = 60, 60

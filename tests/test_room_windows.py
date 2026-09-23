@@ -274,5 +274,23 @@ class RoomWindowLiveDurationTests(unittest.TestCase):
                       "每秒刷新未挂到现有轮询上")
 
 
+class RoomWindowGeometryLoggingTests(unittest.TestCase):
+    """几何记忆的读写都要留痕：用户反馈「窗口位置没记住」时能直接对日志。"""
+
+    def test_save_geometry_is_logged(self):
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                node = _method(ast.parse(_source(module)), cls, "save_room_window_geometry")
+                self.assertIn("log_window", _names(node), f"{module} 记录几何未记日志")
+
+    def test_restore_geometry_is_logged(self):
+        for module in ("tk_room_window.py", "qt_room_window.py"):
+            with self.subTest(module=module):
+                node = _method(ast.parse(_source(module)), "RoomChatWindow",
+                               "restore_geometry")
+                self.assertIn("log_window", _names(node), f"{module} 恢复几何未记日志")
+
+
 if __name__ == "__main__":
     unittest.main()

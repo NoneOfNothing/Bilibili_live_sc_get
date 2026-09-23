@@ -126,6 +126,8 @@ class RoomChatWindow(QWidget):
         rect = self.host.load_room_window_geometry(self._room_id)
         if rect is not None:
             self.setGeometry(rect[0], rect[1], rect[2], rect[3])
+            log_window.debug("恢复房间 %s 的窗口几何：%sx%s+%s+%s", self._room_id,
+                             rect[2], rect[3], rect[0], rect[1])
             return
         # 无记忆：默认尺寸 + 相对主窗口偏移一点，避免与主界面完全重叠
         self.resize(*DEFAULT_SIZE)

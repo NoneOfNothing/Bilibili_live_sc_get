@@ -18,10 +18,15 @@ from blive_sc_get.api import (
 )
 from blive_sc_get.gui_app import (
     format_live_duration,
+    format_live_mark,
     live_duration_text,
-    update_live_activity,
+    restore_live_marks,
     update_live_started_at,
+    update_offline_at,
 )
+from blive_sc_get.gui_config import load_ui_prefs, parse_room_time_map
+from blive_sc_get.client import RoomClient
+from blive_sc_get.storage import SCStorage
 from blive_sc_get.qt_app import (
     drag_source_rows,
     move_items,
@@ -308,7 +313,8 @@ class GuiConfigTests(unittest.TestCase):
                           "notify_sound": "三连音", "dm_visible": True,
                           "dm_emoticon_image": True,
                           "window_size": [0, 0],
-                          "room_windows": {}})
+                          "room_windows": {},
+                          "live_started_at": {}, "live_offline_at": {}})
         # 旧配置缺字段时的缺省值
         save_room_entries(self.path, [RoomEntry(123)], ui={"sort_mode": "manual"})
         prefs = load_ui_prefs(self.path)
@@ -347,7 +353,8 @@ class GuiConfigTests(unittest.TestCase):
                     "notify_sound": "上行双音", "dm_visible": False,
                     "dm_emoticon_image": True,
                     "window_size": [0, 0],
-                    "room_windows": {}}
+                    "room_windows": {},
+                    "live_started_at": {}, "live_offline_at": {}}
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"), expected)
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual(load_ui_prefs(self.path), expected)
@@ -1381,15 +1388,18 @@ class UpdateLiveStartedAtTests(unittest.TestCase):
         self.assertTrue(update_live_started_at(store, 1, True, 0, now=1000.0))
         self.assertEqual(store, {1: 1000.0})
 
-    def test_sorting_marks_are_independent(self):
-        """「已播」起点与排序用的先后标记互不影响（后者是自增整数，不能混用）。"""
-        live_since: dict = {}
-        offline_at: dict = {}
-        update_live_activity(live_since, offline_at, 1, True)
+    def test_live_and_offline_marks_are_independent(self):
+        """「已播」起点与关播时间是两份独立数据：互不影响、各自维护。
+
+        排序里前者用于「正在直播的按开播时间倒序」，后者用于「已下播的按关播时间倒序」。
+        """
         started: dict = {}
-        update_live_started_at(started, 1, True, 1790066140, now=1790066240.0)
-        self.assertEqual(live_since, {1: 1.0})
+        offline: dict = {}
+        self.assertTrue(update_live_started_at(started, 1, True, 1790066140,
+                                               now=1790066240.0))
+        self.assertTrue(update_offline_at(offline, 2, False, 1000.0, was_live=True))
         self.assertEqual(started, {1: 1790066140.0})
+        self.assertEqual(offline, {2: 1000.0})
 
 
 class FormatLiveDurationTests(unittest.TestCase):
@@ -1421,6 +1431,101 @@ class LiveDurationTextTests(unittest.TestCase):
         self.assertIsNone(live_duration_text(1790066140, False, now=1790066240.0))
         self.assertIsNone(live_duration_text(None, True, now=1790066240.0))
         self.assertIsNone(live_duration_text(None, False, now=1790066240.0))
+
+
+class RoomTimeMapTests(unittest.TestCase):
+    """ui 段的「房间号 → 时刻」解析（「按直播状态」排序的持久化载体，ROADMAP 87）。"""
+
+    def test_parses_int_keys_and_float_values(self):
+        self.assertEqual(parse_room_time_map({"111": 123.5}), {111: 123.5})
+        self.assertEqual(parse_room_time_map({111: 5}), {111: 5.0})
+
+    def test_drops_bad_entries(self):
+        """配置文件是用户可编辑的：坏键坏值不能把排序带崩。"""
+        raw = {"abc": 1.0, "222": "x", "333": 0, "444": -3, "555": None}
+        self.assertEqual(parse_room_time_map(raw), {})
+
+    def test_non_dict_is_empty(self):
+        for raw in (None, [], "x", 5):
+            self.assertEqual(parse_room_time_map(raw), {})
+
+    def test_load_ui_prefs_reads_marks(self):
+        """读取界面偏好时要带上这两个映射（否则重启后时间基准丢失）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gui_rooms.json"
+            path.write_text(json.dumps({"rooms": [], "ui": {
+                "live_started_at": {"111": 123.0},
+                "live_offline_at": {"222": 456.0},
+            }}), encoding="utf-8")
+            prefs = load_ui_prefs(path)
+        self.assertEqual(prefs["live_started_at"], {111: 123.0})
+        self.assertEqual(prefs["live_offline_at"], {222: 456.0})
+
+    def test_load_ui_prefs_defaults_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gui_rooms.json"
+            path.write_text(json.dumps({"rooms": [], "ui": {}}), encoding="utf-8")
+            prefs = load_ui_prefs(path)
+        self.assertEqual(prefs["live_started_at"], {})
+        self.assertEqual(prefs["live_offline_at"], {})
+
+
+class RestoreLiveMarksTests(unittest.TestCase):
+    """启动恢复「按直播状态」的时间基准（并留日志）：读回可用记录、丢掉过期/非法记录。"""
+
+    NOW = 1000000.0
+
+    def test_restores_from_ui_section(self):
+        prefs = {"live_started_at": {"11": self.NOW - 60},
+                 "live_offline_at": {"22": self.NOW - 30}}
+        live, offline = restore_live_marks(prefs, now=self.NOW)
+        self.assertEqual(live, {11: self.NOW - 60})
+        self.assertEqual(offline, {22: self.NOW - 30})
+
+    def test_drops_stale_and_invalid(self):
+        prefs = {"live_started_at": {"11": self.NOW - 60,
+                                     "12": self.NOW - 26 * 3600,   # 过旧
+                                     "13": self.NOW + 600,         # 未来
+                                     "abc": self.NOW},             # 键非法
+                 "live_offline_at": None}
+        live, offline = restore_live_marks(prefs, now=self.NOW)
+        self.assertEqual(live, {11: self.NOW - 60})
+        self.assertEqual(offline, {})
+
+    def test_empty_prefs_are_safe(self):
+        self.assertEqual(restore_live_marks({}, now=self.NOW), ({}, {}))
+        self.assertEqual(restore_live_marks({"live_started_at": {}}, now=self.NOW), ({}, {}))
+
+
+class FormatLiveMarkTests(unittest.TestCase):
+    """日志用的时间串：正常值转本地时间，非法值给「—」且不抛异常。"""
+
+    def test_formats_consistent_with_datetime(self):
+        moment = 1790066140.0
+        text = format_live_mark(moment)
+        self.assertRegex(text, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        # 与 datetime 自身转换一致（不写死时区，避免在非东八区环境误报）
+        self.assertEqual(text, datetime.fromtimestamp(moment).strftime("%Y-%m-%d %H:%M:%S"))
+
+    def test_invalid_values_return_dash(self):
+        for value in (None, float("nan"), 1e30):
+            with self.subTest(value=value):
+                self.assertEqual(format_live_mark(value), "—")
+
+
+class DanmakuGateTests(unittest.TestCase):
+    """弹幕接收门控的开关要能报告「是否变化」——宿主据此只在变化时记一条日志。
+
+    门控会因切房 / 开关弹幕区 / 开关房间独立窗口被反复调用，无条件记日志会刷屏。
+    """
+
+    def test_set_danmaku_enabled_reports_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = RoomClient(None, 123456, SCStorage(tmp))
+            self.assertTrue(client.set_danmaku_enabled(True))
+            self.assertFalse(client.set_danmaku_enabled(True), "重复设置不应报告变化")
+            self.assertTrue(client.set_danmaku_enabled(False))
+            self.assertFalse(client.set_danmaku_enabled(False))
 
 
 if __name__ == "__main__":
