@@ -1006,6 +1006,43 @@ class LiveMarkLoggingWiringTests(unittest.TestCase):
                               f"client.{method} 的日志未带开播时刻")
 
 
+class StartupSortAndReorderWiringTests(unittest.TestCase):
+    """启动即应用记忆的排序方案 + 状态跳变重排的合并执行（两版）。
+
+    用户反馈：「重启时会记忆排序方案选择，但不会触发排序，每次启动都是自定义排序的样式」。
+    """
+
+    def test_startup_applies_sort_mode(self):
+        """Tk 启动填充必须按**当前方案**的顺序（此前固定按配置顺序，方案等于没生效）。"""
+        tree = _tree("gui_app.py")
+        populate = _method(tree, "ScMonitorApp", "_populate_rows")
+        self.assertIn("_sorted_room_ids", _called_attrs(populate),
+                      "启动填充未按当前排序方案取顺序")
+        qt = _tree(HOST_MODULE)
+        init = _method(qt, HOST_CLASS, "__init__")
+        self.assertIn("_refresh_display_order", _called_attrs(init),
+                      "Qt 启动未先算显示顺序")
+
+    def test_status_change_marks_reorder(self):
+        """状态跳变（哪怕时间基准没变）也要重排，且合并到轮询末尾统一执行一次。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"), (HOST_MODULE, HOST_CLASS)):
+            with self.subTest(module=module):
+                tree = _tree(module)
+                for method in ("_on_client_event", "_on_room_info"):
+                    node = _method(tree, cls, method)
+                    self.assertIn("_reorder_for_live_change", _called_attrs(node),
+                                  f"{module}.{method} 状态变化后未标记重排")
+                    self.assertIn("prev_text", _names(node),
+                                  f"{module}.{method} 未按「状态是否变化」判断")
+                reorder = _method(tree, cls, "_reorder_for_live_change")
+                self.assertIn("_sort_dirty", _attr_names(reorder), "未标记待重排")
+                self.assertNotIn("_apply_sort", _called_attrs(reorder),
+                                 "不应在状态事件里逐个立即重排（启动时会白做 N 次）")
+                poll = _method(tree, cls, "_poll_queue")
+                self.assertIn("_sort_dirty", _attr_names(poll), "轮询末尾未统一重排")
+                self.assertIn("_apply_sort", _called_attrs(poll), "轮询末尾未执行重排")
+
+
 class DanmakuGateLoggingTests(unittest.TestCase):
     """弹幕接收门控变化要留痕（「窗口里没弹幕」这类问题全靠它定位）。"""
 

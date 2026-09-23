@@ -977,6 +977,7 @@ class ScMonitorApp:
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
         self._live_duration_tick = 0.0  # 「已播」字段上次刷新时刻（秒级节流用）
+        self._sort_dirty = False  # 「按直播状态」有房间状态变了、待本轮轮询末尾统一重排
         self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
         # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
         self._room_windows: Dict[int, object] = {}
@@ -2288,8 +2289,13 @@ class ScMonitorApp:
     # ---------- 房间列表 ----------
 
     def _populate_rows(self) -> None:
-        # 按配置文件中的顺序显示（即上次记忆的顺序），不再启动时自动排序
-        for room_id in self.entries:
+        """按**当前排序方案**的显示顺序填充列表（启动与重建时都走这里）。
+
+        此前固定按配置里的顺序（＝自定义顺序）填充，注释还写着「不再启动时自动排序」——
+        那是「排序靠手动按钮触发」时代的做法。如今方案是「下拉选中即生效 + 跨重启记忆」，
+        启动时不应用方案就表现为「记住了选择，列表却仍是自定义顺序的样子」（用户反馈）。
+        """
+        for room_id in self._sorted_room_ids():
             self.client_states.setdefault(
                 room_id, "disabled" if not self.entries[room_id].enabled else "starting"
             )
@@ -2512,12 +2518,17 @@ class ScMonitorApp:
         self.sort_info_btn.configure(text="ⓘ")
 
     def _reorder_for_live_change(self, room_id: int, status_text: str) -> None:
-        """开播 / 关播后的实时重排（仅「按直播状态」方案；其它方案与状态无关）。"""
+        """状态跳变后**标记**待重排（仅「按直播状态」方案；其它方案与状态无关）。
+
+        不在这里立刻重排：启动后各房间的状态事件几乎同时到达，逐个重排会白做 N 次
+        （Qt 版还要重建整张表）。标记后由本轮轮询末尾统一重排一次（100ms 内完成，
+        观感仍是即时）。
+        """
         if self._sort_mode() != "status":
             return
-        log_room.info("房间 %s %s，按直播状态重排列表", room_id,
-                      "开播" if status_text == "直播中" else "下播")
-        self._apply_sort()
+        self._sort_dirty = True
+        log_room.debug("房间 %s %s，标记待重排（按直播状态）", room_id,
+                       "开播" if status_text == "直播中" else "状态变化")
 
     def _on_overlay_toggled(self) -> None:
         self.ui_prefs["notify_overlay"] = bool(self.notify_overlay_var.get())
@@ -4770,6 +4781,9 @@ class ScMonitorApp:
                               format_live_mark(self.live_started_at.get(int(room_id))),
                               format_live_mark(self._offline_at.get(int(room_id))))
                 self._save_config()
+            # 只要**状态本身**变了就要重排：启动后各房间状态陆续到达，而此前只在「时间
+            # 基准有变化」时才重排——本来就在直播的房间（基准没变）会迟迟排不到最前。
+            if started_changed or offline_changed or prev_text != status_text:
                 self._reorder_for_live_change(room_id, status_text)
             if payload.get("anchor_name"):
                 self.anchor_names[room_id] = payload["anchor_name"]
@@ -4922,6 +4936,7 @@ class ScMonitorApp:
                               format_live_mark(self.live_started_at.get(int(room_id))),
                               format_live_mark(self._offline_at.get(int(room_id))))
                 self._save_config()
+            if started_changed or offline_changed or prev_text != status_text:
                 self._reorder_for_live_change(room_id, status_text)
         if self.tree.exists(str(room_id)):
             self.tree.set(str(room_id), "title", payload.get("title") or "")
@@ -5079,6 +5094,11 @@ class ScMonitorApp:
         # 用户手动滚回底部后清除未读计数（复用同一轮询，不新增定时器）
         self._sync_unseen_from_scroll()
         self._tick_live_duration()
+        # 本轮有房间状态跳变 → 统一重排一次（把同时到达的多个状态变化合并成一次重排）
+        if self._sort_dirty:
+            self._sort_dirty = False
+            log_room.info("状态跳变已合并，按直播状态重排列表")
+            self._apply_sort()
         self.root.after(100, self._poll_queue)
 
     def _tick_live_duration(self) -> None:

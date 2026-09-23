@@ -791,6 +791,7 @@ class QtScMonitorApp(QMainWindow):
         #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
+        self._sort_dirty = False  # 「按直播状态」有房间状态变了、待本轮轮询末尾统一重排
 
         self.client_states: Dict[int, str] = {}
         self.live_state: Dict[int, str] = {}
@@ -1752,6 +1753,7 @@ class QtScMonitorApp(QMainWindow):
                               format_live_mark(self.live_started_at.get(int(room_id))),
                               format_live_mark(self._offline_at.get(int(room_id))))
                 self._save_config()
+            if started_changed or offline_changed or prev_text != status_text:
                 self._reorder_for_live_change(room_id, status_text)
         self._refresh_row(room_id)
         self._refresh_sc_header(room_id)
@@ -2013,12 +2015,17 @@ class QtScMonitorApp(QMainWindow):
             self._select_room(selected)
 
     def _reorder_for_live_change(self, room_id: int, status_text: str) -> None:
-        """开播 / 关播后的实时重排（仅「按直播状态」方案；其它方案与状态无关）。"""
+        """状态跳变后**标记**待重排（仅「按直播状态」方案；其它方案与状态无关）。
+
+        不在这里立刻重排：启动后各房间的状态事件几乎同时到达，逐个重排会白做 N 次
+        （本版还要重建整张表）。标记后由本轮轮询末尾统一重排一次（100ms 内完成，
+        观感仍是即时）。
+        """
         if self._sort_mode() != "status":
             return
-        log_room.info("房间 %s %s，按直播状态重排列表", room_id,
-                      "开播" if status_text == "直播中" else "下播")
-        self._apply_sort()
+        self._sort_dirty = True
+        log_room.debug("房间 %s %s，标记待重排（按直播状态）", room_id,
+                       "开播" if status_text == "直播中" else "状态变化")
 
     def _warn_drag_disabled(self) -> None:
         """非自定义排序时尝试拖动：把「ⓘ」临时变成警示图标并记日志。
@@ -2421,6 +2428,11 @@ class QtScMonitorApp(QMainWindow):
                 for panel in self.dm_panels_for(room_id):
                     panel.append_dm_batch(batch)
         self._sync_unseen_badges()
+        # 本轮有房间状态跳变 → 统一重排一次（把同时到达的多个状态变化合并成一次重建）
+        if self._sort_dirty:
+            self._sort_dirty = False
+            log_room.info("状态跳变已合并，按直播状态重排列表")
+            self._apply_sort()
 
     def _append_log(self, line: str) -> None:
         self._append_logs([line])
@@ -2759,6 +2771,9 @@ class QtScMonitorApp(QMainWindow):
                               format_live_mark(self.live_started_at.get(int(room_id))),
                               format_live_mark(self._offline_at.get(int(room_id))))
                 self._save_config()
+            # 只要**状态本身**变了就要重排：启动后各房间状态陆续到达，而此前只在「时间
+            # 基准有变化」时才重排——本来就在直播的房间（基准没变）会迟迟排不到最前。
+            if started_changed or offline_changed or prev_text != status_text:
                 self._reorder_for_live_change(room_id, status_text)
             # 直播标题单独存：状态列显示直播状态，标题列显示标题（勿混用）
             self.titles[room_id] = payload.get("title") or ""

@@ -101,6 +101,24 @@ class LiveMarkPersistenceTests(unittest.TestCase):
                                live_since=live2, offline_at=offline2)
         self.assertEqual(after, before, "重启后顺序被打乱")
 
+    def test_startup_unknown_state_then_live_reorders(self):
+        """启动时状态未知 → 先按上次关播时间排；状态到达后在播房间要排到最前。
+
+        这正是「状态跳变（哪怕时间基准没变）也要重排」的价值：启动那一刻没人知道谁在播，
+        只能先按历史记录排，等状态陆续到达再纠正。
+        """
+        base = [11, 22, 33]
+        live = {11: 1000.0}                 # 持久化恢复：11 上次的开播时刻
+        offline = {22: 900.0, 33: 800.0}    # 22 最近关播、33 更早
+        self.assertEqual(
+            order_room_ids(base, "status", live_states={},
+                           live_since=live, offline_at=offline),
+            [22, 33, 11], "状态未知时应按上次关播先后排，无记录的落最后")
+        self.assertEqual(
+            order_room_ids(base, "status", live_states={11: "直播中"},
+                           live_since=live, offline_at=offline),
+            [11, 22, 33], "状态到达后在播房间应排到最前")
+
     def test_stale_and_invalid_marks_are_dropped(self):
         """过旧 / 未来 / 非法的记录一律丢弃：上次会话的陈旧时间不能把排序带偏。"""
         now = 1000000.0
