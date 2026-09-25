@@ -35,11 +35,14 @@ from .api import (
 from .app_config import AppConfig
 from .log_categories import CATEGORY_TASK, get_logger
 from .medal_tasks import (
+    LIGHT_UP_DANMAKU_COUNT,
+    LIGHT_UP_LIKE_CLICKS,
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     WRITE_TASK_TYPES,
     compute_action_delay,
     find_task,
+    is_light_up_task,
     is_task_applicable,
     is_task_complete,
     next_fallback_text,
@@ -221,9 +224,23 @@ class MedalTaskRunner:
                                only: Optional[str] = None) -> Dict[str, Any]:
         info = await self._api.get_medal_task_info(anchor_uid)
         tasks = info.get("tasks") or []
-        if info.get("reach_free_intimacy_limit"):
-            return self._result(room_id, "done",
-                                "已达储蓄亲密度上限：投喂一个粉丝灯牌即可领取，暂不执行")
+        # reach_free_intimacy_limit（接口下发）为真表示**该粉丝灯牌刚点亮**：服务端暂时
+        # 不接受点赞 / 发弹幕这类免费任务产生的亲密度（官方规则：熄灭状态下靠点赞 30 次 /
+        # 发弹幕 10 条点亮勋章时，这两种行为仅点亮勋章、不获得亲密度）。
+        # 但任务**仍要照常执行**——长时间不做任务灯牌会熄灭，做任务正是为了点亮并维持它；
+        # 所以这里只把「亲密度为什么没涨」说明给用户，绝不跳过任务。
+        free_intimacy_paused = bool(info.get("reach_free_intimacy_limit"))
+        if free_intimacy_paused:
+            logger.info("房间 %s（%s）的粉丝灯牌刚点亮：免费任务暂不增加亲密度，"
+                        "任务照常执行以点亮并维持灯牌", room_id, label)
+
+        def _with_note(text: str) -> str:
+            """给结果说明补上「刚点亮 → 暂不涨亲密度」的缘由（未命中时原样返回）。"""
+            if not free_intimacy_paused:
+                return text
+            return (f"{text}（粉丝灯牌刚点亮，点赞 / 发弹幕暂不涨亲密度，"
+                    "任务仅用于点亮并维持灯牌）")
+
         pending_all = pending_write_tasks(tasks)
         only_types: Optional[Set[str]] = None
         if only is not None:
@@ -234,20 +251,12 @@ class MedalTaskRunner:
             pending = [t for t in pending_all if t.get("jump_type") in only_types]
             if not pending:
                 reasons = [self._skip_reason(tasks, t) for t in sorted(only_types)]
-                return self._result(room_id, "done", "；".join(reasons))
+                return self._result(room_id, "done", _with_note("；".join(reasons)))
         else:
             pending = pending_all
             if not pending:
-                # 上限为 0 且未完成 = 「仅点亮」等不适用任务（如粉丝牌未点亮），明确说明
-                not_applicable = any(
-                    t.get("jump_type") in WRITE_TASK_TYPES
-                    and not is_task_complete(t) and not is_task_applicable(t)
-                    for t in tasks)
-                if not_applicable:
-                    return self._result(
-                        room_id, "done",
-                        "粉丝牌未点亮（任务显示「仅点亮」），暂无可执行任务")
-                return self._result(room_id, "done", "今日粉丝牌任务已完成")
+                return self._result(room_id, "done",
+                                    _with_note("今日粉丝牌任务已完成"))
 
         details: Dict[str, Dict[str, Any]] = {}
         for task in pending:
@@ -272,7 +281,9 @@ class MedalTaskRunner:
                     "like" if jump_type == TASK_LIKE else "danmaku"),
             })
 
-        return self._summarize(room_id, details)
+        result = self._summarize(room_id, details)
+        result["message"] = _with_note(result["message"])
+        return result
 
     async def _run_like(self, room_id: int, anchor_uid: int,
                         live_status: int) -> Dict[str, Any]:
@@ -312,9 +323,24 @@ class MedalTaskRunner:
                 return _done(False, "接口未返回点赞任务")
             if is_task_complete(task):
                 return _done(True, "点赞任务已完成")
-            if not is_task_applicable(task):
-                # 上限为 0（「仅点亮」等）→ 不执行，避免空发请求
-                return _done(True, "任务不适用（未点亮），跳过点赞")
+            if is_light_up_task(task):
+                # 「仅点亮」态（上限 0）：勋章已熄灭，点赞的唯一目的是重新点亮勋章
+                # （长时间不做任务灯牌会熄灭）。点亮阶段不产生亲密度、接口也不下发进度，
+                # 故按官方点亮次数发一次、复核一次即收尾，不做多轮「进度推进」判定。
+                clicks = parse_title_count(task.get("title")) or LIGHT_UP_LIKE_CLICKS
+                try:
+                    await self._api.like_room(room_id, anchor_uid, click_time=clicks)
+                    actions += 1
+                    clicks_total += clicks
+                except ApiError as exc:
+                    return _done(False, describe_like_error(exc.code, exc.message),
+                                 risk=exc.code in RISK_CONTROL_CODES)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    return _done(False, f"网络异常：{exc}")
+                after = await self._refetch_task(anchor_uid, TASK_LIKE)
+                if after is not None and not is_light_up_task(after):
+                    return _done(True, f"勋章已重新点亮（点赞 {clicks} 次）")
+                return _done(True, f"勋章已熄灭：已发起点赞（{clicks} 次）用于重新点亮")
             limit = int(task.get("limit") or 0)
             current = int(task.get("current") or 0)
             # 每轮复核后即上报最新进度，供界面实时更新该行（无需等整轮结束）
@@ -406,9 +432,38 @@ class MedalTaskRunner:
                 return _done(False, "接口未返回发弹幕任务")
             if is_task_complete(task):
                 return _done(True, "发弹幕任务已完成")
-            if not is_task_applicable(task):
-                # 上限为 0（「仅点亮」等）→ 不执行，避免空发弹幕
-                return _done(True, "任务不适用（未点亮），跳过发弹幕")
+            if is_light_up_task(task):
+                # 「仅点亮」态（上限 0）：同点赞，唯一目的是重新点亮勋章；接口不下发进度，
+                # 故按官方点亮条数发满后收尾（不按「进度推进」判定）。
+                while sent < LIGHT_UP_DANMAKU_COUNT:
+                    if self._interrupted(room_id):
+                        return _done(False, "直播间已开播，已打断自动发弹幕任务",
+                                     interrupted=True)
+                    emoticon, index = select_emoticon_cycle(emoticons, index)
+                    try:
+                        if emoticon:
+                            await self._api.send_danmaku(
+                                room_id, str(emoticon.get("unique") or ""),
+                                emoticon=emoticon)
+                            used_emoticon += 1
+                        else:
+                            fallback_text = next_fallback_text(fallback_text)
+                            await self._api.send_danmaku(room_id, fallback_text)
+                            used_text += 1
+                        sent += 1
+                    except ApiError as exc:
+                        last_error = describe_send_error(exc.code, exc.message)
+                        if exc.code in RISK_CONTROL_CODES:
+                            return _done(False, last_error, risk=True)
+                        return _done(False, last_error)
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        return _done(False, f"网络异常：{exc}")
+                    if sent < LIGHT_UP_DANMAKU_COUNT and await self._sleep_or_interrupt(
+                            room_id,
+                            compute_action_delay(*self._config.medal_danmaku_interval)):
+                        return _done(False, "直播间已开播，已打断自动发弹幕任务",
+                                     interrupted=True)
+                return _done(True, f"勋章已熄灭：已发送 {sent} 条弹幕用于重新点亮")
             limit = int(task.get("limit") or 0)
             current = int(task.get("current") or 0)
             # 每轮复核后即上报最新进度，供界面实时更新该行（无需等整轮结束）

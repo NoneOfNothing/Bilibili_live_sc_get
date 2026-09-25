@@ -893,6 +893,12 @@ class BilibiliLiveAPI:
         （``jump_type`` / ``title`` / ``current`` / ``limit`` / ``is_done``），
         任务上限随粉丝牌等级变化、每日刷新，一律以接口为准。
 
+        ``reach_free_intimacy_limit`` 为真表示**该粉丝灯牌刚点亮**：服务端暂时不接受
+        点赞 / 发弹幕这类免费任务产生的亲密度（官方规则：熄灭状态下靠「点赞 30 次 /
+        发弹幕 10 条」点亮勋章时，这两种行为仅点亮勋章、不获得亲密度）。但它**不代表
+        任务不该做**——长时间不做任务灯牌会熄灭，做任务正是为了点亮并维持它，故调用方
+        应照常执行任务，只把原因说明给用户（见 ``MedalTaskRunner._complete_locked``）。
+
         需已登录且 Cookie 含 ``bili_jct``（csrf）；失败抛 ApiError。
         """
         if not self.has_cookie:

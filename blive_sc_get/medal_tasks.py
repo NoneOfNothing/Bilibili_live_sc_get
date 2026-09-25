@@ -41,6 +41,12 @@ TASK_LABELS: Dict[str, str] = {
 WRITE_TASK_TYPES: Tuple[str, ...] = (TASK_LIKE, TASK_SEND_DANMAKU)
 """本功能会**执行**的写任务类型（其余仅展示）。"""
 
+LIGHT_UP_LIKE_CLICKS = 30
+"""官方「点亮任务」的点赞次数（勋章熄灭时靠它重新点亮）。"""
+
+LIGHT_UP_DANMAKU_COUNT = 10
+"""官方「点亮任务」的发弹幕条数（同上）。"""
+
 ROOM_EMOTICON_PREFIX = "room_"
 """直播间专属表情的 ``emoticon_unique`` 前缀（区分公开表情）。"""
 
@@ -177,10 +183,29 @@ def is_task_applicable(task: Any) -> bool:
     return _int(task.get("limit")) > 0
 
 
+def is_light_up_task(task: Any) -> bool:
+    """任务是否处于「仅点亮」态：未完成、但上限为 0（勋章已熄灭）。
+
+    此时做任务**不产生亲密度**，唯一目的是重新点亮勋章——长时间不做任务粉丝灯牌会
+    熄灭，点亮之后才谈得上继续维持。点亮阶段的次数由官方固定（点赞 30 次 / 发弹幕
+    10 条），接口不下发进度，故按固定次数执行、不按「进度推进」判定。
+    """
+    if not isinstance(task, dict):
+        return False
+    if is_task_complete(task):
+        return False
+    return _int(task.get("limit")) <= 0
+
+
 def pending_write_tasks(tasks: List[dict]) -> List[dict]:
-    """返回仍未完成、且当前可执行的写任务（点赞 / 发弹幕）。"""
+    """返回仍未完成的写任务（点赞 / 发弹幕），**含「仅点亮」态**（上限 0）。
+
+    仅点亮态同样要执行：灯牌熄灭后只有做任务才能把它重新点亮
+    （见 ``is_light_up_task``），跳过不做的代价是灯牌一直熄着。
+    """
     return [task for task in tasks or []
-            if task.get("jump_type") in WRITE_TASK_TYPES and is_task_applicable(task)]
+            if task.get("jump_type") in WRITE_TASK_TYPES
+            and (is_task_applicable(task) or is_light_up_task(task))]
 
 
 def normalize_medal(raw: Any, is_special: bool = False) -> Optional[dict]:

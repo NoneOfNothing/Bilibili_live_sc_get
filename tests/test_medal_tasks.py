@@ -33,6 +33,7 @@ from blive_sc_get.medal_tasks import (
     compute_action_delay,
     dedupe_medals,
     find_task,
+    is_light_up_task,
     is_task_applicable,
     is_task_complete,
     medal_level_for_room,
@@ -223,13 +224,21 @@ class TaskParsingTests(unittest.TestCase):
         # 都关 → 无事可做
         self.assertEqual(kinds(live_status=1), [])
 
-    def test_pending_write_tasks_skips_not_lit(self):
-        # 未点亮（sub_title「仅点亮」）解析出的 limit 为 0，不应计入待办
-        tasks = [{"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
-                  "limit": 0, "is_done": False, "raw": {}},
-                 {"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕10次",
-                  "current": 0, "limit": 0, "is_done": False, "raw": {}}]
-        self.assertEqual(pending_write_tasks(tasks), [])
+    def test_pending_write_tasks_includes_light_up(self):
+        # 未点亮（sub_title「仅点亮」）解析出的 limit 为 0 ＝ 灯牌已熄灭，
+        # 仍要计入待办：只有做任务才能重新点亮并维持灯牌（见 is_light_up_task）
+        like = {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
+                "limit": 0, "is_done": False, "raw": {}}
+        danmaku = {"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕10次",
+                   "current": 0, "limit": 0, "is_done": False, "raw": {}}
+        self.assertTrue(is_light_up_task(like))
+        self.assertEqual(pending_write_tasks([like, danmaku]), [like, danmaku])
+        # 已完成 / 正常上限 / 非任务对象 都不算「仅点亮」
+        self.assertFalse(is_light_up_task(
+            {"limit": 0, "current": 0, "is_done": True}))
+        self.assertFalse(is_light_up_task(
+            {"limit": 10, "current": 0, "is_done": False}))
+        self.assertFalse(is_light_up_task(None))
 
 
 class MedalParsingTests(unittest.TestCase):
@@ -605,7 +614,8 @@ class RoomEntryAutoMedalTests(unittest.TestCase):
 class _StubApi:
     """执行引擎的离线桩：模拟接口按调用推进任务进度。"""
 
-    def __init__(self, tasks, emoticons=None, like_step=None, danmaku_step=1):
+    def __init__(self, tasks, emoticons=None, like_step=None, danmaku_step=1,
+                 free_intimacy_limit=False):
         self.logged_in = True
         self.csrf = "csrf123"
         self.uid = 1
@@ -613,12 +623,14 @@ class _StubApi:
         self.emoticons = emoticons or []
         self._like_step = like_step          # None=按 click_time 计入（模拟服务端等量统计）
         self._danmaku_step = danmaku_step
+        self._free_intimacy_limit = free_intimacy_limit
         self.like_calls = []
         self.danmaku_calls = []
 
     async def get_medal_task_info(self, target_id):
         return {"target_id": target_id, "tasks": list(self._tasks.values()),
-                "free_intimacy": 0, "reach_free_intimacy_limit": False}
+                "free_intimacy": 0,
+                "reach_free_intimacy_limit": self._free_intimacy_limit}
 
     async def like_room(self, room_id, anchor_uid, click_time=1):
         self.like_calls.append(click_time)
@@ -688,6 +700,51 @@ class MedalRunnerTests(unittest.TestCase):
         self.assertIn("未推进", result["message"])
         self.assertEqual(len(api.like_calls), 3)  # max_retry(2)+1 次后停止
 
+    def test_free_intimacy_limit_still_runs_tasks(self):
+        """「刚点亮的灯牌暂不涨亲密度」不等于任务不该做：点赞 / 发弹幕仍应执行（回归：曾被整房跳过）。"""
+        tasks = [
+            {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
+             "limit": 10, "is_done": False, "raw": {}},
+            {"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
+             "limit": 2, "is_done": False, "raw": {}},
+        ]
+        api = _StubApi(tasks, free_intimacy_limit=True)
+        result = asyncio.run(MedalTaskRunner(api, _fast_config())
+                             .complete_room(100, 200, 1))
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(api.like_calls, [30])
+        self.assertEqual(len(api.danmaku_calls), 2)
+        self.assertNotIn("储蓄", result["message"])
+        # 只在结果里说明缘由（亲密度为什么没涨），任务的执行与否不受影响
+        self.assertIn("粉丝灯牌刚点亮", result["message"])
+        self.assertIn("暂不涨亲密度", result["message"])
+
+    def test_free_intimacy_limit_notes_completed_tasks(self):
+        """任务已完成、本轮无需执行时同样说明缘由（长时间不做任务灯牌会熄灭，本来就该做满）。"""
+        tasks = [
+            {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 10,
+             "limit": 10, "is_done": True, "raw": {}},
+        ]
+        api = _StubApi(tasks, free_intimacy_limit=True)
+        result = asyncio.run(MedalTaskRunner(api, _fast_config())
+                             .complete_room(100, 200, 1))
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(api.like_calls, [])
+        self.assertIn("粉丝灯牌刚点亮", result["message"])
+
+    def test_no_note_without_free_intimacy_limit(self):
+        """未命中该标记时结果说明保持原样，不附带任何缘由。"""
+        tasks = [
+            {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
+             "limit": 10, "is_done": False, "raw": {}},
+        ]
+        api = _StubApi(tasks)
+        result = asyncio.run(MedalTaskRunner(api, _fast_config())
+                             .complete_room(100, 200, 1))
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(api.like_calls, [30])
+        self.assertNotIn("粉丝灯牌刚点亮", result["message"])
+
     def test_danmaku_loops_until_complete(self):
         """发弹幕同样按轮次推进直到完成。"""
         tasks = [{"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
@@ -721,8 +778,12 @@ class MedalRunnerTests(unittest.TestCase):
         self.assertEqual(result["details"]["danmaku"]["used_emoticon"], 2)
         self.assertEqual(result["details"]["danmaku"]["used_text"], 0)
 
-    def test_not_lit_tasks_skipped_without_actions(self):
-        """未点亮（limit=0）的写任务不应触发任何点/弹幕请求（回归：曾反复空发导致失败）。"""
+    def test_light_up_tasks_run_when_limit_zero(self):
+        """灯牌熄灭（limit=0、「仅点亮」）时仍要执行点亮任务：点赞 30 次 / 发弹幕 10 条。
+
+        跳过不做的代价是灯牌一直熄着（长时间不做任务会熄灭），故按官方点亮次数发满；
+        点亮阶段不产生亲密度，接口也不下发进度，故不按「进度推进」判定。
+        """
         tasks = [
             {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
              "limit": 0, "is_done": False, "raw": {"sub_title": "仅点亮"}},
@@ -732,10 +793,10 @@ class MedalRunnerTests(unittest.TestCase):
         api = _StubApi(tasks)
         result = asyncio.run(MedalTaskRunner(api, _fast_config())
                              .complete_room(100, 200, 1))
-        self.assertEqual(api.like_calls, [])
-        self.assertEqual(api.danmaku_calls, [])
         self.assertEqual(result["status"], "done")
-        self.assertIn("仅点亮", result["message"])
+        self.assertEqual(api.like_calls, [30])
+        self.assertEqual(len(api.danmaku_calls), 10)
+        self.assertIn("重新点亮", result["message"])
 
     def test_emits_task_progress_events(self):
         """每轮复核后上报实时进度，供界面在执行期间就地更新该行。"""

@@ -1239,24 +1239,21 @@ class ScMonitorApp:
         self.delete_btn = ttk.Button(self.room_actions, text="删除", command=self._on_delete)
         self.delete_btn.pack(side="left")
 
-        # 弹幕开关条（窗口最下方，位于底部操作条之下）
-        dm_bar = ttk.Frame(tab)
-        self.dm_bar = dm_bar
-        dm_bar.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
-        self.dm_var = tk.BooleanVar(value=bool(self.ui_prefs.get("dm_visible", False)))
-        ttk.Checkbutton(dm_bar, text="弹幕", variable=self.dm_var,
-                        command=self._on_dm_toggled).pack(side="left")
-        ttk.Label(dm_bar, text="（开启后显示并保存当前选中房间的弹幕）",
-                  foreground="#888888").pack(side="left", padx=(6, 0))
-
-        # 底部全局操作条：仅保留与房间列表无关的操作（房间相关的备注/启停/删除
-        # 已移到直播间列表下方的 room_actions 行）
+        # 底部操作条（窗口最末一行，与 Qt 版底部布局对齐）：弹幕开关与全局按钮**同排**——
+        # 此前「弹幕开关」与「全局按钮」各占一行，在弹幕区下方留出一片空白；
+        # 房间相关的备注/启停/删除已移到直播间列表下方的 room_actions 行
         bottom = ttk.Frame(tab)
         bottom.pack(side="bottom", fill="x", padx=6, pady=(4, 6))
-        self.refresh_btn = ttk.Button(bottom, text="刷新历史", command=self._on_refresh_history)
-        self.refresh_btn.pack(side="left")
+        self.dm_var = tk.BooleanVar(value=bool(self.ui_prefs.get("dm_visible", False)))
+        ttk.Checkbutton(bottom, text="显示弹幕区", variable=self.dm_var,
+                        command=self._on_dm_toggled).pack(side="left")
+        ttk.Label(bottom, text="（开启后显示并保存当前选中房间的弹幕）",
+                  foreground="#888888").pack(side="left", padx=(6, 0))
+        self.refresh_btn = ttk.Button(bottom, text="刷新历史",
+                                      command=self._on_refresh_history)
+        self.refresh_btn.pack(side="left", padx=(10, 0))
         self.cookie_btn = ttk.Button(bottom, text="获取Cookie", command=self._on_fetch_cookie)
-        self.cookie_btn.pack(side="left", padx=(8, 0))
+        self.cookie_btn.pack(side="left", padx=(6, 0))
         self.cookie_plugin_btn = ttk.Button(
             bottom, text="从插件获取", command=self._on_fetch_cookie_plugin)
         self.cookie_plugin_btn.pack(side="left", padx=(6, 0))
@@ -1368,14 +1365,17 @@ class ScMonitorApp:
         self.dm_len_label.pack(side="left")
         self.dm_send_btn = ttk.Button(row, text="发送", command=self._on_send_danmaku)
         self.dm_send_btn.pack(side="left", padx=(4, 0))
-        # 提示行：显示门控原因或发送结果
+        # 提示行：显示门控原因或发送结果。**无内容时收起、不占位**——这两行各占
+        # 一行高度，空着时就在发送栏下方留出一片空白（历史遗留），故改为有内容才占位
         self.dm_send_hint_var = tk.StringVar(value="")
-        ttk.Label(area, textvariable=self.dm_send_hint_var,
-                  foreground="#888888").pack(side="top", fill="x")
+        self.dm_send_hint_label = ttk.Label(
+            area, textvariable=self.dm_send_hint_var, foreground="#888888")
         # 复制提示行：与发送提示独立，避免点弹幕复制时覆盖发送状态文案
         self.dm_copy_hint_var = tk.StringVar(value="")
-        ttk.Label(area, textvariable=self.dm_copy_hint_var,
-                  foreground="#1a7f37").pack(side="top", fill="x")
+        self.dm_copy_hint_label = ttk.Label(
+            area, textvariable=self.dm_copy_hint_var, foreground="#1a7f37")
+        for var in (self.dm_send_hint_var, self.dm_copy_hint_var):
+            var.trace_add("write", lambda *_a: self._sync_dm_hint_rows())
         # 表情面板：内嵌在发送行上方（点「表情」展开/收起），默认隐藏。
         # 用 pack_forget 收起，不另开窗口；内容在首次展开时才向后端请求
         self.emoticon_panel = ttk.LabelFrame(area, text="发送表情包（点击即发送）")
@@ -1387,6 +1387,22 @@ class ScMonitorApp:
                   foreground="#0055cc").pack(side="left")
         ttk.Button(self.dm_reply_bar, text="取消", width=6,
                    command=self._clear_dm_reply_target).pack(side="left", padx=(4, 0))
+
+    def _sync_dm_hint_rows(self) -> None:
+        """发送提示行按内容显隐：**空提示不占位**。
+
+        这两行位于发送栏下方，空着时各占约一行高度、看上去就是一片空白
+        （历史遗留）。现改为只在有文字时 pack；每次都按固定顺序整体重排，
+        避免「复制提示」先出现时与之顺序颠倒。
+        """
+        rows = ((self.dm_send_hint_var, self.dm_send_hint_label),
+                (self.dm_copy_hint_var, self.dm_copy_hint_label))
+        for _var, label in rows:
+            if label.winfo_manager():
+                label.pack_forget()
+        for var, label in rows:
+            if var.get().strip():
+                label.pack(side="top", fill="x")
 
     def _on_paned_configure(self, _event=None) -> None:
         """首次布局完成后应用一次默认占比；之后不再干预用户手动拖动。"""

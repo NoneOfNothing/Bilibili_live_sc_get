@@ -341,12 +341,15 @@ class DmPanel(QWidget):
 
         outer.addLayout(send)
 
-        # 提示条：发送结果与「已复制」各自独立一行，避免互相覆盖（与 Tk 版一致）
+        # 提示条：发送结果与「已复制」各自独立一行，避免互相覆盖（与 Tk 版一致）；
+        # **空文本时隐藏**——否则两行空 QLabel 会在发送栏下方留出一片空白
         self.dm_hint = QLabel("")
         self.dm_hint.setStyleSheet("color:#888; font-size: 11px")
+        self.dm_hint.setVisible(False)
         outer.addWidget(self.dm_hint)
         self.dm_copy_hint = QLabel("")
         self.dm_copy_hint.setStyleSheet("color:#1a7f37; font-size: 11px")
+        self.dm_copy_hint.setVisible(False)
         outer.addWidget(self.dm_copy_hint)
 
         self._admin_btn_row = send
@@ -565,11 +568,21 @@ class DmPanel(QWidget):
         elif uid:
             webbrowser.open(f"https://space.bilibili.com/{uid}")
 
+    def _set_hint(self, text: str) -> None:
+        """发送提示行：**空文本时隐藏**，避免在发送栏下方留出空行（与 Tk 版一致）。"""
+        self._set_hint(text)
+        self.dm_hint.setVisible(bool(text))
+
+    def _set_copy_hint(self, text: str) -> None:
+        """「已复制」提示行：同样空文本时隐藏。"""
+        self.dm_copy_hint.setText(text)
+        self.dm_copy_hint.setVisible(bool(text))
+
     def _copy_dm_content(self, content: str) -> None:
         """复制弹幕正文到系统剪贴板，并短暂显示「已复制」提示。"""
         self.host.copy_to_clipboard(content)
         snippet = content if len(content) <= 20 else content[:20] + "…"
-        self.dm_copy_hint.setText(f"已复制：{snippet}")
+        self._set_copy_hint(f"已复制：{snippet}")
         if self._copy_hint_timer is None:
             self._copy_hint_timer = QTimer(self)
             self._copy_hint_timer.setSingleShot(True)
@@ -578,7 +591,7 @@ class DmPanel(QWidget):
         self._copy_hint_timer.start(COPY_HINT_MS)
 
     def _clear_copy_hint(self) -> None:
-        self.dm_copy_hint.setText("")
+        self._set_copy_hint("")
 
     def _on_dm_context_menu(self, event) -> bool:
         """右键弹幕：回复该弹幕（需 dmid）/ @该用户（需 uid）。"""
@@ -1058,7 +1071,7 @@ class DmPanel(QWidget):
         self.dm_modes.setEnabled(enabled)
         self._update_dm_len_hint()
         if reason:
-            self.dm_hint.setText(reason)
+            self._set_hint(reason)
 
     def _update_dm_len_hint(self) -> None:
         """字数计数（仅提示，不做客户端截断）：超长标红提醒服务端可能拒绝。"""
@@ -1146,7 +1159,7 @@ class DmPanel(QWidget):
             return
         block = self._dm_send_block_reason()
         if block:
-            self.dm_hint.setText(block)
+            self._set_hint(block)
             return
         text = self.dm_send_entry.text().strip()
         log_task.info("发送弹幕：房间 %s，%d 字，内容：%s", self.selected_room, len(text),
@@ -1155,13 +1168,13 @@ class DmPanel(QWidget):
             text, last_time=self._last_dm_send, now=time.time(),
             cooldown=DM_SEND_COOLDOWN)
         if reason:
-            self.dm_hint.setText(str(reason))
+            self._set_hint(str(reason))
             return
         room_id = self.selected_room
         target = self._dm_reply_target or {}
         self._dm_sending = True
         self._refresh_dm_send_state()
-        self.dm_hint.setText("发送中…")
+        self._set_hint("发送中…")
         self.hub.submit(self._async_send_danmaku(
             room_id=room_id, text=text,
             color=self._selected_color(), mode=self._selected_mode(),
@@ -1203,12 +1216,12 @@ class DmPanel(QWidget):
                 self.dm_send_entry.clear()
                 self._update_dm_len_hint()
                 self._clear_dm_reply_target()
-            self.dm_hint.setText("已发送")
+            self._set_hint("已发送")
             log_task.info("已发送%s：%s", "表情包" if payload.get("emoticon") else "弹幕",
                         payload.get("text") or "")
         else:
             error = payload.get("error") or "发送失败"
-            self.dm_hint.setText(error)
+            self._set_hint(error)
             log_task.warning("发送弹幕失败：%s", error)
         self._refresh_dm_send_state()
 
@@ -1221,7 +1234,7 @@ class DmPanel(QWidget):
             return
         reason = self._dm_send_block_reason()
         if reason:  # 与 Tk 版一致：不具备发送条件时不展开
-            self.dm_hint.setText(reason)
+            self._set_hint(reason)
             return
         room_id = self.selected_room
         if room_id is None:
@@ -1441,7 +1454,7 @@ class DmPanel(QWidget):
             return
         block = self._dm_send_block_reason()
         if block:
-            self.dm_hint.setText(block)
+            self._set_hint(block)
             return
         trigger = str(emo.get("trigger") or emo.get("text") or "").strip()
         log_task.info("发送表情：房间 %s，表情 %s（unique=%s）", self.selected_room,
@@ -1450,12 +1463,12 @@ class DmPanel(QWidget):
             trigger, last_time=self._last_dm_send, now=time.time(),
             cooldown=DM_SEND_COOLDOWN)
         if reason:
-            self.dm_hint.setText(str(reason))
+            self._set_hint(str(reason))
             return
         room_id = self.selected_room
         self._dm_sending = True
         self._refresh_dm_send_state()
-        self.dm_hint.setText("发送表情中…")
+        self._set_hint("发送表情中…")
         self.hub.submit(self._async_send_danmaku(
             room_id=room_id, text=trigger,
             color=self._selected_color(), mode=self._selected_mode(),
