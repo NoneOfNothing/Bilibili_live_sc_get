@@ -40,6 +40,7 @@ from .gui_app import (
     EMOTICON_ROW_HEIGHT,
     EMOTICON_TOOLTIP_DELAY_MS,
     HISTORY_PAGE_SIZE,
+    QUICK_DM_PLACEHOLDER,
     SC_TITLE_MAX_LEN,
     build_sc_segments,
     danmaku_content_from_line,
@@ -48,6 +49,7 @@ from .gui_app import (
     emoticon_from_packages,
     emoticon_tooltip_text,
     live_duration_text,
+    merge_quick_danmaku,
     text_scrolled_to_bottom,
     unseen_badge_text,
 )
@@ -208,6 +210,12 @@ class RoomChatWindow(tk.Toplevel):
         self.dm_emoji_btn = ttk.Button(row, text="表情", width=5,
                                        command=self._on_open_emoticons)
         self.dm_emoji_btn.pack(side="left", padx=(4, 0))
+        # 快捷弹幕（ROADMAP 90）：按房间独立，点选只**填入输入框**（不直接发送）。
+        # 管理入口只在主界面（避免多窗口同时改同一份数据），这里仅作使用
+        self.quick_dm_combo = ttk.Combobox(row, width=8, state="disabled",
+                                           postcommand=self._refresh_quick_danmaku)
+        self.quick_dm_combo.pack(side="left", padx=(4, 0))
+        self.quick_dm_combo.bind("<<ComboboxSelected>>", self._on_quick_danmaku_pick)
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
@@ -939,12 +947,38 @@ class RoomChatWindow(tk.Toplevel):
         self.dm_emoji_btn.configure(state=state)
         if reason:
             self.dm_send_hint_var.set(reason)
+        # 快捷弹幕下拉跟随本窗口房间（本窗口房间固定，刷新一次即可）
+        self._refresh_quick_danmaku()
 
     def _update_dm_len_hint(self, _event=None) -> None:
         """字数计数（仅提示，不做客户端截断）：超过上限时在提示里标注。"""
         length = len(self.dm_send_var.get())
         self.dm_len_var.set(f"{length}/{DANMAKU_MAX_LEN}" if length > DANMAKU_MAX_LEN
                             else str(length))
+
+    # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
+
+    def _refresh_quick_danmaku(self) -> None:
+        """刷新本窗口固定房间的快捷弹幕下拉（管理入口只在主界面）。"""
+        entry = self.host.entries.get(self._room_id)
+        presets = list(entry.quick_danmaku) if entry is not None else []
+        # 首项固定为占位文本（真实项 → 按正常颜色显示，与 Qt 版一致）
+        self.quick_dm_combo["values"] = [QUICK_DM_PLACEHOLDER] + presets
+        self.quick_dm_combo.configure(state="readonly" if presets else "disabled")
+        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)
+
+    def _on_quick_danmaku_pick(self, _event=None) -> None:
+        """点选快捷弹幕：**只填入输入框**（不直接发送），并聚焦到输入框末尾。"""
+        text = self.quick_dm_combo.get()
+        if not text or text == QUICK_DM_PLACEHOLDER:
+            return  # 占位项不做任何事
+        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
+                        text, self._room_id)
+        self.dm_send_var.set(merge_quick_danmaku(self.dm_send_var.get(), text))
+        self._update_dm_len_hint()  # StringVar.set 不触发 KeyRelease，需手动刷字数
+        self.dm_send_entry.focus_set()
+        self.dm_send_entry.icursor(tk.END)
+        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)  # 复位，便于再次点选同一条
 
     def _set_dm_reply_target(self, target: Optional[dict]) -> None:
         self._dm_reply_target = target

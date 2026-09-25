@@ -61,7 +61,8 @@ class RoomChatWindow(QWidget):
         layout.addWidget(splitter, 1)
         # 两个面板都绑定固定房间（注入 provider；不再跟随宿主选中房间）
         self.sc_panel = ScPanel(host, lambda: self._room_id)
-        self.dm_panel = DmPanel(host, lambda: self._room_id, always_visible=True)
+        self.dm_panel = DmPanel(host, lambda: self._room_id, always_visible=True,
+                                show_quick_manage=False)
         splitter.addWidget(self.sc_panel)
         splitter.addWidget(self.dm_panel)
         splitter.setSizes([1, 1])  # SC 与弹幕对半（可拖动调整）

@@ -55,11 +55,13 @@ from .medal_tasks import (
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
+    QUICK_DANMAKU_MAX,
     RoomEntry,
     format_live_mark,
     load_emoticon_memory,
     load_room_entries,
     load_ui_prefs,
+    normalize_quick_danmaku,
     save_room_entries,
 )
 from .storage import SCStorage
@@ -359,6 +361,14 @@ DANMAKU_SEND_COOLDOWN_S = 2.0
 
 DANMAKU_MAX_LEN = 20
 """客户端弹幕长度上限（普通用户约 20 字；超长时服务端返回 1003212）。"""
+
+QUICK_DM_PLACEHOLDER = "快捷弹幕"
+"""快捷弹幕下拉的**占位项**（ROADMAP 90）。
+
+两版都把它作为下拉的第一项：Qt 的 ``placeholderText`` 会以**灰色**绘制，看起来像
+「控件被禁用」（用户反馈过）；做成真实项则按正常颜色显示，且 Tk / Qt 的显示与交互
+完全一致——选中它不做任何事。
+"""
 
 DM_COLOR_PRESETS = (("白色", 16777215), ("红色", 16711680), ("橙色", 16744192),
                     ("黄色", 16776960), ("绿色", 65280), ("蓝色", 255),
@@ -870,6 +880,25 @@ def select_dm_options(presets, offered):
     return deduped or list(presets)
 
 
+def merge_quick_danmaku(current: str, text: str) -> str:
+    """把快捷弹幕填入发送输入框的文本合成（纯函数，ROADMAP 90）。
+
+    - 输入框为空 → 直接填入；
+    - 当前内容已**恰好**是该文本 → 原样返回（避免重复点选时不断叠加）；
+    - 否则追加到末尾（空格分隔）——**不覆盖用户已输入的内容**：快捷弹幕刻意
+      做成「只填入、不发送」就是为了避免误触，这里同样不能丢字。
+    """
+    text = (text or "").strip()
+    current = current or ""
+    if not text:
+        return current
+    if not current.strip():
+        return text
+    if current.strip() == text:
+        return current
+    return f"{current} {text}"
+
+
 class _QueueLogHandler(logging.Handler):
     """把日志记录转发到 UI 队列，由主线程轮询显示。"""
 
@@ -1353,6 +1382,15 @@ class ScMonitorApp:
         self.dm_emoji_btn = ttk.Button(row, text="表情", width=5,
                                        command=self._on_open_emoticons)
         self.dm_emoji_btn.pack(side="left", padx=(4, 0))
+        # 快捷弹幕（ROADMAP 90，按房间独立）：点选只**填入输入框、不直接发送**
+        # （可先改后发，避免误触）；下拉放在发送行内，不额外占用行高
+        self.quick_dm_combo = ttk.Combobox(row, width=8, state="disabled",
+                                           postcommand=self._refresh_quick_danmaku)
+        self.quick_dm_combo.pack(side="left", padx=(4, 0))
+        self.quick_dm_combo.bind("<<ComboboxSelected>>", self._on_quick_danmaku_pick)
+        self.quick_dm_manage_btn = ttk.Button(row, text="管理", width=5,
+                                              command=self._open_quick_danmaku_manager)
+        self.quick_dm_manage_btn.pack(side="left", padx=(4, 0))
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
@@ -2895,6 +2933,8 @@ class ScMonitorApp:
                 log_task.info("发送弹幕不可用：%s", reason)
             elif previous:
                 self.dm_send_hint_var.set("")
+        # 快捷弹幕下拉跟随当前选中房间（选房 / 门控变化都会走到这里）
+        self._refresh_quick_danmaku()
 
     def _update_dm_len_hint(self, _event=None) -> None:
         """字数计数（仅提示，不再有客户端长度上限）：超长标红提醒服务端可能拒绝。"""
@@ -2902,6 +2942,140 @@ class ScMonitorApp:
         self.dm_len_var.set(str(length))
         self.dm_len_label.configure(
             foreground="#c62828" if length > DANMAKU_MAX_LEN else "#888888")
+
+    # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
+
+    def _quick_danmaku_of(self, room_id: Optional[int]) -> List[str]:
+        """取某个房间的快捷弹幕（未选中 / 房间不存在时为空列表）。"""
+        if room_id is None:
+            return []
+        entry = self.entries.get(int(room_id))
+        return list(entry.quick_danmaku) if entry is not None else []
+
+    def _refresh_quick_danmaku(self) -> None:
+        """按当前选中房间刷新快捷弹幕下拉（展开前还会再刷一次，见 postcommand）。"""
+        presets = self._quick_danmaku_of(self._selected_room_id)
+        # 首项固定为占位文本（真实项 → 按正常颜色显示，不像 placeholder 那样发灰）
+        self.quick_dm_combo["values"] = [QUICK_DM_PLACEHOLDER] + presets
+        # 无预设时灰掉（明确表示该房间还没配过），有预设才可选
+        self.quick_dm_combo.configure(state="readonly" if presets else "disabled")
+        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)
+        self.quick_dm_manage_btn.configure(
+            state="normal" if self._selected_room_id is not None else "disabled")
+
+    def _on_quick_danmaku_pick(self, _event=None) -> None:
+        """点选快捷弹幕：**只填入输入框**（不直接发送），并聚焦到输入框末尾。"""
+        text = self.quick_dm_combo.get()
+        if not text or text == QUICK_DM_PLACEHOLDER:
+            return  # 占位项不做任何事
+        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
+                        text, self._selected_room_id)
+        self.dm_send_var.set(merge_quick_danmaku(self.dm_send_var.get(), text))
+        self._update_dm_len_hint()  # StringVar.set 不触发 KeyRelease，需手动刷字数
+        self.dm_send_entry.focus_set()
+        self.dm_send_entry.icursor(tk.END)
+        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)  # 复位，便于再次点选同一条
+
+    def _open_quick_danmaku_manager(self) -> None:
+        """快捷弹幕管理对话框：增删 / 调整顺序（关闭时才写回并落盘）。"""
+        room_id = self._selected_room_id
+        entry = self.entries.get(int(room_id)) if room_id is not None else None
+        if entry is None:
+            return
+        original = list(entry.quick_danmaku)
+        working = list(original)
+        log_window.info("快捷弹幕：打开管理对话框（房间 %s，现有 %d 条）",
+                        room_id, len(original))
+
+        win = tk.Toplevel(self.root)
+        win.title(f"快捷弹幕 — 房间 {room_id}")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=8)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="点选后只填入输入框（不会直接发送）；顺序即下拉顺序",
+                  foreground="#888888").pack(anchor="w")
+        listbox = tk.Listbox(body, height=10, width=36, exportselection=False)
+        listbox.pack(fill="both", expand=True, pady=(6, 6))
+        edit_row = ttk.Frame(body)
+        edit_row.pack(fill="x")
+        item_var = tk.StringVar()
+        item_entry = ttk.Entry(edit_row, textvariable=item_var)
+        item_entry.pack(side="left", fill="x", expand=True)
+
+        def refresh() -> None:
+            listbox.delete(0, tk.END)
+            for text in working:
+                listbox.insert(tk.END, text)
+
+        def add(_event=None) -> None:
+            cleaned = normalize_quick_danmaku([item_var.get()], DANMAKU_MAX_LEN)
+            if not cleaned:
+                return
+            text = cleaned[0]
+            if text in working:
+                return
+            if len(working) >= QUICK_DANMAKU_MAX:
+                messagebox.showinfo("快捷弹幕",
+                                    f"最多只能保存 {QUICK_DANMAKU_MAX} 条", parent=win)
+                return
+            working.append(text)
+            item_var.set("")
+            refresh()
+            listbox.see(tk.END)
+            log_window.debug("快捷弹幕：添加「%s」（房间 %s，暂存 %d 条）",
+                             text, room_id, len(working))
+
+        def current_index() -> Optional[int]:
+            selected = listbox.curselection()
+            return int(selected[0]) if selected else None
+
+        def remove() -> None:
+            index = current_index()
+            if index is not None:
+                removed = working[index]
+                del working[index]
+                refresh()
+                log_window.debug("快捷弹幕：删除「%s」（房间 %s，暂存 %d 条）",
+                                 removed, room_id, len(working))
+
+        def move(offset: int) -> None:
+            index = current_index()
+            if index is None:
+                return
+            target = index + offset
+            if not 0 <= target < len(working):
+                return
+            working[index], working[target] = working[target], working[index]
+            refresh()
+            listbox.selection_set(target)
+            log_window.debug("快捷弹幕：%s「%s」（房间 %s）",
+                             "上移" if offset < 0 else "下移",
+                             working[target], room_id)
+
+        item_entry.bind("<Return>", add)
+        ttk.Button(edit_row, text="添加", width=6,
+                   command=add).pack(side="left", padx=(4, 0))
+        button_row = ttk.Frame(body)
+        button_row.pack(fill="x", pady=(6, 0))
+        for text, command in (("删除", remove), ("上移", lambda: move(-1)),
+                              ("下移", lambda: move(1))):
+            ttk.Button(button_row, text=text, width=6,
+                       command=command).pack(side="left", padx=(0, 4))
+
+        def on_close() -> None:
+            if working != original:
+                entry.quick_danmaku = list(working)
+                self._save_config()
+                log_task.info("快捷弹幕已更新：房间 %s，共 %d 条", room_id, len(working))
+            self._refresh_quick_danmaku()
+            win.destroy()
+
+        ttk.Button(button_row, text="关闭", width=6,
+                   command=on_close).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.grab_set()
+        refresh()
 
     def _set_dm_reply_target(self, target: Optional[dict]) -> None:
         """设置（或清除）回复/@ 目标；设置后聚焦输入框。"""

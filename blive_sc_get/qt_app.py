@@ -51,11 +51,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -91,10 +93,12 @@ from .gui_app import (
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
+    QUICK_DANMAKU_MAX,
     RoomEntry,
     load_emoticon_memory,
     load_room_entries,
     load_ui_prefs,
+    normalize_quick_danmaku,
     save_room_entries,
 )
 from .medal_tasks import (
@@ -3017,6 +3021,115 @@ class QtScMonitorApp(QMainWindow):
             self.entries = {room_id: self.entries[room_id] for room_id in order}
         save_room_entries(self.config_path, self.entries.values(), ui=self.ui_prefs,
                           emoticon=self._emoticon_memory)
+
+    # ---------- 快捷弹幕管理（ROADMAP 90：按房间独立，只填入不发送） ----------
+
+    def open_quick_danmaku_manager(self, room_id: int) -> None:
+        """快捷弹幕管理对话框：增删 / 调整顺序（关闭时写回并落盘）。
+
+        与 Tk 版行为一致——**关闭即保存**（不做「确定 / 取消」），避免改完忘了确认；
+        编辑全部作用于工作副本，只有内容真的变了才落盘。
+        """
+        entry = self.entries.get(int(room_id))
+        if entry is None:
+            log_window.warning("快捷弹幕：房间 %s 不在房间列表中，忽略管理请求", room_id)
+            return
+        log_window.info("快捷弹幕：打开管理对话框（房间 %s，现有 %d 条）",
+                        room_id, len(entry.quick_danmaku))
+        original = list(entry.quick_danmaku)
+        working = list(original)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"快捷弹幕 — 房间 {room_id}")
+        dialog.setModal(True)
+        dialog.resize(380, 420)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("点选后只填入输入框（不会直接发送）；顺序即下拉顺序"))
+        listbox = QListWidget()
+        layout.addWidget(listbox, 1)
+        edit_row = QHBoxLayout()
+        item_edit = QLineEdit()
+        item_edit.setPlaceholderText(f"输入后回车添加（最多 {QUICK_DANMAKU_MAX} 条）")
+        edit_row.addWidget(item_edit, 1)
+
+        def refresh() -> None:
+            listbox.clear()
+            listbox.addItems(working)
+
+        def add() -> None:
+            cleaned = normalize_quick_danmaku([item_edit.text()])
+            if not cleaned:
+                return
+            text = cleaned[0]
+            if text in working:
+                return
+            if len(working) >= QUICK_DANMAKU_MAX:
+                QMessageBox.information(
+                    dialog, "快捷弹幕", f"最多只能保存 {QUICK_DANMAKU_MAX} 条")
+                return
+            working.append(text)
+            item_edit.clear()
+            refresh()
+            listbox.setCurrentRow(len(working) - 1)
+            log_window.debug("快捷弹幕：添加「%s」（房间 %s，暂存 %d 条）",
+                             text, room_id, len(working))
+
+        def remove() -> None:
+            row = listbox.currentRow()
+            if row >= 0:
+                removed = working[row]
+                del working[row]
+                refresh()
+                log_window.debug("快捷弹幕：删除「%s」（房间 %s，暂存 %d 条）",
+                                 removed, room_id, len(working))
+
+        def move(offset: int) -> None:
+            row = listbox.currentRow()
+            target = row + offset
+            if row < 0 or not 0 <= target < len(working):
+                return
+            working[row], working[target] = working[target], working[row]
+            refresh()
+            listbox.setCurrentRow(target)
+            log_window.debug("快捷弹幕：%s「%s」（房间 %s）",
+                             "上移" if offset < 0 else "下移",
+                             working[target], room_id)
+
+        def save_and_refresh() -> None:
+            if working != original:
+                entry.quick_danmaku = list(working)
+                self._save_config()
+                log_task.info("快捷弹幕已更新：房间 %s，共 %d 条", room_id, len(working))
+            # 主界面与各独立窗口的下拉一起刷新（覆盖「同一房间同时开窗」的情况）
+            for panel in list(self._dm_panels):
+                panel._refresh_quick_danmaku()
+
+        def on_close() -> None:
+            save_and_refresh()
+            dialog.accept()
+
+        add_btn = QPushButton("添加")
+        add_btn.clicked.connect(add)
+        edit_row.addWidget(add_btn)
+        layout.addLayout(edit_row)
+        item_edit.returnPressed.connect(add)
+
+        button_row = QHBoxLayout()
+        for text, command in (("删除", remove), ("上移", lambda: move(-1)),
+                              ("下移", lambda: move(1))):
+            button = QPushButton(text)
+            button.clicked.connect(command)
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(on_close)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        # 直接关窗（X）也要保存：rejected 走同一条保存 + 刷新路径
+        dialog.rejected.connect(save_and_refresh)
+        refresh()
+        dialog.exec()
 
     def remember_emoticon_page(self, room_id: int, index: int, name: str) -> None:
         """记住某房间停留的表情包（翻到哪一页即写入，与 Tk 版一致）。"""

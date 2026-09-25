@@ -53,12 +53,14 @@ from .gui_app import (
     EMOTICON_ICON_MAX_HEIGHT,
     EMOTICON_ICON_MAX_WIDTH,
     EMOTICON_IMAGE_CACHE_MAX,
+    QUICK_DM_PLACEHOLDER,
     danmaku_content_from_line,
     danmaku_send_guard,
     dm_trim_index,
     emoticon_from_packages,
     emoticon_packages_signature,
     emoticon_tooltip_text,
+    merge_quick_danmaku,
     select_dm_options,
     unseen_badge_text,
 )
@@ -197,13 +199,17 @@ def _remember_meta(cache: dict, dmid: str, uid: int,
 class DmPanel(QWidget):
     """弹幕显示 + 发送区 + 表情面板。"""
 
-    def __init__(self, host, room_provider=None, *, always_visible: bool = False):
+    def __init__(self, host, room_provider=None, *, always_visible: bool = False,
+                 show_quick_manage: bool = True):
         super().__init__()
         self.host = host
         # 本面板绑定的房间来源：主视图跟随宿主选中房间；房间独立窗口（ROADMAP 84）注入固定房间
         self._room_provider = room_provider or (lambda: host._selected_room_id)
         # 独立窗口的弹幕区恒显示（宿主的「显示弹幕区」开关只作用于主界面）
         self.always_visible = bool(always_visible)
+        # 快捷弹幕的「管理」入口只在主界面提供（独立窗口只作使用，
+        # 避免多个窗口同时编辑同一份预设数据）
+        self.show_quick_manage = bool(show_quick_manage)
         self.visible = True if always_visible else bool(host.dm_var)
         self._dm_unseen = 0
         self._dm_reply_target: Optional[dict] = None
@@ -302,6 +308,19 @@ class DmPanel(QWidget):
         self.dm_emoji_btn.setFixedWidth(52)
         self.dm_emoji_btn.clicked.connect(self.toggle_emoticon_panel)
         send.addWidget(self.dm_emoji_btn)
+        # 快捷弹幕（ROADMAP 90，按房间独立）：选中只**填入输入框、不直接发送**
+        # （可先改后发，避免误触）；放在发送行内，不额外占用行高
+        self.quick_dm_combo = QComboBox()
+        self.quick_dm_combo.setFixedWidth(88)
+        self.quick_dm_combo.setEnabled(False)
+        # activated：每次选择都触发（含重复选同一项），比 currentIndexChanged 更合适
+        self.quick_dm_combo.activated.connect(self._on_quick_danmaku_pick)
+        send.addWidget(self.quick_dm_combo)
+        self.quick_dm_manage_btn = QPushButton("管理")
+        self.quick_dm_manage_btn.setFixedWidth(48)
+        self.quick_dm_manage_btn.clicked.connect(self._open_quick_danmaku_manager)
+        if self.show_quick_manage:
+            send.addWidget(self.quick_dm_manage_btn)
         self.dm_send_entry = QLineEdit()
         # 与 Tk 版一致：不硬截断输入，超长仅标红提示（是否接受由服务端判定）
         self.dm_send_entry.textChanged.connect(self._update_dm_len_hint)
@@ -570,7 +589,7 @@ class DmPanel(QWidget):
 
     def _set_hint(self, text: str) -> None:
         """发送提示行：**空文本时隐藏**，避免在发送栏下方留出空行（与 Tk 版一致）。"""
-        self._set_hint(text)
+        self.dm_hint.setText(text)
         self.dm_hint.setVisible(bool(text))
 
     def _set_copy_hint(self, text: str) -> None:
@@ -1072,6 +1091,8 @@ class DmPanel(QWidget):
         self._update_dm_len_hint()
         if reason:
             self._set_hint(reason)
+        # 快捷弹幕下拉跟随当前房间（选房 / 登录态变化都会走到这里）
+        self._refresh_quick_danmaku()
 
     def _update_dm_len_hint(self) -> None:
         """字数计数（仅提示，不做客户端截断）：超长标红提醒服务端可能拒绝。"""
@@ -1080,6 +1101,48 @@ class DmPanel(QWidget):
         color = "#c62828" if over else "#888"
         self.dm_len_label.setStyleSheet(f"color:{color}; font-size:11px")
         self.dm_len_label.setText(f"{len(text)}/{DANMAKU_MAX_LEN}")
+
+    # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
+
+    def _refresh_quick_danmaku(self) -> None:
+        """按本面板当前房间刷新快捷弹幕下拉（该房间没有预设时置灰）。"""
+        room_id = self.selected_room
+        entry = self.host.entries.get(int(room_id)) if room_id is not None else None
+        presets: List[str] = list(entry.quick_danmaku) if entry is not None else []
+        self.quick_dm_combo.blockSignals(True)
+        self.quick_dm_combo.clear()
+        # 首项固定为占位文本（真实项 → 按正常颜色显示，不像 placeholder 那样发灰）
+        self.quick_dm_combo.addItem(QUICK_DM_PLACEHOLDER)
+        for text in presets:
+            self.quick_dm_combo.addItem(text)
+        self.quick_dm_combo.setCurrentIndex(0)  # 显示占位项，不预选任何一条预设
+        self.quick_dm_combo.blockSignals(False)
+        self.quick_dm_combo.setEnabled(bool(presets))
+        self.quick_dm_manage_btn.setEnabled(room_id is not None)
+
+    def _on_quick_danmaku_pick(self, index: int) -> None:
+        """点选快捷弹幕：**只填入输入框**（不直接发送），光标停在输入框内。
+
+        ``setText`` 会触发 ``textChanged``，字数提示自动更新（无需手动刷新）。
+        """
+        if index <= 0:  # 0 = 占位项「快捷弹幕」，不做任何事
+            return
+        text = self.quick_dm_combo.itemText(index)
+        if not text:
+            return
+        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
+                        text, self.selected_room)
+        self.dm_send_entry.setText(
+            merge_quick_danmaku(self.dm_send_entry.text(), text))
+        self.dm_send_entry.setFocus()
+
+    def _open_quick_danmaku_manager(self) -> None:
+        """打开管理对话框：由宿主实现（弹窗 + 落盘 + 刷新所有面板的下拉）。"""
+        room_id = self.selected_room
+        log_window.debug("快捷弹幕：点击管理（房间 %s）", room_id)
+        if room_id is None:
+            return
+        self.host.open_quick_danmaku_manager(int(room_id))
 
     # ---- 可用颜色 / 模式（服务端按房间下发，失败时保留内置预设） ----
 

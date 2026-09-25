@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from .log_categories import CATEGORY_DATA, get_logger
 
@@ -29,6 +29,35 @@ SORT_MODES = ("manual", "room", "anchor", "status")
 # notify_sound：开播提示音效（键名与 GUI 播放器映射表一致）
 NOTIFY_SOUNDS = ("上行双音", "三连音", "Windows 系统提示音", "静音")
 DEFAULT_NOTIFY_SOUND = "上行双音"
+
+QUICK_DANMAKU_MAX = 12
+"""每个直播间的快捷弹幕最多保存多少条（下拉过长不好用，也限制配置文件体积）。"""
+
+QUICK_DANMAKU_LEN = 20
+"""单条快捷弹幕的最大长度（与 ``gui_app.DANMAKU_MAX_LEN`` 一致：B 站弹幕长度上限）。"""
+
+
+def normalize_quick_danmaku(value: Any, max_len: int = QUICK_DANMAKU_LEN) -> List[str]:
+    """清洗某个直播间的快捷弹幕文本列表（纯函数，ROADMAP 90）。
+
+    只保留**非空字符串**：去首尾空白、超长按 ``max_len`` 截断、保序去重，
+    最多 ``QUICK_DANMAKU_MAX`` 条。非列表 / 含非字符串项一律丢弃而**不抛异常**
+    ——配置里的坏数据不该让整个房间列表读不出来。
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: List[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()[:max_len]
+        if not text or text in result:
+            continue
+        result.append(text)
+        if len(result) >= QUICK_DANMAKU_MAX:
+            break
+    return result
+
 
 DEFAULT_UI_PREFS: Dict[str, object] = {
     "sort_mode": "manual",
@@ -89,6 +118,13 @@ class RoomEntry:
     仅约束**自动**任务，手动「发弹幕」按钮不受影响。
     """
 
+    quick_danmaku: List[str] = field(default_factory=list)
+    """该直播间的快捷弹幕文本（**按房间独立**，ROADMAP 90）。
+
+    界面上点选后**只填入发送输入框、不直接发送**（可先改后发，避免误触）；
+    列表顺序即下拉的显示顺序。读入时由 ``normalize_quick_danmaku`` 清洗。
+    """
+
 
 def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
     """读取房间列表；文件缺失或损坏时返回空列表。"""
@@ -123,6 +159,7 @@ def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
             auto_like=bool(item.get("auto_like", auto_default)),
             auto_danmaku=bool(item.get("auto_danmaku", auto_default)),
             auto_danmaku_when_live=bool(item.get("auto_danmaku_when_live", False)),
+            quick_danmaku=normalize_quick_danmaku(item.get("quick_danmaku")),
         ))
     logger.debug("读取直播间列表 %s：%d 个房间（其中 %d 个启用）",
                  path, len(entries), sum(1 for e in entries if e.enabled))
