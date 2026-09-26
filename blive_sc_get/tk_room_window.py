@@ -41,6 +41,7 @@ from .gui_app import (
     EMOTICON_TOOLTIP_DELAY_MS,
     HISTORY_PAGE_SIZE,
     QUICK_DM_PLACEHOLDER,
+    QUICK_DM_SEND_NOW_TEXT,
     SC_TITLE_MAX_LEN,
     build_sc_segments,
     danmaku_content_from_line,
@@ -216,14 +217,22 @@ class RoomChatWindow(tk.Toplevel):
                                            postcommand=self._refresh_quick_danmaku)
         self.quick_dm_combo.pack(side="left", padx=(4, 0))
         self.quick_dm_combo.bind("<<ComboboxSelected>>", self._on_quick_danmaku_pick)
+        # 「点选即发送」（ROADMAP 92）：与主界面是**同一个全局开关**，任一处切换都会同步
+        self.quick_dm_now_var = tk.BooleanVar(
+            value=bool(self.host.ui_prefs.get("quick_dm_send_now", False)))
+        self.quick_dm_now_check = ttk.Checkbutton(
+            row, text=QUICK_DM_SEND_NOW_TEXT, variable=self.quick_dm_now_var,
+            command=self._on_quick_dm_send_now_toggled)
+        self.quick_dm_now_check.pack(side="left", padx=(4, 0))
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
         self.dm_send_entry.bind("<Return>", lambda _e: self._on_send_danmaku())
         self.dm_send_entry.bind("<KeyRelease>", self._update_dm_len_hint)
         self.dm_len_var = tk.StringVar(value="0")
-        ttk.Label(row, textvariable=self.dm_len_var,
-                  foreground="#888888").pack(side="left")
+        self.dm_len_label = ttk.Label(row, textvariable=self.dm_len_var,
+                                      foreground="#888888")
+        self.dm_len_label.pack(side="left")
         self.dm_send_btn = ttk.Button(row, text="发送", command=self._on_send_danmaku)
         self.dm_send_btn.pack(side="left", padx=(4, 0))
         self.dm_send_hint_var = tk.StringVar(value="")
@@ -951,10 +960,17 @@ class RoomChatWindow(tk.Toplevel):
         self._refresh_quick_danmaku()
 
     def _update_dm_len_hint(self, _event=None) -> None:
-        """字数计数（仅提示，不做客户端截断）：超过上限时在提示里标注。"""
+        """字数计数（仅提示，不做客户端截断）：超长时数字标红。
+
+        与主界面 / Qt 版统一：只显示**已输入字数**，不再出现 ``x/20`` 的上限写法。
+        """
         length = len(self.dm_send_var.get())
-        self.dm_len_var.set(f"{length}/{DANMAKU_MAX_LEN}" if length > DANMAKU_MAX_LEN
-                            else str(length))
+        self.dm_len_var.set(str(length))
+        try:
+            self.dm_len_label.configure(
+                foreground="#c62828" if length > DANMAKU_MAX_LEN else "#888888")
+        except tk.TclError:
+            pass  # 窗口正在销毁
 
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
@@ -967,18 +983,32 @@ class RoomChatWindow(tk.Toplevel):
         self.quick_dm_combo.configure(state="readonly" if presets else "disabled")
         self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)
 
+    def set_quick_dm_send_now(self, enabled: bool) -> None:
+        """宿主统一入口同步勾选框（本窗口只回写，不负责落盘与广播）。"""
+        enabled = bool(enabled)
+        if bool(self.quick_dm_now_var.get()) != enabled:
+            self.quick_dm_now_var.set(enabled)
+
+    def _on_quick_dm_send_now_toggled(self) -> None:
+        """本窗口勾选框：交给宿主统一入口（写偏好、落盘并同步主界面与其它窗口）。"""
+        self.host.set_quick_dm_send_now(self.quick_dm_now_var.get())
+
     def _on_quick_danmaku_pick(self, _event=None) -> None:
-        """点选快捷弹幕：**只填入输入框**（不直接发送），并聚焦到输入框末尾。"""
+        """点选快捷弹幕：按「点选即发送」开关决定**直接发送**或只填入输入框。"""
         text = self.quick_dm_combo.get()
         if not text or text == QUICK_DM_PLACEHOLDER:
             return  # 占位项不做任何事
-        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
-                        text, self._room_id)
+        room_id = self._room_id
+        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)  # 复位，便于再次点选同一条
+        if self.host.ui_prefs.get("quick_dm_send_now"):
+            log_window.info("快捷弹幕：直接发送「%s」（房间 %s）", text, room_id)
+            self._send_danmaku_text(text)  # 走既有发送链路（门控 / 冷却 / 回复目标一致）
+            return
+        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）", text, room_id)
         self.dm_send_var.set(merge_quick_danmaku(self.dm_send_var.get(), text))
         self._update_dm_len_hint()  # StringVar.set 不触发 KeyRelease，需手动刷字数
         self.dm_send_entry.focus_set()
         self.dm_send_entry.icursor(tk.END)
-        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)  # 复位，便于再次点选同一条
 
     def _set_dm_reply_target(self, target: Optional[dict]) -> None:
         self._dm_reply_target = target
@@ -1001,13 +1031,23 @@ class RoomChatWindow(tk.Toplevel):
         self._set_dm_reply_target(None)
 
     def _on_send_danmaku(self) -> None:
+        """发送按钮 / 回车：发送**输入框里**的内容。"""
+        self._send_danmaku_text(self.dm_send_var.get())
+
+    def _send_danmaku_text(self, text: str) -> None:
+        """用指定文本走完整的发送链路（门控 → 本地校验 → 提交后台协程）。
+
+        抽成独立方法是为了让「点选快捷弹幕直接发送」（ROADMAP 92）复用**同一条**路径：
+        写操作门控、登录态、发送冷却、回复目标、颜色与模式全部一致，不会因为多出一个入口
+        而绕过任何限制。
+        """
         if self._dm_sending:
             return
         reason = self._dm_send_block_reason()
         if reason:
             self.dm_send_hint_var.set(reason)
             return
-        text = self.dm_send_var.get().strip()
+        text = (text or "").strip()
         room_id = self._room_id
         guard = danmaku_send_guard(
             text, last_time=self.host._last_dm_send.get(room_id, 0.0),

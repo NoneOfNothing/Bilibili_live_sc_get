@@ -360,7 +360,18 @@ DANMAKU_SEND_COOLDOWN_S = 2.0
 """同一房间两次发送弹幕的最小间隔（秒）。"""
 
 DANMAKU_MAX_LEN = 20
-"""客户端弹幕长度上限（普通用户约 20 字；超长时服务端返回 1003212）。"""
+"""弹幕长度的**提示阈值**（普通用户约 20 字；超长时服务端可能返回 1003212）。
+
+只用于「字数计数标红」这一提醒，**不做任何客户端截断**（ROADMAP 44 起取消，长度与
+内容重复都交给服务端判定）；快捷弹幕预设也不再按它截断（ROADMAP 91）。
+"""
+
+QUICK_DM_SEND_NOW_TEXT = "点选即发送"
+"""「点选快捷弹幕直接发送」勾选框的文案（ROADMAP 92，两版共用）。"""
+
+QUICK_DM_SEND_NOW_HINT = ("勾选后，点选快捷弹幕会**直接发送**（仍受写操作开关、登录态与发送"
+                          "冷却约束）；不勾选则只把文本填入输入框，可先改后发。")
+"""该勾选框的说明（Qt 用作 tooltip；Tk 版文案已足够直白，仅在日志里体现状态）。"""
 
 QUICK_DM_PLACEHOLDER = "快捷弹幕"
 """快捷弹幕下拉的**占位项**（ROADMAP 90）。
@@ -1391,6 +1402,14 @@ class ScMonitorApp:
         self.quick_dm_manage_btn = ttk.Button(row, text="管理", width=5,
                                               command=self._open_quick_danmaku_manager)
         self.quick_dm_manage_btn.pack(side="left", padx=(4, 0))
+        # 「点选即发送」（ROADMAP 92）：勾选后点选快捷弹幕**直接发出**，不再只填入输入框。
+        # 状态是全局偏好（ui.quick_dm_send_now），主界面与各房间独立窗口的勾选框保持一致
+        self.quick_dm_now_var = tk.BooleanVar(
+            value=bool(self.ui_prefs.get("quick_dm_send_now", False)))
+        self.quick_dm_now_check = ttk.Checkbutton(
+            row, text=QUICK_DM_SEND_NOW_TEXT, variable=self.quick_dm_now_var,
+            command=self._on_quick_dm_send_now_toggled)
+        self.quick_dm_now_check.pack(side="left", padx=(4, 0))
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
@@ -2963,18 +2982,45 @@ class ScMonitorApp:
         self.quick_dm_manage_btn.configure(
             state="normal" if self._selected_room_id is not None else "disabled")
 
+    def set_quick_dm_send_now(self, enabled: bool) -> None:
+        """「点选即发送」的统一入口（主界面与各房间独立窗口的勾选框都走这里）。
+
+        三处状态必须永远一致，所以只在这里改：① 偏好落盘；② 回写主界面与各独立窗口的
+        勾选框；③ 记一条 info 日志。点选时的**实际行为**由各视图读 ``ui_prefs`` 决定，
+        不各自维护状态（否则会出现「主界面直接发、独立窗口只填入」这种不一致）。
+        """
+        enabled = bool(enabled)
+        if self.ui_prefs.get("quick_dm_send_now") != enabled:
+            self.ui_prefs["quick_dm_send_now"] = enabled
+            self._save_config()
+            log_window.info("快捷弹幕：点选后%s",
+                            "直接发送（仍受写操作开关与冷却约束）" if enabled
+                            else "只填入输入框（可先改后发）")
+        if bool(self.quick_dm_now_var.get()) != enabled:
+            self.quick_dm_now_var.set(enabled)
+        for window in list(self._room_windows.values()):
+            window.set_quick_dm_send_now(enabled)
+
+    def _on_quick_dm_send_now_toggled(self) -> None:
+        """主界面勾选框：转发到统一入口。"""
+        self.set_quick_dm_send_now(self.quick_dm_now_var.get())
+
     def _on_quick_danmaku_pick(self, _event=None) -> None:
-        """点选快捷弹幕：**只填入输入框**（不直接发送），并聚焦到输入框末尾。"""
+        """点选快捷弹幕：按「点选即发送」开关决定**直接发送**或只填入输入框。"""
         text = self.quick_dm_combo.get()
         if not text or text == QUICK_DM_PLACEHOLDER:
             return  # 占位项不做任何事
-        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
-                        text, self._selected_room_id)
+        room_id = self._selected_room_id
+        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)  # 复位，便于再次点选同一条
+        if self.ui_prefs.get("quick_dm_send_now"):
+            log_window.info("快捷弹幕：直接发送「%s」（房间 %s）", text, room_id)
+            self._send_danmaku_text(text)  # 走既有发送链路（门控 / 冷却 / 回复目标一致）
+            return
+        log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）", text, room_id)
         self.dm_send_var.set(merge_quick_danmaku(self.dm_send_var.get(), text))
         self._update_dm_len_hint()  # StringVar.set 不触发 KeyRelease，需手动刷字数
         self.dm_send_entry.focus_set()
         self.dm_send_entry.icursor(tk.END)
-        self.quick_dm_combo.set(QUICK_DM_PLACEHOLDER)  # 复位，便于再次点选同一条
 
     def _open_quick_danmaku_manager(self) -> None:
         """快捷弹幕管理对话框：增删 / 调整顺序（关闭时才写回并落盘）。"""
@@ -3009,7 +3055,7 @@ class ScMonitorApp:
                 listbox.insert(tk.END, text)
 
         def add(_event=None) -> None:
-            cleaned = normalize_quick_danmaku([item_var.get()], DANMAKU_MAX_LEN)
+            cleaned = normalize_quick_danmaku([item_var.get()])
             if not cleaned:
                 return
             text = cleaned[0]
@@ -3099,7 +3145,16 @@ class ScMonitorApp:
         self._set_dm_reply_target(None)
 
     def _on_send_danmaku(self) -> None:
-        """主线程发送入口：门控 → 本地校验 → 提交后台协程（不再弹确认框）。"""
+        """发送按钮 / 回车：发送**输入框里**的内容。"""
+        self._send_danmaku_text(self.dm_send_var.get())
+
+    def _send_danmaku_text(self, text: str) -> None:
+        """用指定文本走完整的发送链路：门控 → 本地校验 → 提交后台协程（不再弹确认框）。
+
+        抽成独立方法是为了让「点选快捷弹幕直接发送」（ROADMAP 92）复用**同一条**路径：
+        写操作门控、登录态、发送冷却、回复目标、颜色与模式全部一致，不会因为多出一个入口
+        而绕过任何限制。
+        """
         if self._dm_sending:
             return
         reason = self._dm_send_block_reason()
@@ -3107,7 +3162,7 @@ class ScMonitorApp:
             self.dm_send_hint_var.set(reason)
             return
         room_id = self._selected_room_id
-        text = self.dm_send_var.get().strip()
+        text = (text or "").strip()
         guard = danmaku_send_guard(
             text,
             last_time=self._last_dm_send.get(room_id, 0.0),

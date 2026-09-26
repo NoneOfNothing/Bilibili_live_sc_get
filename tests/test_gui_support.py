@@ -312,6 +312,7 @@ class GuiConfigTests(unittest.TestCase):
                           "notify_persist": True,
                           "notify_sound": "三连音", "dm_visible": True,
                           "dm_emoticon_image": True,
+                          "quick_dm_send_now": False,
                           "window_size": [0, 0],
                           "room_windows": {},
                           "live_started_at": {}, "live_offline_at": {}})
@@ -352,6 +353,7 @@ class GuiConfigTests(unittest.TestCase):
                     "notify_overlay": True, "notify_persist": False,
                     "notify_sound": "上行双音", "dm_visible": False,
                     "dm_emoticon_image": True,
+                    "quick_dm_send_now": False,
                     "window_size": [0, 0],
                     "room_windows": {},
                     "live_started_at": {}, "live_offline_at": {}}

@@ -33,16 +33,17 @@ DEFAULT_NOTIFY_SOUND = "上行双音"
 QUICK_DANMAKU_MAX = 12
 """每个直播间的快捷弹幕最多保存多少条（下拉过长不好用，也限制配置文件体积）。"""
 
-QUICK_DANMAKU_LEN = 20
-"""单条快捷弹幕的最大长度（与 ``gui_app.DANMAKU_MAX_LEN`` 一致：B 站弹幕长度上限）。"""
 
-
-def normalize_quick_danmaku(value: Any, max_len: int = QUICK_DANMAKU_LEN) -> List[str]:
+def normalize_quick_danmaku(value: Any) -> List[str]:
     """清洗某个直播间的快捷弹幕文本列表（纯函数，ROADMAP 90）。
 
-    只保留**非空字符串**：去首尾空白、超长按 ``max_len`` 截断、保序去重，
-    最多 ``QUICK_DANMAKU_MAX`` 条。非列表 / 含非字符串项一律丢弃而**不抛异常**
-    ——配置里的坏数据不该让整个房间列表读不出来。
+    只保留**非空字符串**：去首尾空白、保序去重，最多 ``QUICK_DANMAKU_MAX`` 条。非列表 /
+    含非字符串项一律丢弃而**不抛异常**——配置里的坏数据不该让整个房间列表读不出来。
+
+    **不限制单条长度**（ROADMAP 91）：预设只是「待填入输入框的文本」，能不能发由服务端
+    判定（发送侧本来也早已取消客户端截断，见 ``gui_app.danmaku_send_guard``）。此前按
+    20 字截断，预设里写长句会被悄悄砍短，更糟的是**打开一次管理对话框再关闭就会把截断后
+    的文本写回配置**（用户反馈「快捷弹幕预设也不能超过 20 字」）。
     """
     if not isinstance(value, (list, tuple)):
         return []
@@ -50,7 +51,7 @@ def normalize_quick_danmaku(value: Any, max_len: int = QUICK_DANMAKU_LEN) -> Lis
     for item in value:
         if not isinstance(item, str):
             continue
-        text = item.strip()[:max_len]
+        text = item.strip()
         if not text or text in result:
             continue
         result.append(text)
@@ -68,6 +69,9 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     # dm_emoticon_image：弹幕流里是否直接显示表情图片（Qt 版专有，默认开启）。
     # 关闭后只显示「[触发词]」文字，行高更矮；悬浮提示此时仍可看原图（与 Tk 版一致）。
     "dm_emoticon_image": True,
+    # quick_dm_send_now：点选快捷弹幕时是否**直接发送**（ROADMAP 92，默认否 = 只填入输入框）。
+    # 全局偏好（不按房间）；它只决定「点选后的动作」，发送本身仍走原有门控与冷却。
+    "quick_dm_send_now": False,
     # window_size：上次退出时的窗口尺寸 [宽, 高]（逻辑像素）；[0, 0] 表示尚未记忆
     "window_size": [0, 0],
     # room_windows：房间独立窗口（ROADMAP 84）的位置尺寸记忆，

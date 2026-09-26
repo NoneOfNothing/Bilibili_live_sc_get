@@ -2101,6 +2101,23 @@ class QtScMonitorApp(QMainWindow):
             check.blockSignals(False)
         self._refresh_dm_send_state()
 
+    def set_quick_dm_send_now(self, enabled: bool) -> None:
+        """「点选即发送」的统一入口（主界面与各房间独立窗口的勾选框都走这里）。
+
+        三处状态必须永远一致，所以只在这里改：① 偏好落盘；② 广播给**每一个**弹幕面板
+        （各自的 `set_quick_dm_send_now` 只回写勾选框、`blockSignals` 防回环）；③ 记日志。
+        点选时的**实际行为**由各面板读 ``ui_prefs`` 决定，不各自维护状态。
+        """
+        enabled = bool(enabled)
+        if self.ui_prefs.get("quick_dm_send_now") != enabled:
+            self.ui_prefs["quick_dm_send_now"] = enabled
+            self._save_config()
+            log_window.info("快捷弹幕：点选后%s（%d 个弹幕面板同步）",
+                            "直接发送（仍受写操作开关与冷却约束）" if enabled
+                            else "只填入输入框（可先改后发）", len(self._dm_panels))
+        for panel in list(self._dm_panels):
+            panel.set_quick_dm_send_now(enabled)
+
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         """首次显示后按 PANE_RATIO 分配板块高度（此前分割器还没有真实高度）。"""
         super().showEvent(event)

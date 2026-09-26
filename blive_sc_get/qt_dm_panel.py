@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QTextImageFormat,
 )
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -54,6 +55,8 @@ from .gui_app import (
     EMOTICON_ICON_MAX_WIDTH,
     EMOTICON_IMAGE_CACHE_MAX,
     QUICK_DM_PLACEHOLDER,
+    QUICK_DM_SEND_NOW_HINT,
+    QUICK_DM_SEND_NOW_TEXT,
     danmaku_content_from_line,
     danmaku_send_guard,
     dm_trim_index,
@@ -321,6 +324,12 @@ class DmPanel(QWidget):
         self.quick_dm_manage_btn.clicked.connect(self._open_quick_danmaku_manager)
         if self.show_quick_manage:
             send.addWidget(self.quick_dm_manage_btn)
+        # 「点选即发送」（ROADMAP 92）：与主界面 / 各独立窗口是**同一个全局开关**
+        self.quick_dm_now_check = QCheckBox(QUICK_DM_SEND_NOW_TEXT)
+        self.quick_dm_now_check.setToolTip(QUICK_DM_SEND_NOW_HINT)
+        self.quick_dm_now_check.setChecked(self._quick_send_now())
+        self.quick_dm_now_check.toggled.connect(self._on_quick_dm_send_now_toggled)
+        send.addWidget(self.quick_dm_now_check)
         self.dm_send_entry = QLineEdit()
         # 与 Tk 版一致：不硬截断输入，超长仅标红提示（是否接受由服务端判定）
         self.dm_send_entry.textChanged.connect(self._update_dm_len_hint)
@@ -1095,12 +1104,17 @@ class DmPanel(QWidget):
         self._refresh_quick_danmaku()
 
     def _update_dm_len_hint(self) -> None:
-        """字数计数（仅提示，不做客户端截断）：超长标红提醒服务端可能拒绝。"""
+        """字数计数（仅提示，不做客户端截断）：超长标红提醒服务端可能拒绝。
+
+        只显示**已输入字数**，不再显示 ``x/20`` 那种「上限」写法——发送侧早已取消客户端
+        截断，写成 ``x/20`` 会让人以为超过 20 字就发不出去（用户反馈）。超长时数字标红，
+        语义与 Tk 版（主界面 / 房间独立窗口）完全一致。
+        """
         text = self.dm_send_entry.text()
         over = len(text) > DANMAKU_MAX_LEN
         color = "#c62828" if over else "#888"
         self.dm_len_label.setStyleSheet(f"color:{color}; font-size:11px")
-        self.dm_len_label.setText(f"{len(text)}/{DANMAKU_MAX_LEN}")
+        self.dm_len_label.setText(str(len(text)))
 
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
@@ -1120,15 +1134,36 @@ class DmPanel(QWidget):
         self.quick_dm_combo.setEnabled(bool(presets))
         self.quick_dm_manage_btn.setEnabled(room_id is not None)
 
-    def _on_quick_danmaku_pick(self, index: int) -> None:
-        """点选快捷弹幕：**只填入输入框**（不直接发送），光标停在输入框内。
+    def _quick_send_now(self) -> bool:
+        """「点选即发送」是否开启（读全局偏好；各视图不各自维护状态）。"""
+        return bool(self.host.ui_prefs.get("quick_dm_send_now", False))
 
-        ``setText`` 会触发 ``textChanged``，字数提示自动更新（无需手动刷新）。
+    def set_quick_dm_send_now(self, enabled: bool) -> None:
+        """外部（宿主统一入口）同步勾选框；本面板不负责落盘与广播。"""
+        enabled = bool(enabled)
+        if self.quick_dm_now_check.isChecked() != enabled:
+            self.quick_dm_now_check.blockSignals(True)  # 防回环
+            self.quick_dm_now_check.setChecked(enabled)
+            self.quick_dm_now_check.blockSignals(False)
+
+    def _on_quick_dm_send_now_toggled(self, checked: bool) -> None:
+        """本面板勾选框：交给宿主统一入口（写偏好、落盘并同步所有面板与窗口）。"""
+        self.host.set_quick_dm_send_now(bool(checked))
+
+    def _on_quick_danmaku_pick(self, index: int) -> None:
+        """点选快捷弹幕：按「点选即发送」开关决定**直接发送**或只填入输入框。
+
+        填入模式：``setText`` 会触发 ``textChanged``，字数提示自动更新（无需手动刷新）。
+        发送模式：走 ``send_danmaku_text``（门控 / 冷却 / 回复目标与手动发送完全一致）。
         """
         if index <= 0:  # 0 = 占位项「快捷弹幕」，不做任何事
             return
         text = self.quick_dm_combo.itemText(index)
         if not text:
+            return
+        if self._quick_send_now():
+            log_window.info("快捷弹幕：直接发送「%s」（房间 %s）", text, self.selected_room)
+            self.send_danmaku_text(text)
             return
         log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
                         text, self.selected_room)
@@ -1217,14 +1252,23 @@ class DmPanel(QWidget):
     # ---- 发送 ----
 
     def on_send_danmaku(self) -> None:
-        """主线程发送入口：门控 → 本地校验 → 提交后台协程。"""
+        """发送按钮 / 回车：发送**输入框里**的内容。"""
+        self.send_danmaku_text(self.dm_send_entry.text())
+
+    def send_danmaku_text(self, text: str) -> None:
+        """用指定文本走完整的发送链路：门控 → 本地校验 → 提交后台协程。
+
+        抽成独立方法是为了让「点选快捷弹幕直接发送」（ROADMAP 92）复用**同一条**路径：
+        写操作门控、登录态、发送冷却、回复目标、颜色与模式全部一致，不会因为多出一个入口
+        而绕过任何限制。
+        """
         if self._dm_sending:
             return
         block = self._dm_send_block_reason()
         if block:
             self._set_hint(block)
             return
-        text = self.dm_send_entry.text().strip()
+        text = (text or "").strip()
         log_task.info("发送弹幕：房间 %s，%d 字，内容：%s", self.selected_room, len(text),
                       text if len(text) <= 50 else text[:50] + "…")
         reason = danmaku_send_guard(
