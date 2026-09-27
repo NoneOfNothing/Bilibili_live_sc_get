@@ -307,6 +307,60 @@ def live_duration_text(started_at: Optional[float], is_live: bool,
     return f"已播 {format_live_duration(current - float(started_at))}"
 
 
+FOLLOWING_REFRESH_COOLDOWN_S = 600.0
+"""重新抓「关注列表 → 各主播上次直播结束时刻」的最小间隔（秒，ROADMAP 97）。
+
+一次抓取要翻若干页（20 条/页，实测 600 条约 3.5 秒），只在「按直播状态」排序需要它时抓；
+该冷却避免频繁翻页（接口需登录态，频繁请求有风控风险）。
+"""
+
+
+def merge_offline_marks(local: dict, remote: dict) -> dict:
+    """合并「本地观测到的下播时刻」与「关注列表里的真实下播时刻」，供排序使用（纯函数）。
+
+    同一房间取**较晚**的那个：
+
+    - 运行期观测到的跳变（``local``）永远是最新的，接口值可能略滞后；
+    - 程序关闭期间下播的房间只有接口能给（``remote``），此时它比本地遗留的值新；
+    - 退出时给「当时仍在直播」的房间记的估算值（也写在 ``local`` 里）早于真实下播时刻，
+      拿到接口值后自然被它覆盖。
+
+    键统一成 ``int``、值统一成 ``float``；非法值直接忽略，绝不让一条坏数据毁掉排序。
+    """
+    merged: dict = {}
+    for source in (local or {}, remote or {}):
+        for room_id, moment in source.items():
+            try:
+                key = int(room_id)
+                value = float(moment)
+            except (TypeError, ValueError):
+                continue
+            if value > merged.get(key, 0.0):
+                merged[key] = value
+    return merged
+
+
+def scroll_value_for_anchor(anchor_top: int, line_height: int, viewport_height: int,
+                            current: int) -> int:
+    """按「最小滚动」语义算出滚动条新值（纯函数，Qt 版 SC 翻页的视口保持用）。
+
+    与 Tk ``Text.see(index)`` 同一规则：目标行被挤出视口**下方**时只把它带到**底边**、
+    被挤出**上方**时带到**顶边**、本来就在视口内则**一点不动**。Qt 的 SC 面板翻页正是照它
+    摆视口——贴底边意味着新加载的那一页立刻填满视口（用户要的「从第 101 条开始」），
+    而贴顶边会让新内容全落在视口上方、画面看起来毫无变化（曾因此被误认为「没触发加载」）。
+
+    ``anchor_top`` 是锚点行顶的**视口坐标**（即 ``cursorRect().top()``）；返回值直接交给
+    ``QScrollBar.setValue`` 即可（超过上限由 Qt 自己收敛）。
+    """
+    line = max(1, int(line_height))
+    viewport = max(1, int(viewport_height))
+    if anchor_top + line > viewport:
+        return int(current + anchor_top - (viewport - line))  # 下方 → 贴底边
+    if anchor_top < 0:
+        return int(current + anchor_top)                      # 上方 → 贴顶边
+    return int(current)                                       # 已在视口内 → 不动
+
+
 def order_room_ids(base_order, mode: str, *, live_states=None, anchor_names=None,
                    live_since=None, offline_at=None):
     """按排序方案算出**显示顺序**（纯函数，Tk / Qt 两版共用）。
@@ -639,6 +693,18 @@ def emoticon_tooltip_text(info: dict, fields) -> str:
             if value and value != "0":
                 parts.append(f"id={value}")
     return " · ".join(parts)
+
+
+def emoticon_package_id(package) -> int:
+    """表情包 id 的安全取法（纯函数，取不到或脏值都记 0）。
+
+    两版都用它来「按包 id 找回上次那个包」：实测一个房间能有 **9 个包都叫「装扮表情」**
+    （B 站装扮表情各自成包、包名相同），只按包名找会永远落在第一个上。
+    """
+    try:
+        return max(0, int((package or {}).get("id") or 0))
+    except (AttributeError, TypeError, ValueError):  # 不是 dict / 脏值
+        return 0
 
 
 def emoticon_from_packages(packages, unique: str) -> dict:
@@ -1017,6 +1083,11 @@ class ScMonitorApp:
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
         self._live_duration_tick = 0.0  # 「已播」字段上次刷新时刻（秒级节流用）
+        # 关注列表给出的**真实下播时刻**（ROADMAP 97，仅本次运行有效）：程序关闭期间下播的
+        # 房间收不到关播信号，只能靠它排序；与 _offline_at 合并时取较晚的那个。
+        self._remote_offline_at: Dict[int, float] = {}
+        self._following_fetched_at = 0.0  # 上次抓关注列表的时间(monotonic)，冷却用
+        self._offline_estimate_done = False  # 退出时的「下播时刻估算」是否已落盘
         self._sort_dirty = False  # 「按直播状态」有房间状态变了、待本轮轮询末尾统一重排
         self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
         # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
@@ -2571,6 +2642,7 @@ class ScMonitorApp:
         self.ui_prefs["sort_mode"] = mode
         self._apply_sort()
         self._save_config()
+        self._refresh_following_marks("切换到「按直播状态」")  # ROADMAP 97：真实下播时刻
         log_room.info("排序方案切换为「%s」（%s）", SORT_MODE_TEXTS.get(mode, mode),
                       "可拖动调整" if mode == "manual" else "由规则自动排序")
 
@@ -3294,6 +3366,9 @@ class ScMonitorApp:
         self._show_emoticon_panel()
         self._emoticon_panel_room = room_id
         packages = self._emoticons.get(room_id)
+        log_window.debug("展开表情面板（房间 %s，%s）", room_id,
+                         f"缓存里有 {len(packages)} 个包，先用缓存呈现"
+                         if packages else "暂无缓存，先请求接口")
         if packages:
             self._render_emoticons(room_id, packages, "")   # 先用缓存即时呈现
         else:
@@ -3487,8 +3562,9 @@ class ScMonitorApp:
         if room_id is None or not self._emoticon_packages:
             return
         page = max(0, min(self._emoticon_page, len(self._emoticon_packages) - 1))
-        name = str(self._emoticon_packages[page].get("name") or "")
-        memory = {"index": page, "name": name}
+        package = self._emoticon_packages[page]
+        memory = {"index": page, "name": str(package.get("name") or ""),
+                  "id": emoticon_package_id(package)}
         if self._emoticon_memory.get(room_id) == memory:
             return
         self._emoticon_memory[room_id] = memory
@@ -3585,8 +3661,8 @@ class ScMonitorApp:
             values=[self._emoticon_pkg_label(i, p)
                     for i, p in enumerate(self._emoticon_packages)])
         # 停在当前/上次浏览的表情包（越界时 _show_emoticon_page 会自动收敛）：
-        # 优先保持「当前这个包」，否则按记忆的包名找（表情包顺序变化也不会跑偏），
-        # 最后才退回记忆的序号
+        # 优先保持「当前这个包」，否则回到记忆里的包（先包 id、再包名；一个房间可能有
+        # 9 个同名「装扮表情」，只比包名会永远落在第一个），最后才退回记忆的序号
         memory = self._emoticon_memory.get(room_id) or {}
         page = int(memory.get("index") or 0)  # type: ignore[arg-type]
         if keep is not None:
@@ -3594,20 +3670,18 @@ class ScMonitorApp:
             if matched is not None:
                 page = matched
         else:
-            name = str(memory.get("name") or "")
-            if name:
-                matched = self._find_emoticon_package(self._emoticon_packages, {"name": name})
-                if matched is not None:
-                    page = matched
+            matched = self._find_emoticon_package(self._emoticon_packages, memory)
+            if matched is not None:
+                page = matched
         self._show_emoticon_page(page)
 
     @staticmethod
     def _find_emoticon_package(packages: List[dict], target: dict) -> Optional[int]:
         """在新列表中定位原表情包（先按 id、再按包名），找不到返回 None。"""
-        target_id = target.get("id")
+        target_id = emoticon_package_id(target)
         if target_id:
             for index, package in enumerate(packages):
-                if package.get("id") == target_id:
+                if emoticon_package_id(package) == target_id:
                     return index
         name = target.get("name")
         if name:
@@ -4134,6 +4208,80 @@ class ScMonitorApp:
         log_window.debug("弹幕区超过 %d 行，已裁剪最旧的一半（完整内容仍在落盘文件）",
                      DM_TEXT_MAX_LINES)
 
+    # ---------- 排序：真实下播时刻（ROADMAP 97）----------
+
+    def _refresh_following_marks(self, reason: str) -> None:
+        """按需抓「我关注的 UP」列表里的**真实下播时刻**（ROADMAP 97）。
+
+        只在「按直播状态」排序下才有意义（其它方案不用下播时刻）；受
+        ``FOLLOWING_REFRESH_COOLDOWN_S`` 冷却限制，未登录直接跳过（该接口需要登录态）。
+        """
+        if self._sort_mode() != "status":
+            log_data.debug("跳过关注列表抓取：当前不是「按直播状态」排序（%s）", reason)
+            return
+        api = self.hub.api
+        if api is None or not getattr(api, "logged_in", False):
+            log_data.debug("跳过关注列表抓取：后台未就绪或未登录（该接口需要登录态）")
+            return
+        now = time.monotonic()
+        if now - self._following_fetched_at < FOLLOWING_REFRESH_COOLDOWN_S:
+            log_data.debug("跳过关注列表抓取：距上次 %.0f 秒，未到 %.0f 秒冷却（%s）",
+                           now - self._following_fetched_at,
+                           FOLLOWING_REFRESH_COOLDOWN_S, reason)
+            return
+        self._following_fetched_at = now
+        log_data.debug("抓取关注列表的下播时刻（%s）", reason)
+        self.hub.submit(self._async_load_following_marks())
+
+    async def _async_load_following_marks(self) -> None:
+        api = self.hub.api
+        if api is None:
+            return
+        marks = await api.get_following_live_marks(wanted=set(self.entries))
+        self.ui_queue.put(("following", {"marks": marks}))
+
+    def _on_following_marks(self, payload: dict) -> None:
+        """关注列表结果到达：更新排序用的下播时刻（只留我们监听的房间）。"""
+        marks: Dict[int, float] = {}
+        for room_id, moment in (payload.get("marks") or {}).items():
+            try:
+                key = int(room_id)
+                if key in self.entries:
+                    marks[key] = float(moment)
+            except (TypeError, ValueError):
+                continue
+        if not marks:
+            log_room.debug("关注列表没有给出可用的下播时刻（这些房间没被关注 / 未登录 / 抓取失败），"
+                           "仍按本地观测与退出估算排序")
+        if marks == self._remote_offline_at:
+            return
+        self._remote_offline_at = marks
+        log_room.debug("关注列表给出 %d 个监听房间的真实下播时刻（供「按直播状态」排序）",
+                       len(marks))
+        if self._sort_mode() == "status":
+            self._sort_dirty = True  # 交给本轮轮询末尾统一重排（与其它重排路径一致）
+
+    def _record_shutdown_offline_estimate(self) -> None:
+        """退出时给「此刻仍在直播」的房间记一个下播时刻（＝退出时刻，ROADMAP 97）。
+
+        程序关闭期间下播的房间收不到关播信号，重启后既无开播也无下播记录，在「按直播状态」
+        排序里会掉进「无记录」那一档；记下「最后一次确认它还在直播」的时刻，重启后就有序可排
+        （比真实下播时刻略早，但相对先后是对的）。之后若从关注列表拿到真实下播时刻，会取较晚
+        的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，24 小时内有效）。
+        """
+        if self._offline_estimate_done:
+            return
+        self._offline_estimate_done = True
+        now = time.time()
+        rooms = [int(room_id) for room_id, state in self.live_state.items()
+                 if state == "直播中" and room_id in self.entries]
+        for room_id in rooms:
+            self._offline_at[room_id] = now
+        if rooms:
+            log_room.debug("退出时记录 %d 个仍在直播的房间的下播时刻（估算，供重启后排序）：%s",
+                           len(rooms), sorted(rooms))
+            self._save_config()
+
     def _sorted_room_ids(self) -> List[int]:
         """当前排序方案下的显示顺序（由纯函数 ``order_room_ids`` 算出，两版共用）。"""
         mode = self._sort_mode()
@@ -4141,7 +4289,8 @@ class ScMonitorApp:
         return order_room_ids(
             list(self.entries), mode,
             live_states=self.live_state, anchor_names=self.anchor_names,
-            live_since=self.live_started_at, offline_at=self._offline_at)
+            live_since=self.live_started_at,
+            offline_at=merge_offline_marks(self._offline_at, self._remote_offline_at))
 
     def _apply_sort(self) -> None:
         """按当前方案重排**显示顺序**。
@@ -4530,6 +4679,33 @@ class ScMonitorApp:
         finally:
             menu.grab_release()
 
+    def _remember_selected_room(self, room_id: Optional[int]) -> None:
+        """记住当前选中的直播间（`ui.selected_room`，ROADMAP 98）——下次启动自动选中它。
+
+        只在值真的变化时落盘：启动恢复与程序化选行也会走到这里，值没变就不必重写配置。
+        """
+        value = int(room_id) if room_id is not None else 0
+        if self.ui_prefs.get("selected_room") == value:
+            return
+        self.ui_prefs["selected_room"] = value
+        self._save_config()
+
+    def _startup_room_id(self) -> Optional[int]:
+        """启动时该选中哪个房间（ROADMAP 98）：上次退出时选中的那个。
+
+        **仍在房间列表里才算数**（配置里的房间可能已被删除）；没记住 / 已删除返回 ``None``，
+        由调用方回退成**显示顺序的第一行**。
+        """
+        remembered = int(self.ui_prefs.get("selected_room") or 0)
+        if remembered and remembered in self.entries:
+            log_room.debug("启动时恢复上次选中的直播间 %s（%s）", remembered,
+                           self.anchor_names.get(remembered) or "未知主播")
+            return remembered
+        log_room.debug("未恢复上次选中的直播间（%s），改为选中显示顺序的第一行",
+                       "配置里没记住" if not remembered
+                       else f"{remembered} 已不在房间列表里")
+        return None
+
     def _on_room_selected(self, _event=None) -> None:
         self._flush_note()
         room_id = self._get_selected_room_id()
@@ -4539,6 +4715,7 @@ class ScMonitorApp:
                           self.anchor_names.get(room_id) or "未知主播" if room_id else "—",
                           self.live_state.get(room_id, "未知") if room_id else "—")
         self._selected_room_id = room_id
+        self._remember_selected_room(room_id)  # ROADMAP 98：下次启动自动选中它
         self._note_room_id = room_id
         self._refresh_buttons()
         self._clear_sc_view()
@@ -4669,6 +4846,8 @@ class ScMonitorApp:
         self._loading_more = False
         self._loaded_count = skip + len(records)
         self._has_more = self._loaded_count < total
+        log_data.debug("历史 SC 读取完成：房间 %s，skip=%d，本页 %d 条，累计 %d/%d 条",
+                       room_id, skip, len(records), self._loaded_count, total)
         marker = self._history_marker(self._loaded_count, total)
         text = self.sc_text
         text.configure(state="normal")
@@ -4715,7 +4894,10 @@ class ScMonitorApp:
         text.insert("1.0", marker, "info")
         lines_added = int(text.index("end-1c").split(".")[0]) - lines_before
         text.configure(state="disabled")
-        text.see(f"{max(top_line + lines_added, 1)}.0")
+        target_line = max(top_line + lines_added, 1)
+        text.see(f"{target_line}.0")
+        log_data.debug("历史翻页后视口：顶行 %d → %d（本页新增 %d 行）",
+                       top_line, target_line, lines_added)
 
     def _on_sc_scroll(self, *args) -> None:
         self.sc_text.yview(*args)
@@ -4978,9 +5160,14 @@ class ScMonitorApp:
                 # 停用监听的房间不建立连接：补一次只读查询填主播名与直播标题
                 self.hub.submit(self._async_fetch_uid(room_id))
         self._refresh_all_rows()
+        self._refresh_following_marks("后台就绪")  # ROADMAP 97：启动即补齐真实下播时刻
         children = self.tree.get_children()
         if children and self._selected_room_id is None:
-            self.tree.selection_set(children[0])
+            target = self._startup_room_id()  # ROADMAP 98：优先上次退出时选中的房间
+            if target is not None and str(target) in children:
+                self.tree.selection_set(str(target))
+            else:
+                self.tree.selection_set(children[0])  # 回退：显示顺序的第一行
         elif self._selected_room_id is not None:
             self._load_history(self._selected_room_id)
         self._apply_dm_gate()
@@ -5302,6 +5489,8 @@ class ScMonitorApp:
                     self._load_dm_options_for_selected()
                 elif kind == "dm_config":
                     self._on_dm_config(item[1])
+                elif kind == "following":
+                    self._on_following_marks(item[1])  # ROADMAP 97：真实下播时刻
                 elif kind == "emoticons":
                     self._on_emoticons(item[1])
                     for window in list(self._room_windows.values()):
@@ -5375,6 +5564,9 @@ class ScMonitorApp:
         log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self.room_tasks))
         self._remember_emoticon_page()  # 面板还开着时直接退出也要记住当前表情包
         self._hide_emoticon_tooltip()
+        # ROADMAP 97：此刻仍在直播的房间记一个「下播时刻」估算（＝退出时刻），
+        # 供下次启动时「按直播状态」排序使用（函数内部会落盘，无变化则跳过）
+        self._record_shutdown_offline_estimate()
         self.hub.submit(self._async_shutdown())
         self.root.after(1500, self._destroy)
 

@@ -1071,3 +1071,125 @@ class DanmakuGateLoggingTests(unittest.TestCase):
                 for attr in ("live_started_at", "_offline_at"):
                     self.assertIn(attr, _attr_names(delete),
                                   f"{module}._on_delete 未清理 {attr}")
+
+
+class QtScHistoryPagingTests(unittest.TestCase):
+    """SC 历史翻页的视口接线（ROADMAP 95）。
+
+    翻页是把更早的记录**插到文档最前端**：Qt 插入后不会自己调整滚动条，数值仍是 0，
+    于是画面直接停在刚加载那批里最早的一条（＝整段历史的最开头）；Tk 版靠
+    ``see(旧顶行 + 新增行数)`` 把视线钉回原处。这里锁住修复后的四件事：翻页前取锚点、
+    插完把视口钉回去、顶部状态行只留一条、页边界分割点落在本页与旧内容之间。
+    """
+
+    def test_paged_load_restores_viewport_anchor(self):
+        loaded = _method(_tree("qt_sc_panel.py"), "ScPanel", "on_history_loaded")
+        called = _called_attrs(loaded)
+        for name in ("_top_anchor", "_drop_top_marker", "_pack_records",
+                     "_prepend_block", "_restore_top_anchor"):
+            self.assertIn(name, called, f"翻页路径未调用 {name}")
+        self.assertIn("_scroll_to_bottom", called, "首屏应仍吸底到最新一条")
+
+    def test_prepend_order_matches_tk(self):
+        """插入次序＝最终顺序的倒序，最终为 [新标记][本页记录][边界分割点][旧内容…]。"""
+        loaded = _method(_tree("qt_sc_panel.py"), "ScPanel", "on_history_loaded")
+        calls = sorted((node.lineno, node.func.attr) for node in ast.walk(loaded)
+                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                       and node.func.attr in ("_prepend_info", "_prepend_block"))
+        self.assertEqual([name for _, name in calls][-3:],
+                         ["_prepend_info", "_prepend_block", "_prepend_info"],
+                         f"翻页插入次序不对：{calls}")
+        # 边界分割点是 f-string（「（已读取 {skip} 条历史记录）」），故拼接字符串片段再查
+        texts = "".join(sub.value for sub in ast.walk(loaded)
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, str))
+        self.assertIn("已读取", texts, "缺少本页边界分割点文案")
+        self.assertIn("条历史记录", texts, "缺少本页边界分割点文案")
+
+    def test_restore_anchor_really_moves_scrollbar(self):
+        restore = _method(_tree("qt_sc_panel.py"), "ScPanel", "_restore_top_anchor")
+        self.assertIn("cursorRect", _attr_names(restore), "未按锚点行重新定位")
+        self.assertIn("setValue", _called_attrs(restore), "未真正移动滚动条")
+        self.assertIn("characterCount", _called_attrs(restore), "未按插入字符数平移锚点")
+        # 视口摆放必须走「最小滚动」纯函数：贴底边（新页立刻可见）而不是钉在顶边
+        # ——钉顶边会让新加载的一整页全在视口外、画面看起来毫无变化（用户报过一次）
+        self.assertIn("scroll_value_for_anchor", _names(restore),
+                      "未按最小滚动语义摆视口（贴顶边会被误认为「没触发加载」）")
+        self.assertIn("viewport", _called_attrs(restore), "未取视口高度")
+
+    def test_top_marker_replaced_not_stacked(self):
+        drop = _method(_tree("qt_sc_panel.py"), "ScPanel", "_drop_top_marker")
+        self.assertIn("SC_HISTORY_MARKER_PREFIX", _names(drop), "未限定只删状态行")
+        self.assertIn("removeSelectedText", _called_attrs(drop), "未清空旧状态行内容")
+        self.assertIn("deleteChar", _called_attrs(drop), "未吃掉行分隔符（会留下空行）")
+
+    def test_anchor_skips_marker_line(self):
+        """顶部正好是状态行时锚点要下移到下一条记录（状态行会被删掉重写）。"""
+        anchor = _method(_tree("qt_sc_panel.py"), "ScPanel", "_top_anchor")
+        self.assertIn("cursorForPosition", _called_attrs(anchor))
+        self.assertIn("SC_HISTORY_MARKER_PREFIX", _names(anchor), "未处理「顶部是状态行」")
+
+
+class QtEmoticonPanelTests(unittest.TestCase):
+    """表情面板的三处接线（ROADMAP 96）——都是「面板显示与实际列表不一致」的来源。
+
+    1. **翻页要同步下拉框**：用户 2026-09-27 报的就是「用 ◀▶ 翻到 `5/12 · 装扮表情`，
+       顶部下拉还停在 `1. emoji`」（`_show_emoticon_page` 只更新了右侧页码标签）；
+    2. **刷新后要保持当前包**：旧实现「内容指纹一变就把页号重置为 0」，于是跳回第 1 包
+       （实测一个房间有 9 个包都叫「装扮表情」，重置后用户看到的就不是自己那个包）；
+    3. **展开面板要先读宿主缓存**：旧实现从不读缓存，刷新请求被 30 秒冷却静默挡下时，
+       面板会继续显示**上一个房间**的表情包。
+    """
+
+    def test_page_change_syncs_package_combo(self):
+        tree = _tree("qt_dm_panel.py")
+        page = _method(tree, "DmPanel", "_show_emoticon_page")
+        self.assertIn("_sync_emoticon_bar", _called_attrs(page), "翻页未同步下拉框/左右箭头")
+        sync = _method(tree, "DmPanel", "_sync_emoticon_bar")
+        self.assertIn("setCurrentIndex", _called_attrs(sync), "未设置下拉选中项")
+        self.assertIn("blockSignals", _called_attrs(sync), "同步下拉未屏蔽信号（会回环）")
+        self.assertIn("setEnabled", _called_attrs(sync), "左右箭头未按首尾置灰")
+
+    def test_page_change_clears_old_strip(self):
+        """换包要清掉旧按钮：空态/切房时若不清，会留着上一个房间的表情条。"""
+        page = _method(_tree("qt_dm_panel.py"), "DmPanel", "_show_emoticon_page")
+        self.assertIn("_clear_emoticon_grid", _called_attrs(page), "换包未清空表情条")
+
+    def test_refresh_keeps_current_package(self):
+        tree = _tree("qt_dm_panel.py")
+        packages = _method(tree, "DmPanel", "on_emoticons")
+        self.assertIn("_apply_packages", _called_attrs(packages), "刷新未走统一渲染入口")
+        self.assertIn("emoticon_packages_signature", _names(packages),
+                      "内容没变时没有跳过重绘（会复位横向滚动位置）")
+        resets = [node for node in ast.walk(packages)
+                  if isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Attribute) and t.attr == "_emoticon_page"
+                          for t in node.targets)
+                  and isinstance(node.value, ast.Constant) and node.value.value == 0]
+        self.assertEqual(resets, [], "刷新时把页号重置为 0（会跳回第 1 包）")
+        apply_node = _method(tree, "DmPanel", "_apply_packages")
+        called = _called_attrs(apply_node)
+        self.assertIn("_find_package_page", called, "未按包找回当前这个包")
+        self.assertIn("_memory_page", called, "没有记忆兜底")
+
+    def test_open_panel_seeds_from_host_cache(self):
+        toggle = _method(_tree("qt_dm_panel.py"), "DmPanel", "toggle_emoticon_panel")
+        self.assertIn("emoticons_for", _called_attrs(toggle),
+                      "展开面板未先读宿主缓存（冷却被拦时会留着上个房间的列表）")
+        self.assertIn("_apply_packages", _called_attrs(toggle))
+
+    def test_memory_matches_by_package_id(self):
+        """同名包只能靠 id 区分：记忆与查找都要带包 id（Tk 版同步）。"""
+        tree = _tree("qt_dm_panel.py")
+        find = _method(tree, "DmPanel", "_find_package_page")
+        self.assertIn("emoticon_package_id", _names(find), "未按包 id 匹配（同名包落回第一个）")
+        remember = _method(tree, "DmPanel", "_remember_page")
+        self.assertIn("emoticon_package_id", _names(remember), "记忆未记下包 id")
+        memory = _method(tree, "DmPanel", "_memory_page")
+        self.assertIn("_find_package_page", _called_attrs(memory))
+
+        tk = _tree("gui_app.py")
+        tk_remember = _method(tk, "ScMonitorApp", "_remember_emoticon_page")
+        self.assertIn("emoticon_package_id", _names(tk_remember), "Tk 版记忆未记包 id")
+        tk_find = _method(tk, "ScMonitorApp", "_find_emoticon_package")
+        self.assertIn("emoticon_package_id", _names(tk_find),
+                      "Tk 版查找未按包 id（两版行为会不一致）")

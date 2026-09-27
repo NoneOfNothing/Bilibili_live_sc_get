@@ -1,18 +1,21 @@
-"""排序方案（ROADMAP 85 / 87）的离线测试：顺序合成、开播/关播时间记录与**持久化**。
+"""排序方案（ROADMAP 85 / 87 / 97）的离线测试：顺序合成、开播/关播时间记录与**持久化**。
 
 两版共用同一份纯函数（``gui_app.order_room_ids`` / ``update_live_started_at`` /
-``update_offline_at`` / ``prune_live_marks``），所以这里覆盖的就是界面最终看到的顺序
-——不启动任何 GUI。
+``update_offline_at`` / ``merge_offline_marks`` / ``prune_live_marks``），所以这里覆盖的就是
+界面最终看到的顺序——不启动任何 GUI。ROADMAP 97 那部分还顺带检查「关注列表的真实下播时刻」
+在两版宿主里的接线（静态 AST）。
 """
 
 import ast
 import unittest
 from pathlib import Path
 
+from blive_sc_get.api import FOLLOWING_URL
 from blive_sc_get.gui_app import (
     LIVE_MARK_MAX_AGE_S,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    merge_offline_marks,
     order_room_ids,
     prune_live_marks,
     update_live_started_at,
@@ -21,6 +24,42 @@ from blive_sc_get.gui_app import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = [11, 22, 33, 44]
+
+
+def _module_tree(module: str) -> ast.Module:
+    return ast.parse((ROOT / "blive_sc_get" / module).read_text(encoding="utf-8"))
+
+
+def _class_node(tree: ast.Module, name: str) -> ast.ClassDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError(f"未找到类 {name}")
+
+
+def _method(tree: ast.Module, class_name: str, name: str):
+    for node in ast.walk(_class_node(tree, class_name)):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == name):
+            return node
+    raise AssertionError(f"未找到 {class_name}.{name}")
+
+
+def _names(node) -> set:
+    return {sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)}
+
+
+def _attr_names(node) -> set:
+    return {sub.attr for sub in ast.walk(node) if isinstance(sub, ast.Attribute)}
+
+
+def _called_attrs(node) -> set:
+    return {sub.func.attr for sub in ast.walk(node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)}
+
+
+def _consts(node) -> set:
+    return {sub.value for sub in ast.walk(node) if isinstance(sub, ast.Constant)}
 
 
 class UpdateOfflineAtTests(unittest.TestCase):
@@ -265,6 +304,85 @@ class SortModeTextsTests(unittest.TestCase):
                       "「ⓘ」应固定在排序栏最右（与 Qt 版一致）")
         self.assertNotIn("sort_hint_var", source, "动态长提示应已移除")
         self.assertNotIn("（按住行拖动可调整顺序", source, "静态长提示应已移除")
+
+
+class FollowingOfflineMarksTests(unittest.TestCase):
+    """「上次直播结束时刻」的来源、合并与接线（ROADMAP 97）。
+
+    程序关闭期间下播的房间收不到关播信号：以前重启后既无开播也无下播记录，在「按直播状态」
+    排序里掉进「无记录」档（排最后）。现从关注列表接口取**真实下播时刻**
+    （`record_live_time`），并叠加「退出时给仍在直播房间记的下播估算」，两者取较晚的那个。
+    """
+
+    def test_merge_takes_later_mark(self):
+        merged = merge_offline_marks({1: 1000.0, 2: 500.0},
+                                     {1: 2000, 3: 1500, 4: "坏值"})
+        self.assertEqual(merged, {1: 2000.0, 2: 500.0, 3: 1500.0})
+
+    def test_merge_normalizes_and_tolerates_bad_input(self):
+        self.assertEqual(merge_offline_marks({"7": "300"}, None), {7: 300.0})
+        self.assertEqual(merge_offline_marks(None, {}), {})
+        self.assertEqual(merge_offline_marks({"x": 1, "9": None}, {"bad": object()}), {})
+
+    def test_closed_period_offline_room_gets_ordered_by_real_time(self):
+        """关闭期间下播的房间：修前落「无记录」档，修后按真实下播时间就位。"""
+        now = 1_000_000.0
+        states = {11: "直播中", 22: "未开播", 33: "未开播", 44: "未开播"}
+        live_since = {11: now - 3600}
+        local = {22: now - 1800, 44: now - 300}  # 观测到的关播 + 退出时的估算
+        remote = {33: now - 600}                 # 关闭期间下播：只有接口能给
+        before = order_room_ids(BASE, "status", live_states=states,
+                                live_since=live_since, offline_at=local)
+        after = order_room_ids(BASE, "status", live_states=states, live_since=live_since,
+                               offline_at=merge_offline_marks(local, remote))
+        self.assertEqual(before, [11, 44, 22, 33], "33 无记录时应排最后（修前行为）")
+        self.assertEqual(after, [11, 44, 33, 22], "33 应按真实下播时间插到 22 之前")
+
+    def test_exit_writes_offline_estimate(self):
+        """退出时给「此刻仍在直播」的房间写估算下播时刻，并落盘（两版都要）。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                node = _method(_module_tree(module), cls, "_record_shutdown_offline_estimate")
+                self.assertIn("_offline_at", _attr_names(node), "未写入下播时刻")
+                self.assertIn("直播中", _consts(node), "未限定「仍在直播中」的房间")
+                self.assertIn("_save_config", _called_attrs(node), "估算值未落盘")
+
+    def test_following_fetch_wired_into_both_hosts(self):
+        """启动与切到「按直播状态」时都要抓；拿到值要触发重排（两版）。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                tree = _module_tree(module)
+                for trigger in ("_on_hub_ready", "_on_sort_mode_changed"):
+                    node = _method(tree, cls, trigger)
+                    self.assertIn("_refresh_following_marks", _called_attrs(node),
+                                  f"{trigger} 未抓取真实下播时刻")
+                fetch = _method(tree, cls, "_refresh_following_marks")
+                self.assertIn("FOLLOWING_REFRESH_COOLDOWN_S", _names(fetch), "未做冷却节流")
+                self.assertIn("status", _consts(fetch), "未限定只在「按直播状态」下抓")
+                self.assertIn("logged_in", _consts(fetch), "未检查登录态（接口需要）")
+                loader = _method(tree, cls, "_async_load_following_marks")
+                self.assertIn("get_following_live_marks", _called_attrs(loader))
+                handler = _method(tree, cls, "_on_following_marks")
+                self.assertIn("_remote_offline_at", _attr_names(handler))
+                self.assertIn("_sort_dirty", _attr_names(handler), "拿到值后未触发重排")
+
+    def test_sorting_uses_merged_marks(self):
+        for module, cls, method in (("gui_app.py", "ScMonitorApp", "_sorted_room_ids"),
+                                    ("qt_app.py", "QtScMonitorApp", "_refresh_display_order")):
+            with self.subTest(module=module):
+                node = _method(_module_tree(module), cls, method)
+                self.assertIn("merge_offline_marks", _names(node), "排序未用合并后的下播时刻")
+                self.assertIn("_remote_offline_at", _attr_names(node))
+
+    def test_api_endpoint_and_paging(self):
+        tree = _module_tree("api.py")
+        self.assertIn(FOLLOWING_URL, _consts(tree), "关注列表接口地址缺失")
+        fetch = _method(tree, "BilibiliLiveAPI", "get_following_live_marks")
+        self.assertIn("parse_following_live_marks", _names(fetch), "未复用解析函数")
+        self.assertIn("FOLLOWING_PAGE_SIZE", _names(fetch), "未按实测页大小翻页")
+        self.assertIn("FOLLOWING_MAX_PAGES", _names(fetch), "未限制最多翻多少页")
 
 
 if __name__ == "__main__":

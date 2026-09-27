@@ -80,11 +80,14 @@ from .client import LIVE_STATUS_TEXT, RoomClient
 from .cookie_server import DEFAULT_COOKIE_PORT, wait_for_extension_cookie
 from .gui_app import (
     EMOTICON_REFRESH_COOLDOWN_S,
+    FOLLOWING_REFRESH_COOLDOWN_S,
     MEDAL_AUTO_INTERVAL_MS,
     PANE_RATIO,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    emoticon_packages_signature,
     format_live_mark,
+    merge_offline_marks,
     order_room_ids,
     parse_add_input,
     restore_live_marks,
@@ -795,6 +798,11 @@ class QtScMonitorApp(QMainWindow):
         #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
+        # 关注列表给出的**真实下播时刻**（ROADMAP 97，仅本次运行有效）：程序关闭期间下播的
+        # 房间收不到关播信号，只能靠它排序；与 _offline_at 合并时取较晚的那个。
+        self._remote_offline_at: Dict[int, float] = {}
+        self._following_fetched_at = 0.0  # 上次抓关注列表的时间(monotonic)，冷却用
+        self._offline_estimate_done = False  # 退出时的「下播时刻估算」是否已落盘
         self._sort_dirty = False  # 「按直播状态」有房间状态变了、待本轮轮询末尾统一重排
 
         self.client_states: Dict[int, str] = {}
@@ -1416,6 +1424,33 @@ class QtScMonitorApp(QMainWindow):
             all_enabled = all(self.entries[r].enabled for r in valid)
             self.toggle_btn.setText("停用监听" if all_enabled else "开启监听")
 
+    def _remember_selected_room(self, room_id: Optional[int]) -> None:
+        """记住当前选中的直播间（`ui.selected_room`，ROADMAP 98）——下次启动自动选中它。
+
+        只在值真的变化时落盘：启动恢复与程序化选行也会走到这里，值没变就不必重写配置。
+        """
+        value = int(room_id) if room_id is not None else 0
+        if self.ui_prefs.get("selected_room") == value:
+            return
+        self.ui_prefs["selected_room"] = value
+        self._save_config()
+
+    def _startup_room_id(self) -> Optional[int]:
+        """启动时该选中哪个房间（ROADMAP 98）：上次退出时选中的那个。
+
+        **仍在房间列表里才算数**（配置里的房间可能已被删除）；没记住 / 已删除返回 ``None``，
+        由调用方回退成**显示顺序的第一行**。
+        """
+        remembered = int(self.ui_prefs.get("selected_room") or 0)
+        if remembered and remembered in self.entries:
+            log_room.debug("启动时恢复上次选中的直播间 %s（%s）", remembered,
+                           self.anchor_names.get(remembered, "未知主播"))
+            return remembered
+        log_room.debug("未恢复上次选中的直播间（%s），改为选中显示顺序的第一行",
+                       "配置里没记住" if not remembered
+                       else f"{remembered} 已不在房间列表里")
+        return None
+
     def _on_room_selected(self) -> None:
         self._flush_note()  # 先把备注写回它所属的房间，再切换
         room_id = self._get_selected_room_id()
@@ -1427,6 +1462,7 @@ class QtScMonitorApp(QMainWindow):
         self._refresh_buttons()
         if room_id is None:
             self._selected_room_id = None
+            self._remember_selected_room(None)  # ROADMAP 98：无选中 → 下次启动回退第一行
             self.sc_panel.clear_view()
             self._clear_dm_view()
             self._apply_dm_gate()
@@ -1435,6 +1471,7 @@ class QtScMonitorApp(QMainWindow):
         if room_id == self._selected_room_id:
             return
         self._selected_room_id = room_id
+        self._remember_selected_room(room_id)  # ROADMAP 98：下次启动自动选中它
         self._sync_note_display(room_id)
         # SC 区（头部 / 累计 / 历史）由视图自己刷新：主视图跟随选中房间
         self.sc_panel.apply_room(room_id)
@@ -1984,6 +2021,7 @@ class QtScMonitorApp(QMainWindow):
         self.ui_prefs["sort_mode"] = mode
         self._apply_sort()
         self._save_config()
+        self._refresh_following_marks("切换到「按直播状态」")  # ROADMAP 97：真实下播时刻
         # 「ⓘ」的悬浮说明跟着方案走（点击弹出的完整说明见 _show_sort_help）
         self.sort_info_btn.setToolTip(self._sort_help_text())
         table = getattr(self, "table", None)
@@ -1992,6 +2030,80 @@ class QtScMonitorApp(QMainWindow):
         log_room.info("排序方案切换为「%s」（%s）", SORT_MODE_TEXTS.get(mode, mode),
                       "可拖动调整" if mode == "manual" else "由规则自动排序")
 
+    # ---------- 排序：真实下播时刻（ROADMAP 97）----------
+
+    def _refresh_following_marks(self, reason: str) -> None:
+        """按需抓「我关注的 UP」列表里的**真实下播时刻**（ROADMAP 97）。
+
+        只在「按直播状态」排序下才有意义（其它方案不用下播时刻）；受
+        ``FOLLOWING_REFRESH_COOLDOWN_S`` 冷却限制，未登录直接跳过（该接口需要登录态）。
+        """
+        if self._sort_mode() != "status":
+            log_data.debug("跳过关注列表抓取：当前不是「按直播状态」排序（%s）", reason)
+            return
+        api = self.hub.api
+        if api is None or not getattr(api, "logged_in", False):
+            log_data.debug("跳过关注列表抓取：后台未就绪或未登录（该接口需要登录态）")
+            return
+        now = time.monotonic()
+        if now - self._following_fetched_at < FOLLOWING_REFRESH_COOLDOWN_S:
+            log_data.debug("跳过关注列表抓取：距上次 %.0f 秒，未到 %.0f 秒冷却（%s）",
+                           now - self._following_fetched_at,
+                           FOLLOWING_REFRESH_COOLDOWN_S, reason)
+            return
+        self._following_fetched_at = now
+        log_data.debug("抓取关注列表的下播时刻（%s）", reason)
+        self.hub.submit(self._async_load_following_marks())
+
+    async def _async_load_following_marks(self) -> None:
+        api = self.hub.api
+        if api is None:
+            return
+        marks = await api.get_following_live_marks(wanted=set(self.entries))
+        self.ui_queue.put(("following", {"marks": marks}))
+
+    def _on_following_marks(self, payload: dict) -> None:
+        """关注列表结果到达：更新排序用的下播时刻（只留我们监听的房间）。"""
+        marks: Dict[int, float] = {}
+        for room_id, moment in (payload.get("marks") or {}).items():
+            try:
+                key = int(room_id)
+                if key in self.entries:
+                    marks[key] = float(moment)
+            except (TypeError, ValueError):
+                continue
+        if not marks:
+            log_room.debug("关注列表没有给出可用的下播时刻（这些房间没被关注 / 未登录 / 抓取失败），"
+                           "仍按本地观测与退出估算排序")
+        if marks == self._remote_offline_at:
+            return
+        self._remote_offline_at = marks
+        log_room.debug("关注列表给出 %d 个监听房间的真实下播时刻（供「按直播状态」排序）",
+                       len(marks))
+        if self._sort_mode() == "status":
+            self._sort_dirty = True  # 交给本轮轮询末尾统一重排（与其它重排路径一致）
+
+    def _record_shutdown_offline_estimate(self) -> None:
+        """退出时给「此刻仍在直播」的房间记一个下播时刻（＝退出时刻，ROADMAP 97）。
+
+        程序关闭期间下播的房间收不到关播信号，重启后既无开播也无下播记录，在「按直播状态」
+        排序里会掉进「无记录」那一档；记下「最后一次确认它还在直播」的时刻，重启后就有序可排
+        （比真实下播时刻略早，但相对先后是对的）。之后若从关注列表拿到真实下播时刻，会取较晚
+        的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，24 小时内有效）。
+        """
+        if self._offline_estimate_done:
+            return
+        self._offline_estimate_done = True
+        now = time.time()
+        rooms = [int(room_id) for room_id, state in self.live_state.items()
+                 if state == "直播中" and room_id in self.entries]
+        for room_id in rooms:
+            self._offline_at[room_id] = now
+        if rooms:
+            log_room.debug("退出时记录 %d 个仍在直播的房间的下播时刻（估算，供重启后排序）：%s",
+                           len(rooms), sorted(rooms))
+            self._save_config()
+
     def _refresh_display_order(self) -> None:
         """按当前方案重算 ``_room_order``（显示顺序）；``_custom_order`` 不受影响。"""
         mode = self._sort_mode()
@@ -1999,7 +2111,8 @@ class QtScMonitorApp(QMainWindow):
         self._room_order = order_room_ids(
             [r for r in self._custom_order if r in self.entries], mode,
             live_states=self.live_state, anchor_names=self.anchor_names,
-            live_since=self.live_started_at, offline_at=self._offline_at)
+            live_since=self.live_started_at,
+            offline_at=merge_offline_marks(self._offline_at, self._remote_offline_at))
 
     def _apply_sort(self) -> None:
         """重算显示顺序并重建行。
@@ -2397,12 +2510,22 @@ class QtScMonitorApp(QMainWindow):
                 elif kind == "dm_send_result":
                     for panel in self.dm_panels_for(item[1].get("room_id")):
                         panel.on_dm_send_result(item[1])
+                elif kind == "following":
+                    self._on_following_marks(item[1])  # ROADMAP 97：真实下播时刻
                 elif kind == "emoticons":
                     payload = item[1]
                     packages = payload.get("packages") or []
                     # 刷新失败（或确实为空）时保留上次结果，不把已有表情包清空
                     if packages:
-                        self._emoticons[int(payload.get("room_id") or 0)] = packages
+                        package_room = int(payload.get("room_id") or 0)
+                        previous = self._emoticons.get(package_room)
+                        if (previous is not None
+                                and emoticon_packages_signature(previous)
+                                != emoticon_packages_signature(packages)):
+                            log_data.info("房间 %s 的可用表情包已更新：%d → %d 个"
+                                          "（粉丝灯牌升级等可能解锁新表情包）",
+                                          package_room, len(previous), len(packages))
+                        self._emoticons[package_room] = packages
                     for panel in self.dm_panels_for(payload.get("room_id")):
                         panel.on_emoticons(payload)
                 elif kind == "emoticon_image":
@@ -2739,8 +2862,15 @@ class QtScMonitorApp(QMainWindow):
                 # 停用监听的房间不建立连接：补一次只读查询填主播名与直播标题
                 self.hub.submit(self._async_fetch_room_info(room_id))
         self._refresh_all_rows()
+        self._refresh_following_marks("后台就绪")  # ROADMAP 97：启动即补齐真实下播时刻
         if self.entries and self._selected_room_id is None:
-            self._select_room(next(iter(self.entries)))
+            target = self._startup_room_id()  # ROADMAP 98：优先上次退出时选中的房间
+            if target is None:
+                # 回退：**显示顺序**的第一行（此前取的是 entries 的第一个＝自定义排序第一间，
+                # 与 Tk 版的「显示顺序第一行」不一致：排序切到「按直播状态」时会选中不同房间）
+                order = [room for room in self._room_order if room in self.entries]
+                target = order[0] if order else next(iter(self.entries))
+            self._select_room(target)
         elif self._selected_room_id is not None:
             self.sc_panel.load_history(self._selected_room_id)
         self._apply_dm_gate()
@@ -3148,9 +3278,16 @@ class QtScMonitorApp(QMainWindow):
         refresh()
         dialog.exec()
 
-    def remember_emoticon_page(self, room_id: int, index: int, name: str) -> None:
-        """记住某房间停留的表情包（翻到哪一页即写入，与 Tk 版一致）。"""
-        memory = {"index": max(0, int(index)), "name": str(name or "")}
+    def remember_emoticon_page(self, room_id: int, index: int, name: str,
+                               pkg_id: int = 0) -> None:
+        """记住某房间停留的表情包（翻到哪一页即写入，与 Tk 版一致）。
+
+        一并记住**包 id**（写入 `gui_rooms.json` 的 `emoticon` 段）：实测一个房间能有 9 个
+        包都叫「装扮表情」，只按包名找回时永远落在第一个同名包上（见
+        `qt_dm_panel._find_package_page`）；老配置没有该键时按 0 处理，等价于退回按包名找。
+        """
+        memory = {"index": max(0, int(index)), "name": str(name or ""),
+                  "id": max(0, int(pkg_id or 0))}
         if self._emoticon_memory.get(room_id) == memory:
             return
         self._emoticon_memory[room_id] = memory
@@ -3163,6 +3300,9 @@ class QtScMonitorApp(QMainWindow):
             return
         # 记住窗口尺寸：下次启动恢复（Tk 版不使用该键，只原样写回）
         self.ui_prefs["window_size"] = [self.width(), self.height()]
+        # ROADMAP 97：此刻仍在直播的房间记一个「下播时刻」估算（＝退出时刻），
+        # 供下次启动时「按直播状态」排序使用（函数内部会落盘，无变化则跳过）
+        self._record_shutdown_offline_estimate()
         self._save_config()
         log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self._room_order))
         self._window_size_log.flush()    # 退出前把待写的窗口尺寸变化补上

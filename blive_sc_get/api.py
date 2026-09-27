@@ -13,7 +13,7 @@ import re
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 
@@ -196,6 +196,13 @@ LIKE_INTERACT_URL = (
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 HOMEPAGE_URL = "https://www.bilibili.com/"
 BUVID_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+FOLLOWING_URL = "https://api.live.bilibili.com/xlive/web-ucenter/user/following"
+
+FOLLOWING_PAGE_SIZE = 20
+"""关注列表每页条数（实测 20 有效；再大（如 50）会被服务端按 10 条处理）。"""
+
+FOLLOWING_MAX_PAGES = 50
+"""关注列表最多翻多少页（20 条/页 → 1000 个关注），避免关注很多时无限翻页。"""
 
 LIVE_STARTED_AT_KEY = "live_started_at"
 """归一化后的开播时刻（epoch 秒）写在房间信息 dict 的这个键上。
@@ -252,6 +259,35 @@ def parse_live_started_at(raw: object, *, now: Optional[float] = None) -> Option
     if moment > current + LIVE_STARTED_FUTURE_TOLERANCE_S:
         return None  # 超出时钟偏差的「未来开播」必是异常数据
     return int(moment)
+
+
+def parse_following_live_marks(data: Any) -> Dict[int, int]:
+    """关注列表响应 → ``{房间号: 上次直播结束时刻(epoch 秒)}``（纯函数，供 ROADMAP 97 排序用）。
+
+    实测字段（与社区文档 `bilibili-API-collect · 关注 UP 直播情况` 一致）：``data.list[]``
+    每项含 ``roomid`` / ``live_status``（0 未开播、1 直播中、2 轮播中）/ ``record_live_time``
+    —— **主播上一次直播结束的时间戳**，正在直播时该字段为 0。
+
+    只收「当前**不在**直播中、且时间戳为正」的项：正在直播时该字段为 0，若一并收下，
+    会把正在直播的房间也塞进「已下播」组参与排序。缺失 / 脏数据一律跳过，不抛异常。
+    """
+    items = data.get("list") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return {}
+    marks: Dict[int, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            room_id = int(item.get("roomid") or 0)
+            status = int(item.get("live_status") or 0)
+            ended = int(item.get("record_live_time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not room_id or status == 1 or ended <= 0:
+            continue  # 1 = 直播中（此时 record_live_time 为 0，不能当「已下播」）
+        marks[room_id] = ended
+    return marks
 
 
 MEDAL_PANEL_PAGE_SIZE = 10
@@ -1063,6 +1099,49 @@ class BilibiliLiveAPI:
             logger.debug("获取直播间表情失败 room=%s: code=%s", room_id, data.get("code"))
             return []
         return parse_room_emoticon_packages(data.get("data"))
+
+    async def get_following_live_marks(self, wanted: Optional[Set[int]] = None) -> Dict[int, int]:
+        """抓「我关注的 UP」列表，取出各主播**上次直播结束时刻**（ROADMAP 97）。
+
+        为什么不用别的来源（均实测）：未开播时 `room/v1/Room/get_info` 的 `live_time` 是
+        占位值 `0000-00-00 00:00:00`、`getH5InfoByRoom` 的 `room_info.live_start_time` 与
+        `getRoomPlayInfo` 的 `live_time` 都是 0，几个「历史场次 / 回放 / 直播统计」候选接口
+        全部 404；关注列表里的 `record_live_time` 是目前唯一能给出**真实下播时刻**的公开来源。
+
+        限制与代价：只能查**本账号关注的主播**（未关注的房间查不到）；一次要翻若干页
+        （20 条/页，实测 600 条约 3.5 秒），因此 `wanted` 传入关心的房间号，全部找到即提前收工。
+        未登录 / 请求失败一律返回空字典（尽力而为，绝不阻塞界面）。
+        """
+        wanted_set = {int(room_id) for room_id in wanted} if wanted else set()
+        marks: Dict[int, int] = {}
+        if not self._cookie:
+            logger.debug("未登录，跳过「上次直播结束时刻」（关注列表接口需要登录态）")
+            return marks
+        pages = 0
+        for page in range(1, FOLLOWING_MAX_PAGES + 1):
+            try:
+                payload = await self._get_json(FOLLOWING_URL, {
+                    "page": page, "page_size": FOLLOWING_PAGE_SIZE,
+                    "ignoreRecord": 1, "hit_ab": "true"})
+            except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
+                logger.debug("获取关注列表失败（第 %s 页）：%s", page, exc)
+                break
+            if payload.get("code") != 0:
+                logger.debug("获取关注列表失败（第 %s 页）：code=%s message=%s",
+                             page, payload.get("code"), payload.get("message"))
+                break
+            data = payload.get("data") or {}
+            items = data.get("list") or []
+            pages = page
+            marks.update(parse_following_live_marks(data))
+            if len(items) < FOLLOWING_PAGE_SIZE:
+                break  # 最后一页
+            if wanted_set and wanted_set <= set(marks):
+                logger.debug("关注列表已翻 %d 页，关心的 %d 个房间都已拿到下播时刻",
+                             page, len(wanted_set))
+                break
+        logger.info("关注列表给出 %d 个主播的上次直播结束时刻（翻 %d 页）", len(marks), pages)
+        return marks
 
     async def send_danmaku(self, room_id: int, msg: str, *, mode: int = 1,
                            color: int = 16777215, fontsize: int = 25,

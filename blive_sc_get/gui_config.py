@@ -74,6 +74,9 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     "quick_dm_send_now": False,
     # window_size：上次退出时的窗口尺寸 [宽, 高]（逻辑像素）；[0, 0] 表示尚未记忆
     "window_size": [0, 0],
+    # selected_room：上次退出时选中的直播间号（ROADMAP 98）；0 = 没记住。
+    # 下次启动自动选中它（房间已被删除时回退成「显示顺序的第一行」）。
+    "selected_room": 0,
     # room_windows：房间独立窗口（ROADMAP 84）的位置尺寸记忆，
     # {"<房间号>": {"x": .., "y": .., "width": .., "height": ..}}；只记几何，不记「是否打开」
     "room_windows": {},
@@ -198,9 +201,12 @@ def save_room_entries(path: Union[str, Path], entries: Iterable[RoomEntry],
 def load_emoticon_memory(path: Union[str, Path]) -> Dict[int, Dict[str, object]]:
     """读取每个直播间上次浏览的表情包记忆。
 
-    结构为 ``{"emoticon": {"<房间号>": {"index": 序号, "name": 包名}}}``，返回
-    ``{房间号: {"index": int, "name": str}}``（序号非负）；文件缺失、损坏或字段
-    非法时按空处理，不抛异常。
+    结构为 ``{"emoticon": {"<房间号>": {"index": 序号, "name": 包名, "id": 包 id}}}``，
+    返回 ``{房间号: {"index": int, "name": str, "id": int}}``（序号与 id 均非负）；文件
+    缺失、损坏或字段非法时按空处理，不抛异常。
+
+    ``id`` 用来区分**同名包**——实测一个房间能有 9 个包都叫「装扮表情」，只按包名找会
+    永远落回第一个；老配置没有该键时按 0 处理（等于退回按包名/序号找）。
     """
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -218,7 +224,12 @@ def load_emoticon_memory(path: Union[str, Path]) -> Dict[int, Dict[str, object]]
             index = int(item.get("index") or 0)
         except (TypeError, ValueError):
             continue
-        memory[room_id] = {"index": max(0, index), "name": str(item.get("name") or "")}
+        try:
+            pkg_id = int(item.get("id") or 0)
+        except (TypeError, ValueError):
+            pkg_id = 0
+        memory[room_id] = {"index": max(0, index), "name": str(item.get("name") or ""),
+                           "id": max(0, pkg_id)}
     return memory
 
 
@@ -290,6 +301,21 @@ def format_live_mark(moment: Optional[float]) -> str:
         return "—"
 
 
+def parse_selected_room(raw: object) -> int:
+    """解析 ``ui.selected_room``（上次退出时选中的直播间号，ROADMAP 98）；非法一律 0。
+
+    ``0`` 表示「没记住」，启动时回退成选中列表第一行。**恢复时必须再核对一次房间还在不在**：
+    配置里的房间号可能早就被删了，直接拿去选会点到不存在的行（Tk 会静默失败、Qt 会什么都不选）。
+    """
+    if isinstance(raw, bool):  # bool 是 int 的子类，先挡掉
+        return 0
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     """读取界面偏好；文件缺失/损坏/缺少字段时返回默认值。"""
     prefs = dict(DEFAULT_UI_PREFS)
@@ -321,4 +347,6 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     # 「按直播状态」排序的时间基准（ROADMAP 87）：重启后据此恢复上次的先后顺序
     prefs["live_started_at"] = parse_room_time_map(ui.get("live_started_at"))
     prefs["live_offline_at"] = parse_room_time_map(ui.get("live_offline_at"))
+    # 上次退出时选中的直播间（ROADMAP 98）：下次启动自动选中它
+    prefs["selected_room"] = parse_selected_room(ui.get("selected_room"))
     return prefs

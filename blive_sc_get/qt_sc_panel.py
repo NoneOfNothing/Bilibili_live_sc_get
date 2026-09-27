@@ -19,9 +19,9 @@ import logging
 import threading
 import time
 import webbrowser
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
@@ -31,6 +31,7 @@ from .gui_app import (
     SC_TITLE_MAX_LEN,
     build_sc_segments,
     live_duration_text,
+    scroll_value_for_anchor,
     unseen_badge_text,
 )
 from .log_categories import CATEGORY_DATA, get_logger
@@ -56,6 +57,10 @@ _UID_KEY = 0x102
 
 SC_AT_BOTTOM_TOLERANCE = 4
 """滚动条距底部多少像素以内视为「吸底」。"""
+
+SC_HISTORY_MARKER_PREFIX = "（已读取"
+"""历史分页状态行（「（已读取共 x 条…）」）的开头：翻页时要把旧的那条删掉，只留最上面
+一条（与 Tk 版每次翻页先 ``delete("1.0", "2.0")`` 再写新标记同一意图）。"""
 
 
 class ScPanel(QWidget):
@@ -225,6 +230,8 @@ class ScPanel(QWidget):
         self._loading_more = False
         self._loaded_count = skip + len(records)
         self._has_more = self._loaded_count < total
+        log_data.debug("历史 SC 读取完成：房间 %s，skip=%d，本页 %d 条，累计 %d/%d 条",
+                       room_id, skip, len(records), self._loaded_count, total)
         marker = self._history_marker(self._loaded_count, total)
         if skip == 0:
             self.clear_view()
@@ -237,10 +244,17 @@ class ScPanel(QWidget):
             self._prepend_info(marker)
             self._scroll_to_bottom()
             return
-        # 向上翻页：更早记录插在顶部
+        # 向上翻页：更早记录插在顶部，最终顺序与 Tk 版一致 ——
+        # [新标记][本页记录][（已读取 x 条历史记录）][旧内容…]
+        anchor = self._top_anchor()
+        self._drop_top_marker()  # 旧的顶部状态行删掉，只留最新一条
+        # 插入顺序＝最终顺序的倒序（都是往文档最前端插）：分割点先铺在旧内容顶上，
+        # 本页记录再插到它前面，最后放顶部状态行
+        self._prepend_info(f"（已读取 {skip} 条历史记录）")
         block = self._pack_records(records, deleted)
         self._prepend_block(block)
         self._prepend_info(marker)
+        self._restore_top_anchor(anchor)
 
     def _maybe_load_more(self) -> None:
         room_id = self.room_id
@@ -296,6 +310,68 @@ class ScPanel(QWidget):
         cursor.insertText(text + "\n", fmt)
         if follow:
             self._scroll_to_bottom()
+
+    def _drop_top_marker(self) -> None:
+        """删掉顶部的历史分页状态行（仅当它确实在顶部时才删）。
+
+        Tk 版每次翻页都先 ``delete("1.0", "2.0")`` 再写新标记；Qt 版此前「只插不删」，
+        翻几次页顶部就会叠上好几行「已读取共 x 条历史记录」，看着像出了错。
+        """
+        first = self.sc_text.document().begin()
+        if not first.isValid() or not first.text().startswith(SC_HISTORY_MARKER_PREFIX):
+            return
+        cursor = self.sc_text.textCursor()
+        cursor.setPosition(first.position())
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()  # 清空这一行的内容
+        if first.next().isValid():
+            cursor.deleteChar()  # 再吃掉块分隔符，让整行彻底消失（勿在末块上删）
+
+    def _top_anchor(self) -> Tuple[int, int]:
+        """记下「视口顶端那条记录」的文档位置与当时的字符总数（插入更早记录前调用）。
+
+        顶部若正好是分页状态行本身，就往下取到下一条记录再当锚点：那条状态行在翻页时
+        会被删掉重写，拿它当锚点位置会算偏（且新标记文本长度也会变），而用户眼睛盯着
+        的其实是它下面那条记录。
+        """
+        document = self.sc_text.document()
+        position = self.sc_text.cursorForPosition(QPoint(0, 0)).position()
+        block = document.findBlock(position)
+        if block.isValid() and block.text().startswith(SC_HISTORY_MARKER_PREFIX):
+            nxt = block.next()
+            if nxt.isValid():
+                position = nxt.position()
+        return (position, document.characterCount())
+
+    def _restore_top_anchor(self, anchor: Tuple[int, int]) -> None:
+        """把视图按「最小滚动」摆好，等价于 Tk 版 ``see(旧顶行 + 新增行数)``。
+
+        更早的记录是**插在文档最前端**的：Qt 插入内容后不会自己调整滚动条，视口仍停在
+        数值 0，于是直接显示了「整段历史的最开头」（刚加载那批里最早的一条）——这就是
+        ROADMAP 95 最初报的「触发时直接跳到了顶部」。
+
+        但**也不能把锚点钉在视口顶边**（第一版返工就是这么写的）：那样新加载的一整页
+        全落在视口上方、画面看起来和加载前**一模一样**，用户会以为「滚到顶没触发加载」。
+        Tk 的 ``see()`` 是**最小滚动**——目标行在视口下方时只把它带到**底边**，于是新加载
+        的那一页立刻填满视口（接缝停在底边，正好是用户想看的「从第 101 条开始」）。
+        这里照搬同一语义：锚点在视口下方 → 贴底边；在视口上方 → 贴顶边；已经在视口内
+        → 一点不动（避免无谓跳动）。
+
+        ``cursorRect`` 给的是**视口坐标**，加上当前滚动值即锚点在文档中的纵向位置。
+        """
+        position, chars_before = anchor
+        document = self.sc_text.document()
+        delta = document.characterCount() - chars_before
+        if delta <= 0:
+            return
+        cursor = self.sc_text.textCursor()
+        cursor.setPosition(min(position + delta, document.characterCount() - 1))
+        bar = self.sc_text.verticalScrollBar()
+        rect = self.sc_text.cursorRect(cursor)
+        bar.setValue(scroll_value_for_anchor(
+            rect.top(), rect.height(), self.sc_text.viewport().height(), bar.value()))
+        log_data.debug("历史翻页后视口：锚点行顶 %.0f、视口高 %d → 滚动条 %d",
+                       rect.top(), self.sc_text.viewport().height(), bar.value())
 
     def _prepend_info(self, text: str) -> None:
         cursor = self.sc_text.textCursor()

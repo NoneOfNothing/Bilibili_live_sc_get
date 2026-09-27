@@ -13,6 +13,7 @@ from blive_sc_get.api import (
     ApiError,
     BilibiliLiveAPI,
     describe_send_error,
+    parse_following_live_marks,
     parse_live_started_at,
     parse_room_emoticon_packages,
 )
@@ -151,10 +152,12 @@ from blive_sc_get.gui_app import (
     dm_trim_index,
     emoticon_display_size,
     emoticon_id_by_unique,
+    emoticon_package_id,
     emoticon_packages_signature,
     emoticon_tooltip_text,
     fit_emoticon_scale,
     parse_add_input,
+    scroll_value_for_anchor,
     select_dm_options,
     text_scrolled_to_bottom,
     tooltip_position,
@@ -314,6 +317,7 @@ class GuiConfigTests(unittest.TestCase):
                           "dm_emoticon_image": True,
                           "quick_dm_send_now": False,
                           "window_size": [0, 0],
+                          "selected_room": 0,
                           "room_windows": {},
                           "live_started_at": {}, "live_offline_at": {}})
         # 旧配置缺字段时的缺省值
@@ -355,6 +359,7 @@ class GuiConfigTests(unittest.TestCase):
                     "dm_emoticon_image": True,
                     "quick_dm_send_now": False,
                     "window_size": [0, 0],
+                    "selected_room": 0,
                     "room_windows": {},
                     "live_started_at": {}, "live_offline_at": {}}
         self.assertEqual(load_ui_prefs(self.tmp / "nope.json"), expected)
@@ -1193,7 +1198,8 @@ class EmoticonMemoryTests(unittest.TestCase):
         self.path = self.tmp / "gui_rooms.json"
 
     def test_roundtrip_with_rooms_and_ui(self):
-        memory = {1: {"index": 2, "name": "房间专属"}, 2: {"index": 0, "name": ""}}
+        memory = {1: {"index": 2, "name": "房间专属", "id": 228},
+                  2: {"index": 0, "name": "", "id": 0}}
         save_room_entries(self.path, [RoomEntry(1), RoomEntry(2)],
                           ui={"sort_mode": "manual"},
                           emoticon=memory)
@@ -1204,7 +1210,7 @@ class EmoticonMemoryTests(unittest.TestCase):
         self.assertEqual(prefs["sort_mode"], "manual")
 
     def test_other_saves_do_not_drop_memory(self):
-        memory = {7: {"index": 3, "name": "粉丝团"}}
+        memory = {7: {"index": 3, "name": "粉丝团", "id": 345}}
         save_room_entries(self.path, [RoomEntry(7)], ui={}, emoticon=memory)
         # 不传 emoticon 的其他保存动作（改备注、排序等）不应抹掉记忆
         save_room_entries(self.path, [RoomEntry(7, note="备注")],
@@ -1229,9 +1235,31 @@ class EmoticonMemoryTests(unittest.TestCase):
             ' "3": 5, "4": {"index": -1}, "5": {"name": "只有名字"}}}',
             encoding="utf-8")
         self.assertEqual(load_emoticon_memory(self.path), {
-            1: {"index": 2, "name": ""},
-            4: {"index": 0, "name": ""},
-            5: {"index": 0, "name": "只有名字"},
+            1: {"index": 2, "name": "", "id": 0},
+            4: {"index": 0, "name": "", "id": 0},
+            5: {"index": 0, "name": "只有名字", "id": 0},
+        })
+
+    def test_package_id_is_kept_and_old_configs_default_to_zero(self):
+        """包 id 要能存能读：一个房间可能有 9 个同名「装扮表情」，只能靠 id 区分。
+
+        老配置没有 ``id`` 键（或值是脏数据）时按 0 处理，等价于退回按包名/序号找。
+        """
+        memory = {1: {"index": 4, "name": "装扮表情", "id": 228},
+                  2: {"index": 5, "name": "装扮表情", "id": 345},
+                  3: {"index": 0, "name": "emoji", "id": 100}}
+        save_room_entries(self.path, [RoomEntry(i) for i in (1, 2, 3)],
+                          ui={}, emoticon=memory)
+        self.assertEqual(load_emoticon_memory(self.path), memory)
+        self.path.write_text(
+            '{"emoticon": {"1": {"index": 4, "name": "装扮表情", "id": "228"},'
+            ' "2": {"index": 5, "name": "装扮表情", "id": "坏值"},'
+            ' "3": {"index": 0, "name": "装扮表情", "id": -7}}}',
+            encoding="utf-8")
+        self.assertEqual(load_emoticon_memory(self.path), {
+            1: {"index": 4, "name": "装扮表情", "id": 228},
+            2: {"index": 5, "name": "装扮表情", "id": 0},
+            3: {"index": 0, "name": "装扮表情", "id": 0},
         })
 
 
@@ -1264,6 +1292,20 @@ class EmoticonPackagesSignatureTests(unittest.TestCase):
         self.assertEqual(emoticon_packages_signature(["bad", 1]), empty)
         self.assertEqual(emoticon_packages_signature([{"name": "x"}]),
                          ((None, "x", ()),))
+
+
+class EmoticonPackageIdTests(unittest.TestCase):
+    """表情包 id 的安全取法：实测一个房间有 9 个同名「装扮表情」，只能靠 id 区分。"""
+
+    def test_reads_id_from_package(self):
+        self.assertEqual(emoticon_package_id({"id": 228, "name": "装扮表情"}), 228)
+        self.assertEqual(emoticon_package_id({"id": "345"}), 345)
+
+    def test_missing_or_bad_id_is_zero(self):
+        for bad in ({}, {"name": "装扮表情"}, {"id": None}, {"id": ""}, {"id": "坏值"},
+                    {"id": -7}, None, "not-a-dict", 5):
+            with self.subTest(bad=bad):
+                self.assertEqual(emoticon_package_id(bad), 0)
 
 
 class LiveSignalInterruptWiringTests(unittest.TestCase):
@@ -1528,6 +1570,57 @@ class DanmakuGateTests(unittest.TestCase):
             self.assertFalse(client.set_danmaku_enabled(True), "重复设置不应报告变化")
             self.assertTrue(client.set_danmaku_enabled(False))
             self.assertFalse(client.set_danmaku_enabled(False))
+
+
+class ScrollValueForAnchorTests(unittest.TestCase):
+    """SC 翻页后的视口摆放：照 Tk ``see()`` 的最小滚动（ROADMAP 95 返工点）。
+
+    贴**底边**才能让新加载的那一页立刻填满视口（用户要的「从第 101 条开始」）；
+    贴顶边会让新内容全落在视口上方、画面看起来毫无变化（曾被误认为「没触发加载」）。
+    """
+
+    def test_anchor_below_viewport_goes_to_bottom_edge(self):
+        # 视口 220 高、行高 15：锚点在第 300 行位置（视口下方）→ 贴底边、露出 205px 新内容
+        self.assertEqual(scroll_value_for_anchor(300, 15, 220, 0), 300 - (220 - 15))
+        self.assertEqual(scroll_value_for_anchor(300, 15, 220, 1000), 1000 + 300 - 205)
+
+    def test_anchor_above_viewport_goes_to_top_edge(self):
+        self.assertEqual(scroll_value_for_anchor(-40, 15, 220, 500), 460)
+
+    def test_anchor_inside_viewport_keeps_scroll(self):
+        self.assertEqual(scroll_value_for_anchor(0, 15, 220, 500), 500)
+        self.assertEqual(scroll_value_for_anchor(100, 15, 220, 500), 500)
+        self.assertEqual(scroll_value_for_anchor(205, 15, 220, 500), 500)
+
+    def test_bad_sizes_do_not_crash(self):
+        self.assertEqual(scroll_value_for_anchor(300, 0, 0, 0), 300)
+        self.assertEqual(scroll_value_for_anchor(0, 0, 0, 7), 7)
+
+
+class ParseFollowingLiveMarksTests(unittest.TestCase):
+    """关注列表 → 各主播「上次直播结束时刻」（ROADMAP 97 的真实下播时间来源）。"""
+
+    def test_keeps_only_offline_items_with_time(self):
+        payload = {"list": [
+            {"roomid": 1, "live_status": 0, "record_live_time": 1790487203},
+            {"roomid": 2, "live_status": 1, "record_live_time": 0},
+            {"roomid": 3, "live_status": 1, "record_live_time": 1790487000},
+            {"roomid": 4, "live_status": 2, "record_live_time": 1790486000},
+        ]}
+        self.assertEqual(parse_following_live_marks(payload),
+                         {1: 1790487203, 4: 1790486000})
+
+    def test_skips_bad_rows_and_bad_input(self):
+        payload = {"list": [
+            {"roomid": 0, "live_status": 0, "record_live_time": 1790487000},
+            {"roomid": 5, "live_status": 0, "record_live_time": "坏值"},
+            {"roomid": 6, "live_status": 0},
+            "not-a-dict",
+        ]}
+        self.assertEqual(parse_following_live_marks(payload), {})
+        for bad in (None, {}, {"list": "x"}, {"list": None}, []):
+            with self.subTest(bad=bad):
+                self.assertEqual(parse_following_live_marks(bad), {})
 
 
 if __name__ == "__main__":

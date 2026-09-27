@@ -61,6 +61,7 @@ from .gui_app import (
     danmaku_send_guard,
     dm_trim_index,
     emoticon_from_packages,
+    emoticon_package_id,
     emoticon_packages_signature,
     emoticon_tooltip_text,
     merge_quick_danmaku,
@@ -84,6 +85,12 @@ DANMAKU_MAX_LEN = 20
 DM_SEND_COOLDOWN = 2.0
 AT_BOTTOM_TOLERANCE = 4
 """滚动条距底部多少像素以内视为「吸底」（与 qt_app.SC_AT_BOTTOM_TOLERANCE 一致）。"""
+
+EMOTICON_LOADING_HINT = "（正在加载该直播间的表情包…）"
+"""表情面板已展开、但本房间的表情包还没拿到时的提示（此前会留着上一个房间的列表）。"""
+
+EMOTICON_EMPTY_HINT = "该直播间暂无可用专属表情（需已登录，且账号在该房间有可用表情）"
+"""该房间确实没有可用表情时的提示（文案与 Tk 版一致）。"""
 
 
 class BottomHoldTextEdit(QTextEdit):
@@ -389,18 +396,19 @@ class DmPanel(QWidget):
         v.setContentsMargins(6, 4, 6, 4)
 
         bar = QHBoxLayout()
-        prev = QPushButton("◀")
-        prev.setFixedWidth(32)
-        prev.clicked.connect(self._on_emoticon_prev_page)
-        bar.addWidget(prev)
+        # 左右翻页箭头：首尾要能置灰（与 Tk 版一致），故存成属性
+        self.emoticon_prev_btn = QPushButton("◀")
+        self.emoticon_prev_btn.setFixedWidth(32)
+        self.emoticon_prev_btn.clicked.connect(self._on_emoticon_prev_page)
+        bar.addWidget(self.emoticon_prev_btn)
         self.emoticon_pkg_box = QComboBox()
         self.emoticon_pkg_box.currentIndexChanged.connect(
             self._on_emoticon_pkg_selected)
         bar.addWidget(self.emoticon_pkg_box, 1)
-        nxt = QPushButton("▶")
-        nxt.setFixedWidth(32)
-        nxt.clicked.connect(self._on_emoticon_next_page)
-        bar.addWidget(nxt)
+        self.emoticon_next_btn = QPushButton("▶")
+        self.emoticon_next_btn.setFixedWidth(32)
+        self.emoticon_next_btn.clicked.connect(self._on_emoticon_next_page)
+        bar.addWidget(self.emoticon_next_btn)
         self.emoticon_page_var = QLabel("")
         self.emoticon_page_var.setStyleSheet("color:#666; font-size: 11px")
         bar.addWidget(self.emoticon_page_var)
@@ -1335,7 +1343,14 @@ class DmPanel(QWidget):
     # ---------- 表情面板 ----------
 
     def toggle_emoticon_panel(self) -> None:
-        """展开/收起表情面板（懒加载：首次展开时才向后端请求，与 Tk 版一致）。"""
+        """展开/收起表情面板（懒加载：首次展开时才向后端请求，与 Tk 版一致）。
+
+        展开时**先用宿主缓存渲染**本房间的表情包（Tk 版同样如此，见
+        ``gui_app._on_open_emoticons``）：刷新请求可能被 30 秒冷却挡下
+        （``request_room_packages`` 直接 return、也不发事件），不先取缓存的话面板会继续
+        显示**上一个房间**的表情包——那是「列表与实际不一致」的另一条来源。宿主里还没有
+        该房间的缓存时清掉旧内容并提示正在加载，而不是留着上一份列表。
+        """
         if self._emoticon_visible:
             self.hide_emoticon_panel()
             return
@@ -1350,6 +1365,7 @@ class DmPanel(QWidget):
         self._emoticon_panel_room = room_id
         log_window.debug("展开表情面板（房间 %s）", room_id)
         self.emoticon_panel.setVisible(True)
+        self._apply_packages(room_id, self.host.emoticons_for(room_id))
         self._refresh_emoticons()
 
     def hide_emoticon_panel(self) -> None:
@@ -1368,8 +1384,10 @@ class DmPanel(QWidget):
         if room_id is None or not self._emoticon_packages:
             return
         index = max(0, min(self._emoticon_page, len(self._emoticon_packages) - 1))
-        name = str(self._emoticon_packages[index].get("name") or "")
-        self.host.remember_emoticon_page(room_id, index, name)
+        package = self._emoticon_packages[index]
+        self.host.remember_emoticon_page(room_id, index,
+                                         str(package.get("name") or ""),
+                                         emoticon_package_id(package))
 
     def _refresh_emoticons(self) -> None:
         """刷新当前房间可用表情包（宿主统一拉取：面板与弹幕表情兜底共用缓存）。"""
@@ -1380,33 +1398,89 @@ class DmPanel(QWidget):
         self.host.request_room_packages(room_id)
 
     def on_emoticons(self, payload: dict) -> None:
-        """表情包到达：仅当是本面板正在展示的房间时才重绘（否则只留在宿主缓存里）。"""
+        """表情包到达（宿主统一拉取的结果）：只在本面板正展示该房间时才重绘。"""
         room_id = payload.get("room_id")
         if room_id != self._emoticon_panel_room:
-            return
+            return  # 不是本面板当前展示的房间：只留在宿主缓存里
         packages = payload.get("packages") or []
         if not packages:
-            return  # 刷新失败/为空：保留上次结果
-        new_sig = emoticon_packages_signature(packages)
-        old_sig = emoticon_packages_signature(self._emoticon_packages)
-        first_show = room_id != self._emoticon_rendered_room
-        self._emoticon_packages = packages
-        if new_sig != old_sig:
-            self._emoticon_page = 0
-        if packages and first_show:
-            # 首次展示该房间：回到上次收起时停留的表情包（优先按包名找回）
-            self._emoticon_page = self._memory_page(room_id, packages)
+            # 刷新失败或确实为空：保留已有列表，本来就没有才显示空态提示
+            if not self._emoticon_packages:
+                self._apply_packages(room_id, [], empty_hint=EMOTICON_EMPTY_HINT)
+            return
+        if (emoticon_packages_signature(packages)
+                == emoticon_packages_signature(self._emoticon_packages)):
+            return  # 内容没变：保留当前包与横向滚动位置，不做无谓重绘（与 Tk 版一致）
+        self._apply_packages(room_id, packages)
+
+    def _apply_packages(self, room_id: int, packages: Optional[list], *,
+                        empty_hint: str = "") -> None:
+        """把某房间的表情包渲染到面板（``packages`` 为 ``None`` = 宿主还没缓存）。
+
+        停在哪一包与 Tk 版同一套规则：优先保持**当前正显示的那个包**（按包 id、再按包名
+        找回，包列表增删或换序都不会跑偏），否则回到记忆里的包（同样先 id 后名，最后退
+        序号）。**不能在内容变化时把页号重置为 0**——实测一个房间能有 9 个包都叫「装扮
+        表情」，重置就跳回第一包，看着就像「列表显示的和你实际选的不一致」。
+        """
+        if packages is None:
+            # 宿主还没有该房间的缓存：清掉旧房间的内容并提示加载中，别留着上一份列表
+            if self._emoticon_rendered_room != room_id:
+                self._emoticon_packages = []
+                self._emoticon_page = 0
+                self._set_emoticon_hint(EMOTICON_LOADING_HINT)
+                self._render_emoticons()
+                log_window.debug("表情面板：房间 %s 还没有缓存，先显示「正在加载该直播间的表情包…」",
+                                 room_id)
+            return
+        keep = None
+        if (self._emoticon_rendered_room == room_id
+                and 0 <= self._emoticon_page < len(self._emoticon_packages)):
+            keep = self._emoticon_packages[self._emoticon_page]
+        self._emoticon_packages = [p for p in packages if isinstance(p, dict)]
+        page = self._find_package_page(keep) if keep is not None else None
+        source = "保持当前包"
+        if page is None:
+            page = self._memory_page(room_id, self._emoticon_packages)
+            source = "按记忆恢复"
+        self._emoticon_page = max(0, page)
         self._emoticon_rendered_room = room_id
+        self._set_emoticon_hint("" if self._emoticon_packages else empty_hint)
+        if self._emoticon_packages:
+            current = self._emoticon_packages[self._emoticon_page]
+            log_window.debug("表情面板渲染：房间 %s，共 %d 个包，停在 第 %d 包「%s」(id=%s，%s)",
+                             room_id, len(self._emoticon_packages), self._emoticon_page + 1,
+                             current.get("name") or "", emoticon_package_id(current), source)
+        else:
+            log_window.debug("表情面板渲染：房间 %s 没有可用表情包（提示：%s）",
+                             room_id, empty_hint)
         self._render_emoticons()
 
-    def _memory_page(self, room_id: int, packages: list) -> int:
-        """按记忆找表情包页号：先按包名，再退回序号（越界自动收敛）。"""
-        memory = self.host._emoticon_memory.get(room_id) or {}
-        name = str(memory.get("name") or "")
+    def _find_package_page(self, target: Optional[dict]) -> Optional[int]:
+        """在当前列表里定位原来那个表情包（先按包 id、再按包名），找不到返回 ``None``。
+
+        与 Tk 版 ``gui_app._find_emoticon_package`` 同一意图：包名会重复（实测一个房间
+        有 9 个包都叫「装扮表情」），只比包名会永远落在第一个上。
+        """
+        if not isinstance(target, dict):
+            return None
+        target_id = emoticon_package_id(target)
+        if target_id:
+            for index, package in enumerate(self._emoticon_packages):
+                if emoticon_package_id(package) == target_id:
+                    return index
+        name = str(target.get("name") or "")
         if name:
-            for index, package in enumerate(packages):
+            for index, package in enumerate(self._emoticon_packages):
                 if str((package or {}).get("name") or "") == name:
                     return index
+        return None
+
+    def _memory_page(self, room_id: int, packages: list) -> int:
+        """按记忆找表情包页号：先按包 id、再按包名，最后退回序号（越界自动收敛）。"""
+        memory = self.host._emoticon_memory.get(room_id) or {}
+        matched = self._find_package_page(memory)
+        if matched is not None:
+            return matched
         try:
             return max(0, min(int(memory.get("index") or 0), len(packages) - 1))
         except (TypeError, ValueError):
@@ -1422,20 +1496,26 @@ class DmPanel(QWidget):
         self._show_emoticon_page(self._emoticon_page)
 
     def _show_emoticon_page(self, index: int) -> None:
-        """渲染一个表情包（一页 = 一个包）：有图显图，缺图则按需后台下载。"""
+        """渲染一个表情包（一页 = 一个包）：有图显图，缺图则按需后台下载。
+
+        页码变化的所有入口（◀▶ 按钮、下拉、滚轮翻动、刷新后保持当前包）最终都走这里，
+        所以**下拉框与左右箭头也在这一步同步**：只在 ``_render_emoticons`` 里填下拉、不在
+        这里改选中项的话，用 ◀▶ 翻页后下拉会一直停在「1. emoji」（用户 2026-09-27 报的
+        正是这条）。
+        """
         packages = self._emoticon_packages
         if not packages:
-            self.emoticon_page_var.setText("（无表情包）")
+            self._clear_emoticon_grid()
+            self.emoticon_grid.setMinimumWidth(0)  # 别留着上一个包撑出的横向滚动条
+            self._sync_emoticon_bar(None)
+            self.emoticon_page_var.setText("")
             return
         index = max(0, min(index, len(packages) - 1))
         self._emoticon_page = index
         self._remember_page()  # 翻到哪一页就持久化哪一页（收起/直接退出都能记住）
-        while self.emoticon_grid_layout.count():
-            item = self.emoticon_grid_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
+        self._clear_emoticon_grid()
         self._emoticon_buttons = {}
+        self._sync_emoticon_bar(index)
         pkg = packages[index]
         self.emoticon_page_var.setText(
             f"{index + 1}/{len(packages)} · {pkg.get('name') or '表情'}")
@@ -1465,6 +1545,30 @@ class DmPanel(QWidget):
         if missing:
             self._emoticon_pending.update(missing)
             self.host.request_emoticon_images(missing)
+
+    def _clear_emoticon_grid(self) -> None:
+        """清空表情条上的按钮（换包 / 空态 / 切房时都要清，别留着上个房间的表情）。"""
+        while self.emoticon_grid_layout.count():
+            item = self.emoticon_grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _sync_emoticon_bar(self, index: Optional[int]) -> None:
+        """把分页下拉与左右箭头同步到当前页（``None`` = 空态：清空下拉并置灰）。"""
+        box = self.emoticon_pkg_box
+        box.blockSignals(True)  # 防回环：setCurrentIndex 会触发 currentIndexChanged
+        box.setCurrentIndex(-1 if index is None else index)
+        box.blockSignals(False)
+        box.setEnabled(index is not None)
+        count = len(self._emoticon_packages)
+        self.emoticon_prev_btn.setEnabled(index is not None and index > 0)
+        self.emoticon_next_btn.setEnabled(index is not None and index < count - 1)
+
+    def _set_emoticon_hint(self, text: str) -> None:
+        """面板底部提示（空串即隐藏，省掉一行高度，与 Tk 版 ``_set_emoticon_hint`` 一致）。"""
+        self.emoticon_hint.setText(text)
+        self.emoticon_hint.setVisible(bool(text))
 
     def _emoticon_strip_width(self) -> int:
         """单行表情条的自然宽度（各按钮宽度 + 网格间距 + 边距）。"""
