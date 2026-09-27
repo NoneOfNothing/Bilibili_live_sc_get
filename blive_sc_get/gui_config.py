@@ -339,6 +339,13 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
         prefs["notify_sound"] = ui["notify_sound"]
     prefs["dm_visible"] = bool(ui.get("dm_visible", False))
     prefs["dm_emoticon_image"] = bool(ui.get("dm_emoticon_image", True))
+    # 「点选即发送」（ROADMAP 99）：**写入侧一直有它、读取侧唯独漏了这个键**——切换勾选框
+    # 时确实把值写进了 ui 段（``save_room_entries`` 整段落盘，磁盘上能看到
+    # ``quick_dm_send_now: true``），但这里逐键列出要读回的偏好、漏了它，于是重启后永远是
+    # 默认的关闭，用户看到的就是「勾选框记不住」。读取方式与相邻几个开关保持一致。
+    prefs["quick_dm_send_now"] = bool(ui.get("quick_dm_send_now", False))
+    if prefs["quick_dm_send_now"]:
+        logger.info("已按上次设置开启「点选即发送」：点选快捷弹幕会直接发送")
     size = ui.get("window_size")
     if (isinstance(size, list) and len(size) == 2
             and all(isinstance(value, int) and value > 200 for value in size)):
