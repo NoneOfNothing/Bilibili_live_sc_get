@@ -831,6 +831,9 @@ class QtScMonitorApp(QMainWindow):
         self._dm_panels: list = []
         # 房间独立窗口（ROADMAP 84）：room_id -> RoomChatWindow（一房一窗）
         self._room_windows: dict = {}
+        # 正在打开的快捷弹幕管理对话框（ROADMAP 100）：按钮可开可关，故记下它属于哪个房间
+        self._quick_dm_manager = None
+        self._quick_dm_manager_room = None
         # 房间号 -> {"index": 收起的表情包序号, "name": 包名}（持久化到 gui_rooms.json）
         self._emoticon_memory: Dict[int, dict] = load_emoticon_memory(self.config_path)
         # 房间号 -> 可用表情包（表情面板与「弹幕表情悬浮看原图」共用，见 Tk 版 self._emoticons）
@@ -3176,8 +3179,19 @@ class QtScMonitorApp(QMainWindow):
 
         与 Tk 版行为一致——**关闭即保存**（不做「确定 / 取消」），避免改完忘了确认；
         编辑全部作用于工作副本，只有内容真的变了才落盘。
+
+        ROADMAP 100：按钮**可开可关**——同一房间的对话框开着时再点一次即关闭它；换过房间则
+        先收掉旧的那个、再为当前房间打开。为此对话框改为**非模态**（`show()` 而非 `exec()`）：
+        `exec()` 会把主窗口整个挡住，管理按钮根本点不到，也就无从「再点一次」。
         """
-        entry = self.entries.get(int(room_id))
+        room_id = int(room_id)
+        if self._quick_dm_manager is not None:
+            same_room = self._quick_dm_manager_room == room_id
+            self._close_quick_danmaku_manager()
+            if same_room:
+                log_window.info("快捷弹幕：再次点击「管理」，关闭对话框（房间 %s）", room_id)
+                return
+        entry = self.entries.get(room_id)
         if entry is None:
             log_window.warning("快捷弹幕：房间 %s 不在房间列表中，忽略管理请求", room_id)
             return
@@ -3188,7 +3202,8 @@ class QtScMonitorApp(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle(f"快捷弹幕 — 房间 {room_id}")
-        dialog.setModal(True)
+        # 非模态：管理按钮要能再点一次（ROADMAP 100），exec()/模态都会挡住主窗口
+        dialog.setModal(False)
         dialog.resize(380, 420)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel("点选后只填入输入框（不会直接发送）；顺序即下拉顺序"))
@@ -3252,8 +3267,14 @@ class QtScMonitorApp(QMainWindow):
                 panel._refresh_quick_danmaku()
 
         def on_close() -> None:
-            save_and_refresh()
             dialog.accept()
+
+        def finish() -> None:
+            """对话框收尾（「关闭」按钮 / 关窗 X / 再点一次「管理」都汇聚到这里）。"""
+            save_and_refresh()
+            if self._quick_dm_manager is dialog:
+                self._quick_dm_manager = None
+                self._quick_dm_manager_room = None
 
         add_btn = QPushButton("添加")
         add_btn.clicked.connect(add)
@@ -3273,10 +3294,24 @@ class QtScMonitorApp(QMainWindow):
         button_row.addWidget(close_btn)
         layout.addLayout(button_row)
 
-        # 直接关窗（X）也要保存：rejected 走同一条保存 + 刷新路径
-        dialog.rejected.connect(save_and_refresh)
+        # accepted（「关闭」按钮）与 rejected（关窗 X）都要保存：统一挂到 finished
+        dialog.finished.connect(lambda _result: finish())
         refresh()
-        dialog.exec()
+        dialog.show()  # 非模态显示（exec() 会阻塞主窗口，管理按钮点不到）
+        dialog.raise_()
+        self._quick_dm_manager = dialog
+        self._quick_dm_manager_room = room_id
+
+    def _close_quick_danmaku_manager(self) -> None:
+        """关闭正在打开的管理对话框（reject → finished → 与「关闭」按钮同一条收尾路径）。
+
+        不能直接 close()/deleteLater()——那会跳过「关闭即保存」，刚改的内容就丢了。
+        """
+        dialog = self._quick_dm_manager
+        self._quick_dm_manager = None
+        self._quick_dm_manager_room = None
+        if dialog is not None:
+            dialog.reject()
 
     def remember_emoticon_page(self, room_id: int, index: int, name: str,
                                pkg_id: int = 0) -> None:
@@ -3298,6 +3333,9 @@ class QtScMonitorApp(QMainWindow):
                                     QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             event.ignore()
             return
+        # 管理对话框可能还开着（非模态，ROADMAP 100）：先走它的收尾，别让刚改的预设
+        # 随窗口一起消失（模态时代挡着主窗口，不存在这种退出方式）
+        self._close_quick_danmaku_manager()
         # 记住窗口尺寸：下次启动恢复（Tk 版不使用该键，只原样写回）
         self.ui_prefs["window_size"] = [self.width(), self.height()]
         # ROADMAP 97：此刻仍在直播的房间记一个「下播时刻」估算（＝退出时刻），

@@ -26,6 +26,27 @@ from blive_sc_get.gui_config import (
 PKG = Path(__file__).resolve().parent.parent / "blive_sc_get"
 
 
+def _func(module: str, name: str) -> ast.FunctionDef:
+    """取出某模块里的顶层/嵌套函数节点（找不到即失败）。"""
+    tree = ast.parse((PKG / module).read_text(encoding="utf-8"))
+    node = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if node is None:
+        raise AssertionError(f"{module} 缺少 {name}")
+    return node
+
+
+def _attr_names(node: ast.AST) -> set:
+    """节点里出现过的属性名（读 / 写都算）。"""
+    return {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+
+
+def _called(node: ast.AST) -> set:
+    """节点里调用过的方法名。"""
+    return {n.func.attr for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+
 class NormalizeQuickDanmakuTests(unittest.TestCase):
     """清洗：只留非空字符串、去首尾空白、保序去重、限制条数（**不限单条长度**，ROADMAP 91）。"""
 
@@ -311,6 +332,83 @@ class QuickSendNowPersistenceTests(unittest.TestCase):
                        and any(isinstance(a, ast.Attribute) and a.attr == "_quick_send_now"
                                for a in ast.walk(n.args[0]))]
         self.assertTrue(set_checked, "Qt 勾选框初值未调用 _quick_send_now（可能写死了）")
+
+
+class QuickDanmakuManagerToggleTests(unittest.TestCase):
+    """「管理」按钮可开可关（ROADMAP 100）。
+
+    用户要求：对话框开着时再点一次「管理」要能把它关掉。此前**两版都做不到**——Tk 用
+    ``grab_set()``、Qt 用 ``exec()`` 把对话框做成模态，主窗口整个被挡住，管理按钮根本点不到，
+    自然没有「再点一次」这回事。所以这里同时锁住三件事：
+    ① 对话框改为非模态（否则按钮依然点不到）；
+    ② 按钮按「当前是否开着」分支：同一房间再点一次＝关闭，换过房间＝先收掉旧的再开新的；
+    ③ 关闭走对话框**自己的收尾路径**（写回配置 + 刷新下拉）——直接 destroy() 会跳过
+    「关闭即保存」，用户刚改的内容就丢了。
+    """
+
+    def test_tk_button_toggles_and_dialog_is_not_modal(self):
+        open_node = _func("gui_app.py", "_open_quick_danmaku_manager")
+        self.assertIn("_close_quick_danmaku_manager", _called(open_node),
+                      "Tk 管理按钮未按「已经开着」分支去关闭对话框")
+        self.assertIn("_quick_dm_manager_room", _attr_names(open_node),
+                      "Tk 未记下对话框属于哪个房间（换房后无法正确分流）")
+        self.assertNotIn("grab_set", _called(open_node),
+                         "Tk 对话框仍是模态（主窗口被挡住，管理按钮点不到）")
+
+        close_node = _func("gui_app.py", "_close_quick_danmaku_manager")
+        self.assertIn("_quick_dm_manager_close", _attr_names(close_node),
+                      "Tk 关闭时未走对话框自己的收尾（会丢掉未保存的编辑）")
+        self.assertIn("_quick_dm_manager", _attr_names(close_node), "Tk 未清跟踪字段")
+
+    def test_tk_close_path_still_saves_and_refreshes(self):
+        """收尾路径必须保留「关闭即保存」：写回 + 落盘 + 刷新下拉。"""
+        node = _func("gui_app.py", "_open_quick_danmaku_manager")
+        self.assertIn("_save_config", _called(node), "Tk 收尾不再落盘")
+        self.assertIn("_refresh_quick_danmaku", _called(node), "Tk 收尾不再刷新下拉")
+
+    def test_qt_button_toggles_and_dialog_is_not_blocking(self):
+        open_node = _func("qt_app.py", "open_quick_danmaku_manager")
+        self.assertIn("_close_quick_danmaku_manager", _called(open_node),
+                      "Qt 管理按钮未按「已经开着」分支去关闭对话框")
+        self.assertIn("_quick_dm_manager_room", _attr_names(open_node),
+                      "Qt 未记下对话框属于哪个房间（换房后无法正确分流）")
+        self.assertNotIn("exec", _called(open_node),
+                         "Qt 对话框仍用 exec() 阻塞（管理按钮点不到）")
+        self.assertIn("show", _called(open_node), "Qt 未以非模态方式显示对话框")
+        modal = [n for n in ast.walk(open_node)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "setModal"]
+        self.assertTrue(modal, "Qt 未显式声明非模态")
+        self.assertTrue(all(isinstance(c.args[0], ast.Constant)
+                            and c.args[0].value is False for c in modal if c.args),
+                        "Qt 的 setModal 不是 False")
+
+        close_node = _func("qt_app.py", "_close_quick_danmaku_manager")
+        self.assertIn("reject", _called(close_node),
+                      "Qt 关闭未走 reject（finished 信号才不会触发，收尾被跳过）")
+        self.assertIn("_quick_dm_manager", _attr_names(close_node), "Qt 未清跟踪字段")
+
+    def test_exit_closes_open_manager_first(self):
+        """对话框是非模态的，退出时可能还开着：必须先走收尾再退出，否则刚改的编辑白改。
+
+        模态时代挡着主窗口，压根不存在「对话框开着时退出」这条路；改非模态后它成了新场景。
+        """
+        self.assertIn("_close_quick_danmaku_manager",
+                      _called(_func("gui_app.py", "_on_close")),
+                      "Tk 退出时未先收尾管理对话框")
+        self.assertIn("_close_quick_danmaku_manager",
+                      _called(_func("qt_app.py", "closeEvent")),
+                      "Qt 退出时未先收尾管理对话框")
+
+    def test_qt_close_path_still_saves_and_refreshes(self):
+        node = _func("qt_app.py", "open_quick_danmaku_manager")
+        # save_and_refresh 是本函数内的嵌套函数，按裸名字调用，故看 Name 调用而非属性调用
+        local_calls = {n.func.id for n in ast.walk(node)
+                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        self.assertIn("save_and_refresh", local_calls, "Qt 收尾不再保存")
+        self.assertIn("_save_config", _called(node), "Qt 收尾不再落盘")
+        self.assertIn("finished", _attr_names(node),
+                      "Qt 未把收尾挂到 finished（关窗 X 会跳过保存）")
 
 
 if __name__ == "__main__":

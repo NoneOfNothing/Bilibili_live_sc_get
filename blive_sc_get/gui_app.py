@@ -27,7 +27,7 @@ except ImportError:
     Image = None
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
@@ -1092,6 +1092,11 @@ class ScMonitorApp:
         self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
         # 房间独立窗口（ROADMAP 84）：room_id -> TkRoomChatWindow（一房一窗）
         self._room_windows: Dict[int, object] = {}
+        # 正在打开的快捷弹幕管理对话框（ROADMAP 100）：按钮可开可关，故记下窗口本体、所属
+        # 房间与它的收尾函数（再点一次「管理」时必须走收尾，直接 destroy 会丢掉未保存的编辑）
+        self._quick_dm_manager: Optional[tk.Toplevel] = None
+        self._quick_dm_manager_room: Optional[int] = None
+        self._quick_dm_manager_close: Optional[Callable[[], None]] = None
         # 发送弹幕相关状态（仅主线程读写）
         self._last_dm_send: Dict[int, float] = {}   # 房间号 -> 上次发送时间(monotonic)，冷却用
         self._room_id_map: Dict[int, int] = {}      # 输入房间号 -> 真实房间号
@@ -3095,9 +3100,22 @@ class ScMonitorApp:
         self.dm_send_entry.icursor(tk.END)
 
     def _open_quick_danmaku_manager(self) -> None:
-        """快捷弹幕管理对话框：增删 / 调整顺序（关闭时才写回并落盘）。"""
-        room_id = self._selected_room_id
-        entry = self.entries.get(int(room_id)) if room_id is not None else None
+        """快捷弹幕管理对话框：增删 / 调整顺序（关闭时才写回并落盘）。
+
+        ROADMAP 100：这是**可开可关**的按钮——对话框开着时再点一次即关闭它；若期间在房间
+        列表里换过房间，则先收掉旧的那个、再为当前房间打开。为此对话框改为**非模态**：此前
+        ``grab_set()`` 会把主窗口整个挡住，管理按钮根本点不到，也就无从「再点一次」。
+        """
+        selected = self._selected_room_id
+        room_id = int(selected) if selected is not None else None
+        # 已经开着：同一个房间 → 再点一次就是「关闭」；换过房间 → 先收掉它再开当前房间的
+        if self._quick_dm_manager is not None:
+            same_room = self._quick_dm_manager_room == room_id
+            self._close_quick_danmaku_manager()
+            if same_room:
+                log_window.info("快捷弹幕：再次点击「管理」，关闭对话框（房间 %s）", room_id)
+                return
+        entry = self.entries.get(room_id) if room_id is not None else None
         if entry is None:
             return
         original = list(entry.quick_danmaku)
@@ -3182,6 +3200,10 @@ class ScMonitorApp:
                        command=command).pack(side="left", padx=(0, 4))
 
         def on_close() -> None:
+            """收尾（「关闭」按钮 / 窗口 X / 再点一次「管理」都汇聚到这里）：写回 + 落盘。"""
+            self._quick_dm_manager = None
+            self._quick_dm_manager_room = None
+            self._quick_dm_manager_close = None
             if working != original:
                 entry.quick_danmaku = list(working)
                 self._save_config()
@@ -3192,8 +3214,24 @@ class ScMonitorApp:
         ttk.Button(button_row, text="关闭", width=6,
                    command=on_close).pack(side="right")
         win.protocol("WM_DELETE_WINDOW", on_close)
-        win.grab_set()
+        # 非模态（不加 grab_set）：管理按钮要能再点一次（ROADMAP 100）；transient 让对话框
+        # 浮在主窗口之上，不会缩到主窗口背后
+        self._quick_dm_manager = win
+        self._quick_dm_manager_room = room_id
+        self._quick_dm_manager_close = on_close
         refresh()
+
+    def _close_quick_danmaku_manager(self) -> None:
+        """关闭正在打开的管理对话框（走它自己的收尾：写回配置、刷新下拉、销毁窗口）。
+
+        不能直接 ``destroy()``——那会跳过「关闭即保存」的收尾，用户刚改的内容就丢了。
+        """
+        close = self._quick_dm_manager_close
+        self._quick_dm_manager = None
+        self._quick_dm_manager_room = None
+        self._quick_dm_manager_close = None
+        if close is not None:
+            close()
 
     def _set_dm_reply_target(self, target: Optional[dict]) -> None:
         """设置（或清除）回复/@ 目标；设置后聚焦输入框。"""
@@ -5561,6 +5599,9 @@ class ScMonitorApp:
     def _on_close(self) -> None:
         if not messagebox.askokcancel("退出", "确定退出？将停止所有房间的监听。"):
             return
+        # 管理对话框可能还开着（非模态，ROADMAP 100）：先走它的收尾，别让刚改的预设
+        # 随窗口一起消失（模态时代挡着主窗口，不存在这种退出方式）
+        self._close_quick_danmaku_manager()
         log_app.info("用户确认退出：正在停止 %d 个房间的监听", len(self.room_tasks))
         self._remember_emoticon_page()  # 面板还开着时直接退出也要记住当前表情包
         self._hide_emoticon_tooltip()

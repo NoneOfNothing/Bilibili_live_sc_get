@@ -328,6 +328,7 @@ class DmPanel(QWidget):
         send.addWidget(self.quick_dm_combo)
         self.quick_dm_manage_btn = QPushButton("管理")
         self.quick_dm_manage_btn.setFixedWidth(48)
+        self.quick_dm_manage_btn.setToolTip("打开快捷弹幕管理对话框；对话框开着时再点一次即关闭")
         self.quick_dm_manage_btn.clicked.connect(self._open_quick_danmaku_manager)
         if self.show_quick_manage:
             send.addWidget(self.quick_dm_manage_btn)
