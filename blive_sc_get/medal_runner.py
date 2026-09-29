@@ -37,6 +37,7 @@ from .log_categories import CATEGORY_TASK, get_logger
 from .medal_tasks import (
     LIGHT_UP_DANMAKU_COUNT,
     LIGHT_UP_LIKE_CLICKS,
+    SAVINGS_MODE_NOTE,
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     WRITE_TASK_TYPES,
@@ -224,22 +225,22 @@ class MedalTaskRunner:
                                only: Optional[str] = None) -> Dict[str, Any]:
         info = await self._api.get_medal_task_info(anchor_uid)
         tasks = info.get("tasks") or []
-        # reach_free_intimacy_limit（接口下发）为真表示**该粉丝灯牌刚点亮**：服务端暂时
-        # 不接受点赞 / 发弹幕这类免费任务产生的亲密度（官方规则：熄灭状态下靠点赞 30 次 /
-        # 发弹幕 10 条点亮勋章时，这两种行为仅点亮勋章、不获得亲密度）。
-        # 但任务**仍要照常执行**——长时间不做任务灯牌会熄灭，做任务正是为了点亮并维持它；
-        # 所以这里只把「亲密度为什么没涨」说明给用户，绝不跳过任务。
-        free_intimacy_paused = bool(info.get("reach_free_intimacy_limit"))
-        if free_intimacy_paused:
-            logger.info("房间 %s（%s）的粉丝灯牌刚点亮：免费任务暂不增加亲密度，"
-                        "任务照常执行以点亮并维持灯牌", room_id, label)
+        # reach_free_intimacy_limit（接口下发）为真表示**储蓄池已满（100）**：点亮后免费
+        # 互动（点赞 / 发弹幕 / 观看）拿到的亲密度会先攒进储蓄池，攒满 100 后不再累加，
+        # 要投喂付费礼物才能把储蓄领出来（口径见 medal_tasks.SAVINGS_MODE_NOTE）。
+        # 但任务**仍要照常执行**——点亮后 3 天内没完成任何点亮任务灯牌就会熄灭，做任务
+        # 正是为了点亮并维持它；所以这里只把「亲密度为什么没涨」说明给用户，绝不跳过任务。
+        savings_full = bool(info.get("reach_free_intimacy_limit"))
+        if savings_full:
+            logger.info("房间 %s（%s）的粉丝牌储蓄池已满（free_intimacy=%s）：免费互动不再"
+                        "累计亲密度，需投喂付费礼物领取；任务照常执行以点亮并维持灯牌",
+                        room_id, label, info.get("free_intimacy"))
 
         def _with_note(text: str) -> str:
-            """给结果说明补上「刚点亮 → 暂不涨亲密度」的缘由（未命中时原样返回）。"""
-            if not free_intimacy_paused:
+            """给结果说明补上「储蓄池已满 → 免费互动不涨亲密度」的缘由（未命中时原样返回）。"""
+            if not savings_full:
                 return text
-            return (f"{text}（粉丝灯牌刚点亮，点赞 / 发弹幕暂不涨亲密度，"
-                    "任务仅用于点亮并维持灯牌）")
+            return f"{text}（{SAVINGS_MODE_NOTE}）"
 
         pending_all = pending_write_tasks(tasks)
         only_types: Optional[Set[str]] = None
@@ -325,8 +326,9 @@ class MedalTaskRunner:
                 return _done(True, "点赞任务已完成")
             if is_light_up_task(task):
                 # 「仅点亮」态（上限 0）：勋章已熄灭，点赞的唯一目的是重新点亮勋章
-                # （长时间不做任务灯牌会熄灭）。点亮阶段不产生亲密度、接口也不下发进度，
-                # 故按官方点亮次数发一次、复核一次即收尾，不做多轮「进度推进」判定。
+                # （点亮后 3 天内没完成任何点亮任务就会熄灭；大航海生效期间不会熄灭）。
+                # 点亮阶段不产生亲密度（免费互动只能点亮、拿不到亲密度）、接口也不下发
+                # 进度，故按官方点亮次数发一次、复核一次即收尾，不做多轮「进度推进」判定。
                 clicks = parse_title_count(task.get("title")) or LIGHT_UP_LIKE_CLICKS
                 try:
                     await self._api.like_room(room_id, anchor_uid, click_time=clicks)
@@ -433,8 +435,8 @@ class MedalTaskRunner:
             if is_task_complete(task):
                 return _done(True, "发弹幕任务已完成")
             if is_light_up_task(task):
-                # 「仅点亮」态（上限 0）：同点赞，唯一目的是重新点亮勋章；接口不下发进度，
-                # 故按官方点亮条数发满后收尾（不按「进度推进」判定）。
+                # 「仅点亮」态（上限 0）：同点赞，唯一目的是重新点亮勋章（免费互动只能点亮、
+                # 拿不到亲密度）；接口不下发进度，故按官方点亮条数发满后收尾（不按「进度推进」判定）。
                 while sent < LIGHT_UP_DANMAKU_COUNT:
                     if self._interrupted(room_id):
                         return _done(False, "直播间已开播，已打断自动发弹幕任务",

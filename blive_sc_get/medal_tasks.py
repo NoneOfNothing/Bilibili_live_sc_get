@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ---- jump_type 常量（接口 task_info[].jump_type） ----
 TASK_LIKE = "like"
@@ -46,6 +46,43 @@ LIGHT_UP_LIKE_CLICKS = 30
 
 LIGHT_UP_DANMAKU_COUNT = 10
 """官方「点亮任务」的发弹幕条数（同上）。"""
+
+# ---- 亲密度机制的用户可见说明（Tk 与 Qt 两版共用同一份文案，避免两份漂移） ----
+# 口径来源：2026-05-14 起生效的官方规则（用户提供并确认），替换掉此前基于未验证字段
+# 语义写的「粉丝灯牌刚点亮」解释——见 ROADMAP 101。
+
+MEDAL_RULES_HELP = (
+    "· 点亮与维持：粉丝牌点亮后，3 天内没完成任何点亮任务就会熄灭"
+    "（大航海生效期间不会熄灭）；本页的「点赞 / 发弹幕」就是点亮任务。\n"
+    "· 熄灭后重新点亮：完成任意一个点亮任务即可——点赞、发弹幕、看播，"
+    "或投喂付费礼物、开通大航海、给主播视频充电这类付费行为。\n"
+    "· 熄灭的影响：不掉亲密度、也不掉等级；但熄灭并重新点亮后，免费互动拿到的"
+    "亲密度会先进「储蓄」，要任一种付费行为（灯牌 / 电池礼物 / 大航海 / 充电都行，"
+    "与灯牌当前是否点亮无关）才能领取。\n"
+    "· 清零：删除勋章或退出粉丝团会把亲密度清零。"
+)
+"""粉丝牌「点亮 / 熄灭 / 清零」规则全文（两版「ⓘ 规则」弹窗共用）。
+
+只写「会影响怎么用」的规则，不堆数值（每日额度与点赞换算等一律不写，用户要求精简）；
+正文直接进弹窗（messagebox / QMessageBox），故**不写 Markdown 强调标记**——
+星号会原样显示在弹窗里。
+"""
+
+MEDAL_ACQUIRE_HINT = "拿牌方式：投喂一个粉丝团灯牌 / 给该主播视频充电 1 B 币 / 开通大航海"
+"""未持有粉丝牌时的取得方式（两版共用；规则弹窗末尾也附这句）。"""
+
+SAVINGS_MODE_NOTE = (
+    "免费互动（点赞 / 发弹幕 / 观看）获得的亲密度会先攒进储蓄池，"
+    "攒满 100 后停止累计，需投喂付费礼物才能领取；任务仍照做以点亮并维持灯牌"
+)
+"""「储蓄模式」说明（接口 ``reach_free_intimacy_limit`` 为真时给用户的缘由）。
+
+点亮后免费互动拿到的亲密度先进入**储蓄池**（接口字段 ``free_intimacy``，实测取值
+0 / 12 / 100），攒满 100 即 ``reach_free_intimacy_limit=true``、免费互动不再累加，
+要投喂付费礼物才能把储蓄领出来（转为亲密度）。这与「灯牌熄灭时靠免费互动只能点亮、
+拿不到亲密度」是两件事：本条描述的是**已点亮**状态下的储蓄机制。任务照常执行
+（长时间不做点亮任务灯牌会熄灭），故这里只解释「为什么亲密度没涨」。
+"""
 
 ROOM_EMOTICON_PREFIX = "room_"
 """直播间专属表情的 ``emoticon_unique`` 前缀（区分公开表情）。"""
@@ -186,9 +223,14 @@ def is_task_applicable(task: Any) -> bool:
 def is_light_up_task(task: Any) -> bool:
     """任务是否处于「仅点亮」态：未完成、但上限为 0（勋章已熄灭）。
 
-    此时做任务**不产生亲密度**，唯一目的是重新点亮勋章——长时间不做任务粉丝灯牌会
-    熄灭，点亮之后才谈得上继续维持。点亮阶段的次数由官方固定（点赞 30 次 / 发弹幕
-    10 条），接口不下发进度，故按固定次数执行、不按「进度推进」判定。
+    此时做任务**不产生亲密度**，唯一目的是重新点亮勋章——点亮后 3 天内没完成任何点亮
+    任务就会熄灭（大航海生效期间不会熄灭），点亮之后才谈得上继续维持。点亮阶段的次数由
+    官方固定（点赞 30 次 / 发弹幕 10 条），接口不下发进度，故按固定次数执行、不按
+    「进度推进」判定。
+
+    **熄灭后用免费互动（点赞 / 发弹幕 / 观看）恢复，只能点亮灯牌、拿不到亲密度**，要投喂
+    付费礼物才既能点亮又加亲密度；重新点亮后任务面板会切换成**储蓄任务模式**，任务照做
+    也得先投喂才能把经验领出来（口径见 ``SAVINGS_MODE_NOTE``）。
     """
     if not isinstance(task, dict):
         return False
@@ -201,7 +243,9 @@ def pending_write_tasks(tasks: List[dict]) -> List[dict]:
     """返回仍未完成的写任务（点赞 / 发弹幕），**含「仅点亮」态**（上限 0）。
 
     仅点亮态同样要执行：灯牌熄灭后只有做任务才能把它重新点亮
-    （见 ``is_light_up_task``），跳过不做的代价是灯牌一直熄着。
+    （见 ``is_light_up_task``），跳过不做的代价是灯牌一直熄着。这也正是「点亮后 3 天内
+    没完成任何点亮任务就会熄灭」的应对手段——这些任务的作用是**点亮并维持灯牌**，
+    而不是可有可无的刷分。
     """
     return [task for task in tasks or []
             if task.get("jump_type") in WRITE_TASK_TYPES
@@ -281,6 +325,79 @@ def medal_level_for_room(medals: List[dict], room_id: int = 0, target_id: int = 
         if target_id and _int(medal.get("target_id")) == _int(target_id):
             return _int(medal.get("level"))
     return 0
+
+
+def shows_medal_tasks(task_info: Any) -> bool:
+    """该房间要不要在「粉丝牌任务」表里占一行（ROADMAP 104）。
+
+    **未持有该主播粉丝牌**的房间（任务刷新时被标记 ``no_medal``）不显示——那一行本来就只
+    三个「无粉丝牌」字，既没有任务可看、也不能执行任何任务。状态**尚未取到**时
+    （``None`` / 缺该键 / 非 dict）一律照常显示：等刷新给出结论再收掉，避免启动时整表先空
+    一下又长回来。
+    """
+    if not isinstance(task_info, dict):
+        return True
+    return not bool(task_info.get("no_medal"))
+
+
+def monitored_medals(medals: List[dict],
+                     rooms: Iterable[Tuple[Any, Any]]) -> Tuple[List[dict], int]:
+    """只保留**已加入监听列表**的直播间的粉丝牌，返回 ``(保留的, 隐藏数量)``（ROADMAP 103）。
+
+    ``rooms`` 为各监听房间的 ``(主播 uid, 真实房间号)`` 序列（短号场景由调用方先映射成
+    真实房间号）。匹配规则与「该直播间是否持有粉丝牌」的判定保持一致：粉丝牌的
+    ``target_id`` 等于某个房间的主播 uid，**或**粉丝牌的 ``room_id`` 等于某个房间的房间号。
+
+    为什么要隐藏而不是照常列出：储蓄亲密度（``free_intimacy``）是**随任务接口**一起下来
+    的，而任务只对监听列表里的房间拉取，未加入列表的粉丝牌永远拿不到储蓄值、只能显示今日
+    部分——留在列表里会被误读成「这个牌子的储蓄是 0」。隐藏数量由调用方在状态行说明，
+    免得用户以为牌子丢了。
+    """
+    wanted_uids: set = set()
+    wanted_rooms: set = set()
+    for uid, room_id in rooms or []:
+        uid_value = _int(uid)
+        room_value = _int(room_id)
+        if uid_value:
+            wanted_uids.add(uid_value)
+        if room_value:
+            wanted_rooms.add(room_value)
+    kept: List[dict] = []
+    hidden = 0
+    for medal in medals or []:
+        if not isinstance(medal, dict):
+            continue
+        uid = _int(medal.get("target_id"))
+        room_id = _int(medal.get("room_id"))
+        if (uid and uid in wanted_uids) or (room_id and room_id in wanted_rooms):
+            kept.append(medal)
+        else:
+            hidden += 1
+    return kept, hidden
+
+
+def format_intimacy_change(today_feed: Any, free_intimacy: Any = None) -> str:
+    """粉丝牌列表「亲密度变化」列的文案（两版共用，ROADMAP 102）。
+
+    **一格只显示一段**——该列很窄，而两者又不会同时为正：今天直接入账的亲密度与储蓄池里
+    待领取的额度是互斥的（进了储蓄模式后，免费互动拿到的亲密度先进储蓄、不进今日账）。
+    故：
+
+    - 今日有值 → ``+30（今日亲密度）``；
+    - 今日为 0 而储蓄有值 → ``26（储蓄亲密度）``（满池即 ``100（储蓄亲密度）``）；
+    - 两者都没有 → ``+0（今日亲密度）``。
+
+    今日已获取来自粉丝牌列表接口（``today_feed``），储蓄池内累计来自任务接口
+    （``free_intimacy``，实测 0 / 12 / 100）；``free_intimacy`` 传 ``None`` 表示**该房间的
+    任务信息还没取到**（两个接口到达时间不同，粉丝牌列表先到），此时按「没有储蓄」显示。
+    """
+    today = _int(today_feed)
+    if today > 0:
+        return f"+{today}（今日亲密度）"
+    savings = 0 if free_intimacy is None else _int(free_intimacy)
+    if savings > 0:
+        return f"{savings}（储蓄亲密度）"
+    return "+0（今日亲密度）"
 
 
 def room_exclusive_emoticons(packages: Any) -> List[dict]:

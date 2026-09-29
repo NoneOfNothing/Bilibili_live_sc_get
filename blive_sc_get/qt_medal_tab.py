@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -27,11 +28,16 @@ from PySide6.QtWidgets import (
 from .gui_app import MEDAL_TASK_REFRESH_GAP_S
 from .medal_runner import MedalTaskRunner
 from .medal_tasks import (
+    MEDAL_ACQUIRE_HINT,
+    MEDAL_RULES_HELP,
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     TASK_WATCH_LIVE,
     find_task,
+    format_intimacy_change,
     is_task_complete,
+    monitored_medals,
+    shows_medal_tasks,
     task_label,
 )
 
@@ -66,7 +72,9 @@ class MedalTab(QWidget):
     def __init__(self, host):
         super().__init__()
         self.host = host
-        self._medals: list = []
+        self._medals: list = []        # 账号粉丝牌列表（**全部**）
+        self._medal_shown = 0          # 其中显示在界面上的数量（已加入监听列表）
+        self._medal_hidden = 0         # 未加入监听列表、被隐藏的数量（ROADMAP 103）
         self._medal_levels_room: Dict[int, int] = {}
         self._medal_levels_uid: Dict[int, int] = {}
         self._medal_names_room: Dict[int, str] = {}
@@ -97,7 +105,7 @@ class MedalTab(QWidget):
         self.medal_tree = ProtectedLinkTable(0, 7)
         self.medal_tree.link_columns = (2, 3)
         self.medal_tree.setHorizontalHeaderLabels(
-            ["粉丝牌", "等级", "主播", "房间号", "今日亲密度", "当前/升级需", "状态"])
+            ["粉丝牌", "等级", "主播", "房间号", "亲密度变化", "当前/升级需", "状态"])
         self.medal_tree.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.medal_tree.setSelectionBehavior(QTableWidget.SelectRows)
         self.medal_tree.setSelectionMode(QTableWidget.SingleSelection)
@@ -142,6 +150,11 @@ class MedalTab(QWidget):
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self._on_refresh)
         btns.addWidget(refresh_btn)
+        # 「ⓘ 规则」：点亮 / 熄灭 / 清零与拿牌方式收进弹窗（ROADMAP 101），
+        # 文案取自 medal_tasks 的共享常量，与 Tk 版同一份
+        self.medal_rules_btn = QPushButton("ⓘ 规则")
+        self.medal_rules_btn.clicked.connect(self._show_medal_rules)
+        btns.addWidget(self.medal_rules_btn)
         outer.addLayout(btns)
 
         auto = QHBoxLayout()
@@ -168,6 +181,14 @@ class MedalTab(QWidget):
         auto.addWidget(self.auto_like_check)
         auto.addStretch(1)
         outer.addLayout(auto)
+
+    def _show_medal_rules(self) -> None:
+        """粉丝牌规则弹窗（点亮 / 熄灭 / 清零 + 拿牌方式）。
+
+        文案取自 ``medal_tasks`` 的共享常量，与 Tk 版同一份（避免两版说法漂移）。
+        """
+        QMessageBox.information(self, "粉丝牌规则",
+                                f"{MEDAL_RULES_HELP}\n\n{MEDAL_ACQUIRE_HINT}")
 
     # ---------- 工具 ----------
 
@@ -209,9 +230,16 @@ class MedalTab(QWidget):
         return (f"写操作：{'启用' if app_config.allow_write_operations else '关闭'}"
                 f" · 全自动总开关：{'开' if app_config.auto_medal_tasks else '关'}")
 
+    def _monitored_rooms(self) -> list:
+        """监听列表里各房间的 ``(主播 uid, 真实房间号)``（见 Tk 版同名方法，ROADMAP 103）。"""
+        return [(int(entry.uid), int(self.host.real_room_id(rid)))
+                for rid, entry in self.host.entries.items()]
+
     def update_status(self, medals_count: Optional[int] = None) -> None:
-        count = len(self._medals) if medals_count is None else medals_count
-        self.medal_status.setText(f"共持有 {count} 个粉丝牌 · {self.master_text()}")
+        count = self._medal_shown if medals_count is None else medals_count
+        note = (f"（另有 {self._medal_hidden} 个未加入监听列表，已隐藏）"
+                if self._medal_hidden else "")
+        self.medal_status.setText(f"共持有 {count} 个粉丝牌{note} · {self.master_text()}")
 
     # ---------- 刷新 ----------
 
@@ -310,8 +338,11 @@ class MedalTab(QWidget):
         if not payload.get("ok"):
             self.medal_status.setText(f"获取粉丝牌失败：{payload.get('error')}")
             return
-        medals = payload.get("medals") or []
-        self._medals = medals
+        all_medals = payload.get("medals") or []
+        self._medals = all_medals  # 保留完整列表（新增房间后无需重新请求即可重新筛）
+        # 只显示**已加入监听列表**的粉丝牌（ROADMAP 103）——理由见 Tk 版同名处理
+        medals, self._medal_hidden = monitored_medals(all_medals, self._monitored_rooms())
+        self._medal_shown = len(medals)
         self._medal_levels_room = {}
         self._medal_levels_uid = {}
         self._medal_names_room = {}
@@ -335,11 +366,14 @@ class MedalTab(QWidget):
                 state += "·直播中"
             anchor = medal.get("anchor_name") or self.host.anchor_names.get(room_id) \
                 or "未知主播"
-            # 今日亲密度 = 今日已获取；当前/升级需 = 当前亲密度 / 下一级门槛
-            today_feed = int(medal.get("today_feed") or 0)
+            # 亲密度变化 = 今日已获取与储蓄池内累计**二选一**（列窄、且两者不同时为正；
+            # 与 Tk 版同一个纯函数 format_intimacy_change）
+            # 当前/升级需 = 当前亲密度 / 下一级门槛
             intimacy = int(medal.get("intimacy") or 0)
             next_intimacy = int(medal.get("next_intimacy") or 0)
-            today = f"+{today_feed}"
+            today = format_intimacy_change(
+                medal.get("today_feed"),
+                (self._medal_tasks.get(room_id) or {}).get("free_intimacy"))
             exp = f"{intimacy}/{next_intimacy}" if next_intimacy else str(intimacy)
             self.medal_tree.insertRow(i)
             for col, text in enumerate((name, str(level or "—"), anchor,
@@ -359,7 +393,29 @@ class MedalTab(QWidget):
         if room_id is None:
             return
         self._medal_tasks[room_id] = payload
-        self._update_task_row(room_id)
+        # 本轮才判为「无粉丝牌」的房间要当场收掉整行（反之则补行），再重绘内容（ROADMAP 104）
+        self._sync_task_row_visibility(int(room_id))
+        self._update_task_row(int(room_id))
+        self._update_medal_intimacy_cell(int(room_id))
+
+    def _update_medal_intimacy_cell(self, room_id: int) -> None:
+        """刷新该房间粉丝牌行的「亲密度变化」列（与 Tk 版同名方法同职责，ROADMAP 102）。
+
+        粉丝牌列表与任务信息是两个接口、到达时间不同：任务信息晚到时就地补上
+        「储蓄亲密度」那一格，不必等下一次整表刷新。
+        """
+        room_id = int(room_id)
+        medal = next((m for m in self._medals
+                      if int(m.get("room_id") or 0) == room_id), None)
+        row = next((i for i, rid in self._medal_room_by_iid.items() if rid == room_id),
+                   None)
+        if medal is None or row is None:
+            return
+        item = self.medal_tree.item(row, 4)
+        if item is not None:
+            item.setText(format_intimacy_change(
+                medal.get("today_feed"),
+                (self._medal_tasks.get(room_id) or {}).get("free_intimacy")))
 
     def on_medal_tasks_done(self, payload: dict) -> None:
         if payload.get("api") is False:
@@ -408,7 +464,12 @@ class MedalTab(QWidget):
         return None
 
     def sync_task_rows(self) -> None:
-        """按 host.entries 增删任务行，并让行顺序与直播间列表保持一致。"""
+        """按 host.entries 增删任务行，并让行顺序与直播间列表保持一致。
+
+        **未持有该主播粉丝牌**的房间不占行（ROADMAP 104）——那一行只有「无粉丝牌」三个字，
+        既没有任务可看也不能执行任务。状态还没取到的房间照常显示（见 ``shows_medal_tasks``），
+        刷新给出结论后由 ``_sync_task_row_visibility`` 收掉。
+        """
         tree = self.medal_task_tree
         for row in range(tree.rowCount() - 1, -1, -1):
             item = tree.item(row, 0)
@@ -416,9 +477,12 @@ class MedalTab(QWidget):
                 rid = int(item.text() or 0) if item is not None else 0
             except (TypeError, ValueError):
                 rid = 0
-            if rid not in self.host.entries:
+            if rid not in self.host.entries or not shows_medal_tasks(
+                    self._medal_tasks.get(rid)):
                 tree.removeRow(row)
         for room_id in list(self.host.entries.keys()):
+            if not shows_medal_tasks(self._medal_tasks.get(room_id)):
+                continue
             if self._row_of_room(room_id) is None:
                 # 先写房间号：_row_of_room 以第 0 列的房间号定位行
                 row = tree.rowCount()
@@ -427,11 +491,36 @@ class MedalTab(QWidget):
             self._update_task_row(room_id)
         self._apply_task_order()
 
-    def _apply_task_order(self) -> None:
-        """让任务表行顺序与直播间列表**完全一致**（排序/拖动即刻反映）。"""
+    def _sync_task_row_visibility(self, room_id: int) -> None:
+        """按「是否持有粉丝牌」决定该房间在任务表里占不占一行（ROADMAP 104）。
+
+        任务信息是**逐个房间**到达的：某房间这轮才被判为「无粉丝牌」时要当场把行收掉，
+        反过来重新持有时再补一行（与 Tk 版 ``_sync_medal_task_row_visibility`` 同职责）。
+        """
         tree = self.medal_task_tree
-        order = [r for r in self.host._room_order if r in self.host.entries]
-        order += [r for r in self.host.entries if r not in order]
+        show = (room_id in self.host.entries
+                and shows_medal_tasks(self._medal_tasks.get(room_id)))
+        row = self._row_of_room(room_id)
+        if show and row is None:
+            row = tree.rowCount()
+            tree.insertRow(row)
+            tree.setItem(row, 0, QTableWidgetItem(str(room_id)))
+            # 补回来的行落在末尾：立刻按直播间列表顺序重排（与 Tk 版一致）
+            self._apply_task_order()
+        elif not show and row is not None:
+            tree.removeRow(row)
+
+    def _apply_task_order(self) -> None:
+        """让任务表行顺序与直播间列表**完全一致**（排序/拖动即刻反映）。
+
+        只排**当前有行**的房间（未持有粉丝牌的已被隐藏），否则行数对不上会整段跳过——
+        那会让任务表不再跟随直播间列表顺序。
+        """
+        tree = self.medal_task_tree
+        order = [r for r in self.host._room_order
+                 if r in self.host.entries and shows_medal_tasks(self._medal_tasks.get(r))]
+        order += [r for r in self.host.entries if r not in order
+                  and shows_medal_tasks(self._medal_tasks.get(r))]
         if len(order) != tree.rowCount():
             return
         selected = self._selected_room()
@@ -459,17 +548,20 @@ class MedalTab(QWidget):
                 tree.selectRow(row)
 
     def _update_task_row(self, room_id: int) -> None:
-        """按该房间的任务信息重绘行（含「无粉丝牌 / 获取失败」文案与自动列）。"""
+        """按该房间的任务信息重绘行（含「获取失败」文案与自动列）。
+
+        未持有该主播粉丝牌的房间**不占行**（ROADMAP 104），所以这里也不给它兜底建行。
+        """
+        payload = self._medal_tasks.get(room_id) or {}
         row = self._row_of_room(room_id)
         if row is None:
-            if room_id not in self.host.entries:
+            if room_id not in self.host.entries or not shows_medal_tasks(payload):
                 return
             # 兜底建行（正常路径由 sync_task_rows 建行）
             row = self.medal_task_tree.rowCount()
             self.medal_task_tree.insertRow(row)
             self.medal_task_tree.setItem(row, 0, QTableWidgetItem(str(room_id)))
         entry = self.host.entries.get(room_id)
-        payload = self._medal_tasks.get(room_id) or {}
         uid = int(entry.uid) if entry else 0
         level = self._medal_levels_room.get(room_id)
         if level is None and uid:
@@ -513,7 +605,8 @@ class MedalTab(QWidget):
             self.medal_hint.setText("请先在上方列表选择一个直播间")
             return
         if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
-            self.medal_hint.setText("该主播未持有粉丝牌，无法执行任务")
+            # 顺带把「怎么拿到牌子」说清（ROADMAP 101）；表格单元格仍保持「无粉丝牌」短文案
+            self.medal_hint.setText(f"该主播未持有粉丝牌，无法执行任务；{MEDAL_ACQUIRE_HINT}")
             return
         entry = self.host.entries.get(room_id)
         live = self.host.live_state.get(room_id)

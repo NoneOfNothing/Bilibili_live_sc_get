@@ -26,6 +26,11 @@ from blive_sc_get.app_config import (
 from blive_sc_get.gui_config import RoomEntry, load_room_entries, save_room_entries
 from blive_sc_get.medal_runner import MedalTaskRunner
 from blive_sc_get.medal_tasks import (
+    LIGHT_UP_DANMAKU_COUNT,
+    LIGHT_UP_LIKE_CLICKS,
+    MEDAL_ACQUIRE_HINT,
+    MEDAL_RULES_HELP,
+    SAVINGS_MODE_NOTE,
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     TASK_WATCH_LIVE,
@@ -33,10 +38,12 @@ from blive_sc_get.medal_tasks import (
     compute_action_delay,
     dedupe_medals,
     find_task,
+    format_intimacy_change,
     is_light_up_task,
     is_task_applicable,
     is_task_complete,
     medal_level_for_room,
+    monitored_medals,
     next_fallback_text,
     normalize_medal,
     normalize_task,
@@ -46,6 +53,7 @@ from blive_sc_get.medal_tasks import (
     parse_title_count,
     pending_write_tasks,
     room_exclusive_emoticons,
+    shows_medal_tasks,
     select_emoticon_cycle,
     should_auto_danmaku,
     task_label,
@@ -611,11 +619,174 @@ class RoomEntryAutoMedalTests(unittest.TestCase):
         self.assertFalse(second.auto_danmaku)
 
 
+class MedalRulesTextTests(unittest.TestCase):
+    """规则文案与口径（ROADMAP 101，两版共用同一份常量）。
+
+    这两段文案是本轮**唯一新增的界面提示**（用户从四个候选里只选了「点亮与清零规则」
+    与「拿牌方式」），所以既锁「该说的都说全」，也锁被否决的内容不许混进来——
+    「点赞 30 次 = 1 点 / 每天 300 赞上限」与「本日免费额度 X/30」都属未选中项。
+    """
+
+    def test_rules_help_covers_light_up_and_clearing(self):
+        """点亮维持 / 熄灭后果 / 清零，四句要点缺一不可。"""
+        for text in ("3 天", "大航海", "不掉亲密度", "不掉等级",
+                     "删除勋章", "退出粉丝团", "清零"):
+            with self.subTest(text=text):
+                self.assertIn(text, MEDAL_RULES_HELP)
+
+    def test_rules_help_says_tasks_are_how_you_keep_it(self):
+        """还要说清「这些任务 = 点亮并维持」，否则用户不知道这一页有何用。"""
+        self.assertIn("点亮任务", MEDAL_RULES_HELP)
+        self.assertIn("维持", MEDAL_RULES_HELP)
+
+    def test_rules_help_has_no_declined_quota_hints(self):
+        """被否决的额度提示不进规则弹窗。"""
+        for text in ("30 次", "300", "/30"):
+            with self.subTest(text=text):
+                self.assertNotIn(text, MEDAL_RULES_HELP,
+                                 "被否决的额度提示不该出现在规则弹窗里")
+
+    def test_rules_texts_have_no_markdown_markers(self):
+        """弹窗正文里星号会原样显示，故这两段文案不写 Markdown 强调标记。"""
+        for name, text in (("MEDAL_RULES_HELP", MEDAL_RULES_HELP),
+                           ("MEDAL_ACQUIRE_HINT", MEDAL_ACQUIRE_HINT)):
+            with self.subTest(constant=name):
+                self.assertNotIn("**", text)
+
+    def test_rules_help_lists_light_up_threshold(self):
+        """点亮门槛：完成任意一个点亮任务即可（免费与付费都算）。"""
+        self.assertIn("任意一个点亮任务", MEDAL_RULES_HELP)
+        self.assertIn("付费", MEDAL_RULES_HELP)
+
+    def test_rules_help_says_savings_need_paid_action(self):
+        """储蓄模式由「熄灭并重新点亮」触发；任一种付费行为都能领取、与灯牌是否点亮无关。"""
+        for text in ("熄灭并重新点亮后", "储蓄", "投喂付费礼物", "电池礼物", "领取",
+                     "与灯牌当前是否点亮无关"):
+            with self.subTest(text=text):
+                self.assertIn(text, MEDAL_RULES_HELP)
+
+    def test_acquire_hint_lists_three_ways_only(self):
+        """三种拿牌方式写全；用户明确不要「早年上舰附赠的免费灯牌已失效」那半句。"""
+        for text in ("投喂一个粉丝团灯牌", "视频充电 1 B 币", "开通大航海"):
+            with self.subTest(text=text):
+                self.assertIn(text, MEDAL_ACQUIRE_HINT)
+        for text in ("上舰", "坷垃", "失效"):
+            with self.subTest(text=text):
+                self.assertNotIn(text, MEDAL_ACQUIRE_HINT)
+
+    def test_savings_note_is_pool_wording(self):
+        """储蓄池口径：池内累计、满 100 停、需投喂付费礼物；旧的「刚点亮」说法不得复活。"""
+        for text in ("储蓄池", "100", "投喂付费礼物"):
+            with self.subTest(text=text):
+                self.assertIn(text, SAVINGS_MODE_NOTE)
+        self.assertIn("任务仍照做", SAVINGS_MODE_NOTE)
+        self.assertNotIn("刚点亮", SAVINGS_MODE_NOTE)
+
+    def test_light_up_counts_are_official(self):
+        """点亮任务的官方次数（点赞 30 次 / 发弹幕 10 条）别被顺手改掉。"""
+        self.assertEqual((LIGHT_UP_LIKE_CLICKS, LIGHT_UP_DANMAKU_COUNT), (30, 10))
+
+
+class IntimacyChangeTextTests(unittest.TestCase):
+    """「亲密度变化」列文案（ROADMAP 102，两版共用同一个纯函数）：一格只显示一段。
+
+    该列不宽，而两者又**不会同时为正**——进了储蓄模式后免费互动拿到的亲密度先进储蓄、
+    不进今日账，所以按「今日优先，今日为 0 才看储蓄」二选一即可。
+    """
+
+    def test_today_shown_when_positive(self):
+        self.assertEqual(format_intimacy_change(30, 0), "+30（今日亲密度）")
+        # 理论上不会同时 >0；真出现时也以今日为先，绝不拼成两段
+        self.assertEqual(format_intimacy_change(30, 26), "+30（今日亲密度）")
+
+    def test_savings_shown_when_today_is_zero(self):
+        self.assertEqual(format_intimacy_change(0, 26), "26（储蓄亲密度）")
+        self.assertEqual(format_intimacy_change(0, 100), "100（储蓄亲密度）")
+
+    def test_nothing_gained_falls_back_to_today_zero(self):
+        """两者都为 0、或任务信息还没取到（未知）→ 都显示今日 0。"""
+        self.assertEqual(format_intimacy_change(0, 0), "+0（今日亲密度）")
+        self.assertEqual(format_intimacy_change(0), "+0（今日亲密度）")
+        self.assertEqual(format_intimacy_change(None, "坏值"), "+0（今日亲密度）")
+
+    def test_only_one_label_in_a_cell(self):
+        """任何组合下都只有一段文案（列宽有限，不允许两段拼接）。"""
+        for today, savings in ((30, 0), (0, 26), (0, 0), (0, None), (7, 100)):
+            with self.subTest(today=today, savings=savings):
+                text = format_intimacy_change(today, savings)
+                self.assertEqual(text.count("（"), 1, f"出现了两段文案：{text}")
+                self.assertEqual(text.count("）"), 1, f"出现了两段文案：{text}")
+
+
+class MonitoredMedalsTests(unittest.TestCase):
+    """只显示**已加入监听列表**的粉丝牌（ROADMAP 103，两版共用）。
+
+    储蓄亲密度随任务接口下来，而任务只对监听列表里的房间拉取：未监控的牌子留在列表里会被
+    误读成「这个牌子的储蓄是 0」，所以隐藏，并把隐藏数量交给状态行说明。
+    """
+
+    MEDALS = [
+        {"medal_id": 1, "medal_name": "A", "target_id": 101, "room_id": 1001},
+        {"medal_id": 2, "medal_name": "B", "target_id": 202, "room_id": 2002},
+        {"medal_id": 3, "medal_name": "C", "target_id": 303, "room_id": 3003},
+    ]
+
+    def test_keeps_by_anchor_uid(self):
+        kept, hidden = monitored_medals(self.MEDALS, [(101, 999999)])
+        self.assertEqual([m["medal_id"] for m in kept], [1])
+        self.assertEqual(hidden, 2)
+
+    def test_keeps_by_real_room_id(self):
+        """短号场景：比对用的是**真实房间号**（此时 uid 对不上也能留下）。"""
+        kept, hidden = monitored_medals(self.MEDALS, [(0, 2002)])
+        self.assertEqual([m["medal_id"] for m in kept], [2])
+        self.assertEqual(hidden, 2)
+
+    def test_all_kept_when_all_monitored(self):
+        kept, hidden = monitored_medals(
+            self.MEDALS, [(101, 1001), (202, 2002), (303, 3003)])
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(hidden, 0)
+
+    def test_empty_room_list_hides_everything(self):
+        kept, hidden = monitored_medals(self.MEDALS, [])
+        self.assertEqual((kept, hidden), ([], 3))
+
+    def test_bad_items_skipped_and_zero_ids_never_match(self):
+        """非 dict 不是牌子（不计入隐藏）；全是 0 的牌子匹配不上任何房间。"""
+        kept, hidden = monitored_medals(
+            [None, "坏值", {"medal_id": 9, "target_id": 0, "room_id": 0}],
+            [(0, 0)])
+        self.assertEqual(kept, [])
+        self.assertEqual(hidden, 1)
+
+
+class ShowsMedalTasksTests(unittest.TestCase):
+    """「粉丝牌任务」表里给谁占行（ROADMAP 104）。
+
+    未持有该主播粉丝牌的房间不显示——那一行只有「无粉丝牌」三个字；但**状态未取到**时
+    必须照常显示，否则启动时整表会先空一下再长回来。
+    """
+
+    def test_hidden_when_explicitly_no_medal(self):
+        self.assertFalse(shows_medal_tasks({"no_medal": True, "tasks": []}))
+
+    def test_shown_when_has_tasks_or_error(self):
+        self.assertTrue(shows_medal_tasks({"no_medal": False, "tasks": []}))
+        self.assertTrue(shows_medal_tasks({"no_medal": False, "error": "获取失败"}))
+
+    def test_shown_when_state_unknown(self):
+        """还没拉到任务信息：照常占行（等刷新给出结论再收掉）。"""
+        for value in (None, {}, {"tasks": []}, "坏值", 5):
+            with self.subTest(value=value):
+                self.assertTrue(shows_medal_tasks(value))
+
+
 class _StubApi:
     """执行引擎的离线桩：模拟接口按调用推进任务进度。"""
 
     def __init__(self, tasks, emoticons=None, like_step=None, danmaku_step=1,
-                 free_intimacy_limit=False):
+                 free_intimacy_limit=False, free_intimacy=0):
         self.logged_in = True
         self.csrf = "csrf123"
         self.uid = 1
@@ -624,12 +795,13 @@ class _StubApi:
         self._like_step = like_step          # None=按 click_time 计入（模拟服务端等量统计）
         self._danmaku_step = danmaku_step
         self._free_intimacy_limit = free_intimacy_limit
+        self._free_intimacy = free_intimacy  # 储蓄池内累计（实测 0 / 12 / 100）
         self.like_calls = []
         self.danmaku_calls = []
 
     async def get_medal_task_info(self, target_id):
         return {"target_id": target_id, "tasks": list(self._tasks.values()),
-                "free_intimacy": 0,
+                "free_intimacy": self._free_intimacy,
                 "reach_free_intimacy_limit": self._free_intimacy_limit}
 
     async def like_room(self, room_id, anchor_uid, click_time=1):
@@ -701,26 +873,33 @@ class MedalRunnerTests(unittest.TestCase):
         self.assertEqual(len(api.like_calls), 3)  # max_retry(2)+1 次后停止
 
     def test_free_intimacy_limit_still_runs_tasks(self):
-        """「刚点亮的灯牌暂不涨亲密度」不等于任务不该做：点赞 / 发弹幕仍应执行（回归：曾被整房跳过）。"""
+        """储蓄池已满 ≠ 任务不该做：点赞 / 发弹幕仍应执行（回归：曾被整房跳过）。
+
+        口径见 ROADMAP 101：免费互动拿到的亲密度先攒进储蓄池、满 100 后不再累加，需投喂
+        付费礼物才能领取；但点亮任务照做才不至于 3 天后灯牌熄灭，所以这里锁两件事——
+        任务照跑，且缘由按储蓄口径说清（旧的「刚点亮」解释不得复活）。
+        """
         tasks = [
             {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 0,
              "limit": 10, "is_done": False, "raw": {}},
             {"jump_type": TASK_SEND_DANMAKU, "title": "发弹幕", "current": 0,
              "limit": 2, "is_done": False, "raw": {}},
         ]
-        api = _StubApi(tasks, free_intimacy_limit=True)
-        result = asyncio.run(MedalTaskRunner(api, _fast_config())
-                             .complete_room(100, 200, 1))
+        api = _StubApi(tasks, free_intimacy_limit=True, free_intimacy=100)
+        with self.assertLogs("blive_sc_get.medal_runner", level="INFO") as captured:
+            result = asyncio.run(MedalTaskRunner(api, _fast_config())
+                                 .complete_room(100, 200, 1))
         self.assertEqual(result["status"], "done")
         self.assertEqual(api.like_calls, [30])
         self.assertEqual(len(api.danmaku_calls), 2)
-        self.assertNotIn("储蓄", result["message"])
-        # 只在结果里说明缘由（亲密度为什么没涨），任务的执行与否不受影响
-        self.assertIn("粉丝灯牌刚点亮", result["message"])
-        self.assertIn("暂不涨亲密度", result["message"])
+        self.assertIn(SAVINGS_MODE_NOTE, result["message"])
+        self.assertNotIn("刚点亮", result["message"])
+        # 日志带上池内累计值：出问题时能分清「没读到字段」与「读了但没累加」
+        self.assertTrue(any("储蓄池已满" in line and "100" in line
+                            for line in captured.output), captured.output)
 
     def test_free_intimacy_limit_notes_completed_tasks(self):
-        """任务已完成、本轮无需执行时同样说明缘由（长时间不做任务灯牌会熄灭，本来就该做满）。"""
+        """任务已完成、本轮无需执行时同样说明缘由（点亮任务本来就该做满）。"""
         tasks = [
             {"jump_type": TASK_LIKE, "title": "点赞30次", "current": 10,
              "limit": 10, "is_done": True, "raw": {}},
@@ -730,7 +909,7 @@ class MedalRunnerTests(unittest.TestCase):
                              .complete_room(100, 200, 1))
         self.assertEqual(result["status"], "done")
         self.assertEqual(api.like_calls, [])
-        self.assertIn("粉丝灯牌刚点亮", result["message"])
+        self.assertIn(SAVINGS_MODE_NOTE, result["message"])
 
     def test_no_note_without_free_intimacy_limit(self):
         """未命中该标记时结果说明保持原样，不附带任何缘由。"""
@@ -743,7 +922,8 @@ class MedalRunnerTests(unittest.TestCase):
                              .complete_room(100, 200, 1))
         self.assertEqual(result["status"], "done")
         self.assertEqual(api.like_calls, [30])
-        self.assertNotIn("粉丝灯牌刚点亮", result["message"])
+        self.assertNotIn(SAVINGS_MODE_NOTE, result["message"])
+        self.assertNotIn("储蓄池", result["message"])
 
     def test_danmaku_loops_until_complete(self):
         """发弹幕同样按轮次推进直到完成。"""

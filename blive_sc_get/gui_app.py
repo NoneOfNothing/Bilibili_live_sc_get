@@ -45,12 +45,17 @@ from .cli import COOKIE_FILE_NAME, _pending_flush_loop, parse_room_id, resolve_c
 from .client import LIVE_STATUS_TEXT, RoomClient
 from .medal_runner import MedalTaskRunner
 from .medal_tasks import (
+    MEDAL_ACQUIRE_HINT,
+    MEDAL_RULES_HELP,
     TASK_LIKE,
     TASK_SEND_DANMAKU,
     TASK_WATCH_LIVE,
     auto_task_types,
     find_task,
+    format_intimacy_change,
     is_task_complete,
+    monitored_medals,
+    shows_medal_tasks,
     task_label,
 )
 from .gui_config import (
@@ -1152,7 +1157,9 @@ class ScMonitorApp:
         self._resize_wrap_frozen = False   # 拖动窗口期间 SC 文本暂停 word 换行
         self._wrap_restore_id: Optional[str] = None
         # 粉丝牌（任务）状态（仅主线程读写）
-        self._medals: List[dict] = []                 # 账号粉丝牌列表（panel 结果）
+        self._medals: List[dict] = []                 # 账号粉丝牌列表（panel 结果，**全部**）
+        self._medal_shown = 0                         # 其中显示在界面上的数量（已加入监听列表）
+        self._medal_hidden = 0                        # 未加入监听列表、被隐藏的数量（ROADMAP 103）
         self._medal_levels_room: Dict[int, int] = {}  # 房间号 -> 粉丝牌等级
         self._medal_levels_uid: Dict[int, int] = {}   # 主播 uid -> 粉丝牌等级
         self._medal_names_room: Dict[int, str] = {}   # 房间号 -> 粉丝牌名称
@@ -1593,6 +1600,10 @@ class ScMonitorApp:
         bar = ttk.Frame(tab)
         bar.pack(side="top", fill="x", padx=6, pady=(6, 2))
         ttk.Button(bar, text="刷新粉丝牌", command=self._on_refresh_medals).pack(side="left")
+        # 「ⓘ」规则说明（ROADMAP 101）：点亮 / 熄灭 / 清零与拿牌方式收进弹窗——与排序栏的
+        # 「ⓘ」同一写法，长文案不会把页签撑高；文案取自 medal_tasks，与 Qt 版同一份
+        ttk.Button(bar, text="ⓘ", width=2,
+                   command=self._show_medal_rules).pack(side="left", padx=(6, 0))
         self.medal_status_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.medal_status_var,
                   foreground="#666666").pack(side="left", padx=(8, 0))
@@ -1610,7 +1621,8 @@ class ScMonitorApp:
             ("level", "等级", 50, 40, "center"),
             ("anchor", "主播", 150, 80, "w"),
             ("room", "房间", 100, 70, "center"),
-            ("today", "今日亲密度", 100, 80, "center"),
+            # 「亲密度变化」列放「今日」或「储蓄」其中一段（二选一，见 format_intimacy_change）
+            ("today", "亲密度变化", 130, 110, "center"),
             ("exp", "当前/升级需", 110, 90, "center"),
             ("state", "状态", 110, 80, "center"),
         ):
@@ -1690,6 +1702,15 @@ class ScMonitorApp:
         self.medal_auto_like_check.pack(side="left", padx=(6, 0))
         self._update_medal_buttons()
 
+    def _show_medal_rules(self) -> None:
+        """粉丝牌规则弹窗（点亮 / 熄灭 / 清零 + 拿牌方式）。
+
+        文案取自 ``medal_tasks`` 的共享常量，Qt 版用同一份（避免两版说法漂移）。
+        """
+        messagebox.showinfo("粉丝牌规则",
+                            f"{MEDAL_RULES_HELP}\n\n{MEDAL_ACQUIRE_HINT}",
+                            parent=self.root)
+
     def _on_tab_changed(self, _event=None) -> None:
         """切到「粉丝牌」页签：同步房间行并启动自动刷新；切走则停止。"""
         try:
@@ -1742,6 +1763,17 @@ class ScMonitorApp:
         if hasattr(self, "medal_status_var"):
             self.medal_status_var.set(self._medal_master_text())
 
+    def _monitored_rooms(self) -> List[Tuple[int, int]]:
+        """监听列表里各房间的 ``(主播 uid, 真实房间号)``（供筛掉未监控的粉丝牌，ROADMAP 103）。"""
+        return [(int(entry.uid), int(self._room_id_map.get(rid, rid)))
+                for rid, entry in self.entries.items()]
+
+    def _medal_list_status_text(self) -> str:
+        """粉丝牌列表状态行：显示的数量 + 被隐藏的未监控数量 + 写操作 / 总开关。"""
+        note = (f"（另有 {self._medal_hidden} 个未加入监听列表，已隐藏）"
+                if self._medal_hidden else "")
+        return f"共 {self._medal_shown} 个粉丝牌{note} · {self._medal_master_text()}"
+
     def _medal_info_for(self, room_id: int, uid: int = 0):
         """返回该房间的（粉丝牌名称, 等级）；未持有该主播粉丝牌时返回 ("", 0)。"""
         if room_id in self._medal_levels_room:
@@ -1770,14 +1802,38 @@ class ScMonitorApp:
         if tree is None:
             return
         existing = {int(iid) for iid in tree.get_children()}
-        wanted = set(self.entries.keys())
+        # 只给**持有粉丝牌**的监听房间占行（ROADMAP 104）：未持有该主播粉丝牌的房间那一行
+        # 只有「无粉丝牌」三个字，既没有任务可看也不能执行任务，故整行不显示；
+        # 状态还没取到的房间照常显示（见 shows_medal_tasks），刷新给出结论后自然收掉。
+        wanted = {room_id for room_id in self.entries
+                  if shows_medal_tasks(self._medal_tasks.get(room_id))}
         for room_id in existing - wanted:
             tree.delete(str(room_id))
         for room_id in self.entries:
-            if room_id not in existing:
+            if room_id not in existing and room_id in wanted:
                 tree.insert("", "end", iid=str(room_id), values=("",) * 7)
             self._update_medal_task_row(room_id)
         self._apply_medal_task_order()
+
+    def _sync_medal_task_row_visibility(self, room_id: int) -> None:
+        """按「是否持有粉丝牌」决定该房间在任务表里占不占一行（ROADMAP 104）。
+
+        任务信息的到达是**逐个房间**的：某房间这轮才被判为「无粉丝牌」时要当场把行收掉
+        （否则它会一直挂在那里显示「无粉丝牌」），反过来重新持有时再补一行。
+        """
+        tree = getattr(self, "medal_task_tree", None)
+        if tree is None:
+            return
+        iid = str(room_id)
+        show = (room_id in self.entries
+                and shows_medal_tasks(self._medal_tasks.get(room_id)))
+        exists = bool(tree.exists(iid))
+        if show and not exists:
+            tree.insert("", "end", iid=iid, values=("",) * 7)
+            # 补回来的行落在末尾：立刻按直播间列表顺序重排，否则任务表会「不跟随列表顺序」
+            self._apply_medal_task_order()
+        elif not show and exists:
+            tree.delete(iid)
 
     def _apply_medal_task_order(self) -> None:
         """让「监听房间 · 任务」列表的行顺序与直播间列表**完全一致**（实时跟随）。
@@ -1975,8 +2031,13 @@ class ScMonitorApp:
             self.medal_status_var.set(f"获取粉丝牌失败：{error}")
             log_data.warning("获取粉丝牌失败：%s", error)
             return
-        medals = payload.get("medals") or []
-        self._medals = medals
+        all_medals = payload.get("medals") or []
+        self._medals = all_medals  # 保留完整列表（新增房间后无需重新请求即可重新筛）
+        # 只显示**已加入监听列表**的粉丝牌（ROADMAP 103）：储蓄亲密度是随任务接口一起下来
+        # 的，未监控的房间永远拿不到，留在列表里会被误读成「这个牌子的储蓄是 0」；
+        # 隐藏了几个由状态行说明。
+        medals, self._medal_hidden = monitored_medals(all_medals, self._monitored_rooms())
+        self._medal_shown = len(medals)
         self._medal_levels_room = {}
         self._medal_levels_uid = {}
         self._medal_names_room = {}
@@ -1999,12 +2060,15 @@ class ScMonitorApp:
             state = "点亮" if int(medal.get("is_lighted") or 0) == 1 else "未点亮"
             if int(medal.get("living_status") or 0) == 1:
                 state += "·直播中"
-            # 拆成两列：今日亲密度 = 今日已获取（today_feed）；
-            # 当前经验/升级需 = 当前亲密度 intimacy / 下一级门槛 next_intimacy
-            today_feed = int(medal.get("today_feed") or 0)
+            # 「亲密度变化」= 今日已获取（today_feed）与储蓄池内累计（任务接口的
+            # free_intimacy）**二选一**显示——列窄、且两者不会同时为正；两者都没有时显示
+            # 「+0（今日亲密度）」。格式化两版共用 format_intimacy_change。
+            # 「当前/升级需」= 当前亲密度 intimacy / 下一级门槛 next_intimacy
             intimacy = int(medal.get("intimacy") or 0)
             next_intimacy = int(medal.get("next_intimacy") or 0)
-            today = f"+{today_feed}"
+            today = format_intimacy_change(
+                medal.get("today_feed"),
+                (self._medal_tasks.get(room_id) or {}).get("free_intimacy"))
             exp = (f"{intimacy}/{next_intimacy}" if next_intimacy else str(intimacy))
             iid = str(int(medal.get("medal_id") or 0))
             self._medal_uid_by_iid[iid] = uid
@@ -2012,7 +2076,7 @@ class ScMonitorApp:
             tree.insert("", "end", iid=iid, values=(
                 name, level or "—",
                 medal.get("anchor_name") or "", room_id or "—", today, exp, state))
-        self.medal_status_var.set(f"共 {len(medals)} 个粉丝牌 · {self._medal_master_text()}")
+        self.medal_status_var.set(self._medal_list_status_text())
         for room_id in self.entries:
             self._update_medal_task_row(room_id)
         if self._selected_room_id is not None:
@@ -2113,7 +2177,32 @@ class ScMonitorApp:
             "free_intimacy": int(payload.get("free_intimacy") or 0),
             "reach_free_intimacy_limit": bool(payload.get("reach_free_intimacy_limit")),
         }
+        # 本轮才判为「无粉丝牌」的房间要当场收掉整行（反之则补行），再重绘内容（ROADMAP 104）
+        self._sync_medal_task_row_visibility(room_id)
         self._update_medal_task_row(room_id)
+        self._update_medal_intimacy_cell(room_id)
+
+    def _update_medal_intimacy_cell(self, room_id: int) -> None:
+        """刷新该房间粉丝牌行的「亲密度变化」列（储蓄池值随任务刷新到达，ROADMAP 102）。
+
+        粉丝牌列表与任务信息是两个接口、到达时间不同：任务信息晚到时若只重画任务行，
+        「储蓄亲密度」得等下一次整表刷新才出现——这里就地补上那一格。
+        """
+        room_id = int(room_id)
+        medal = next((m for m in self._medals
+                      if int(m.get("room_id") or 0) == room_id), None)
+        if medal is None:
+            return
+        iid = str(int(medal.get("medal_id") or 0))
+        if not self.medal_tree.exists(iid):
+            return
+        values = list(self.medal_tree.item(iid, "values"))
+        if len(values) < 5:
+            return
+        values[4] = format_intimacy_change(
+            medal.get("today_feed"),
+            (self._medal_tasks.get(room_id) or {}).get("free_intimacy"))
+        self.medal_tree.item(iid, values=values)
 
     # ---------- 粉丝牌：执行（手动 / 自动） ----------
 
@@ -2157,7 +2246,8 @@ class ScMonitorApp:
             self.medal_hint_var.set("该房间任务正在执行中")
             return
         if (self._medal_tasks.get(room_id) or {}).get("no_medal"):
-            self.medal_hint_var.set("该主播未持有粉丝牌，无法执行任务")
+            # 顺带把「怎么拿到牌子」说清（ROADMAP 101）；表格单元格仍保持「无粉丝牌」短文案
+            self.medal_hint_var.set(f"该主播未持有粉丝牌，无法执行任务；{MEDAL_ACQUIRE_HINT}")
             return
         runner = self._get_medal_runner()
         if runner is None:

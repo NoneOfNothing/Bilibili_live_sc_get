@@ -1193,3 +1193,147 @@ class QtEmoticonPanelTests(unittest.TestCase):
         tk_find = _method(tk, "ScMonitorApp", "_find_emoticon_package")
         self.assertIn("emoticon_package_id", _names(tk_find),
                       "Tk 版查找未按包 id（两版行为会不一致）")
+
+
+class MedalRulesWiringTests(unittest.TestCase):
+    """粉丝牌规则入口的接线（ROADMAP 101）。
+
+    文案常量放在 ``medal_tasks``（纯函数模块）里、两版都从那取——只锁「两版都用了这个
+    常量」还不够，还要锁**都从同一处导入**，否则各写一份、说法迟早漂移；再锁两版都有
+    「ⓘ 规则」入口，以及「未持有粉丝牌」的提示都带拿牌方式（表格单元格仍保持短文案）。
+    """
+
+    def test_constants_come_from_medal_tasks(self):
+        for module in ("gui_app.py", "qt_medal_tab.py"):
+            with self.subTest(module=module):
+                imported = set()
+                for node in ast.walk(_tree(module)):
+                    if isinstance(node, ast.ImportFrom) and node.module == "medal_tasks":
+                        imported |= {alias.name for alias in node.names}
+                for name in ("MEDAL_RULES_HELP", "MEDAL_ACQUIRE_HINT"):
+                    self.assertIn(name, imported,
+                                  f"{module} 未从 medal_tasks 引入 {name}（两版文案会漂移）")
+
+    def test_tk_rules_entry(self):
+        build = _method(_tree("gui_app.py"), "ScMonitorApp", "_build_medal_tab")
+        self.assertIn("_show_medal_rules", _attr_names(build),
+                      "Tk 粉丝牌页缺少「ⓘ」规则按钮或其处理函数")
+        show = _method(_tree("gui_app.py"), "ScMonitorApp", "_show_medal_rules")
+        self.assertIn("MEDAL_RULES_HELP", _names(show), "Tk 规则弹窗未用共享规则文案")
+        self.assertIn("MEDAL_ACQUIRE_HINT", _names(show), "Tk 规则弹窗未附拿牌方式")
+
+    def test_qt_rules_entry(self):
+        build = _method(_tree("qt_medal_tab.py"), "MedalTab", "_build_ui")
+        self.assertIn("medal_rules_btn", _attr_names(build), "Qt 粉丝牌页缺少「ⓘ 规则」按钮")
+        self.assertIn("_show_medal_rules", _attr_names(build), "Qt 规则按钮未接处理函数")
+        show = _method(_tree("qt_medal_tab.py"), "MedalTab", "_show_medal_rules")
+        self.assertIn("MEDAL_RULES_HELP", _names(show), "Qt 规则弹窗未用共享规则文案")
+        self.assertIn("MEDAL_ACQUIRE_HINT", _names(show), "Qt 规则弹窗未附拿牌方式")
+
+    def test_intimacy_change_column_uses_shared_formatter(self):
+        """「今日亲密度」列改名「亲密度变化」，两版都用共享格式化函数（ROADMAP 102）。"""
+        for module, cls, builders in (
+                ("gui_app.py", "ScMonitorApp",
+                 ("_on_medal_list", "_update_medal_intimacy_cell")),
+                ("qt_medal_tab.py", "MedalTab",
+                 ("on_medal_list", "_update_medal_intimacy_cell"))):
+            with self.subTest(module=module):
+                source = (PKG / module).read_text(encoding="utf-8")
+                # 只查**列标题字面量**（注释里引用单元格文案「+0（今日亲密度）」是允许的）
+                self.assertIn('"亲密度变化"', source, f"{module} 未把列名改成「亲密度变化」")
+                self.assertNotIn('"今日亲密度"', source,
+                                 f"{module} 仍留有旧的「今日亲密度」列标题")
+                tree = _tree(module)
+                for name in builders:
+                    node = _method(tree, cls, name)
+                    self.assertIn("format_intimacy_change", _names(node),
+                                  f"{module}.{name} 未用共享格式化函数（两版文案会漂移）")
+
+    def test_task_info_arrival_refreshes_savings_cell(self):
+        """任务信息晚到时就地补「储蓄亲密度」那一格，不等下一次整表刷新。"""
+        tk = _method(_tree("gui_app.py"), "ScMonitorApp", "_on_medal_task_info")
+        self.assertIn("_update_medal_intimacy_cell", _called_attrs(tk),
+                      "Tk 任务信息到达后未补刷「亲密度变化」列")
+        qt = _method(_tree("qt_medal_tab.py"), "MedalTab", "on_medal_task_info")
+        self.assertIn("_update_medal_intimacy_cell", _called_attrs(qt),
+                      "Qt 任务信息到达后未补刷「亲密度变化」列")
+
+    def test_medal_list_only_shows_monitored_rooms(self):
+        """两版都筛掉「未加入监听列表」的粉丝牌，并在状态行说明隐藏了几个（ROADMAP 103）。
+
+        储蓄亲密度是随任务接口下来的、而任务只对监听列表里的房间拉取——未监控的牌子留在
+        列表里会被误读成「储蓄是 0」，所以隐藏；但**必须说明隐藏数量**，否则用户会以为
+        牌子丢了。
+        """
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_medal_tab.py", "MedalTab")):
+            with self.subTest(module=module):
+                tree = _tree(module)
+                builder = _method(tree, cls,
+                                  "_on_medal_list" if cls == "ScMonitorApp"
+                                  else "on_medal_list")
+                self.assertIn("monitored_medals", _names(builder),
+                              f"{module} 未筛掉未监控的粉丝牌")
+                self.assertIn("_medal_hidden", _attr_names(builder),
+                              f"{module} 未记录被隐藏的数量")
+                rooms = _method(tree, cls, "_monitored_rooms")
+                self.assertIn("entries", _attr_names(rooms),
+                              f"{module} 的 _monitored_rooms 没取监听列表")
+
+        # 状态行必须带上「已隐藏」说明（两版各一处）
+        tk_text = {c.value for c in ast.walk(
+            _method(_tree("gui_app.py"), "ScMonitorApp", "_medal_list_status_text"))
+            if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+        self.assertTrue(any("已隐藏" in text for text in tk_text),
+                        "Tk 状态行未说明隐藏了几个粉丝牌")
+        qt_text = {c.value for c in ast.walk(
+            _method(_tree("qt_medal_tab.py"), "MedalTab", "update_status"))
+            if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+        self.assertTrue(any("已隐藏" in text for text in qt_text),
+                        "Qt 状态行未说明隐藏了几个粉丝牌")
+
+    def test_task_table_hides_rooms_without_medal(self):
+        """「粉丝牌任务」表不给未持有粉丝牌的房间占行（ROADMAP 104）。
+
+        任务信息是逐个房间到达的，所以除了整体重排（sync）之外，还得在**单房间**到达时
+        当场收掉/补上那一行；Qt 的排序也要按「有行」的房间算，否则行数对不上会整段跳过。
+        """
+        tk = _tree("gui_app.py")
+        self.assertIn("shows_medal_tasks",
+                      _names(_method(tk, "ScMonitorApp", "_sync_medal_task_rows")),
+                      "Tk 未按「是否持有粉丝牌」筛任务行")
+        self.assertIn("_sync_medal_task_row_visibility",
+                      _called_attrs(_method(tk, "ScMonitorApp", "_on_medal_task_info")),
+                      "Tk 任务信息到达时未调整该行的显示与否")
+
+        qt = _tree("qt_medal_tab.py")
+        self.assertIn("shows_medal_tasks",
+                      _names(_method(qt, "MedalTab", "sync_task_rows")),
+                      "Qt 未按「是否持有粉丝牌」筛任务行")
+        self.assertIn("shows_medal_tasks",
+                      _names(_method(qt, "MedalTab", "_apply_task_order")),
+                      "Qt 任务表排序未按「有行」的房间算（行数对不上会整段跳过）")
+        self.assertIn("_sync_task_row_visibility",
+                      _called_attrs(_method(qt, "MedalTab", "on_medal_task_info")),
+                      "Qt 任务信息到达时未调整该行的显示与否")
+        self.assertIn("shows_medal_tasks",
+                      _names(_method(qt, "MedalTab", "_update_task_row")),
+                      "Qt 兜底建行未排除「无粉丝牌」的房间（会把它又拉回来）")
+
+        # 补回来的行插在末尾，必须立刻重排——否则任务表不再跟随直播间列表顺序（实测踩到过）
+        self.assertIn("_apply_medal_task_order",
+                      _called_attrs(_method(tk, "ScMonitorApp",
+                                            "_sync_medal_task_row_visibility")),
+                      "Tk 补回任务行后未重排（顺序会与直播间列表不一致）")
+        self.assertIn("_apply_task_order",
+                      _called_attrs(_method(qt, "MedalTab",
+                                            "_sync_task_row_visibility")),
+                      "Qt 补回任务行后未重排（顺序会与直播间列表不一致）")
+
+    def test_no_medal_hint_mentions_acquire_way(self):
+        tk = _method(_tree("gui_app.py"), "ScMonitorApp", "_start_medal_room")
+        self.assertIn("MEDAL_ACQUIRE_HINT", _names(tk),
+                      "Tk「未持有粉丝牌」提示缺少拿牌方式")
+        qt = _method(_tree("qt_medal_tab.py"), "MedalTab", "_complete_selected")
+        self.assertIn("MEDAL_ACQUIRE_HINT", _names(qt),
+                      "Qt「未持有粉丝牌」提示缺少拿牌方式")
