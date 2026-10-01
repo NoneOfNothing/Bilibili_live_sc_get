@@ -63,7 +63,7 @@ python -m venv .venv
 ## 4. 测试
 
 ```bash
-.venv\Scripts\python -m unittest discover -s tests -q   # 当前 456 项，全绿
+.venv\Scripts\python -m unittest discover -s tests -q   # 当前 611 项，全绿
 ```
 
 没有网络依赖。改动后**必跑**：`py_compile` + 这套 unittest；涉及 Qt 控件逻辑时先在
@@ -264,3 +264,31 @@ SC 头部信息行新增 `已播 01:23:45`（排在「舰长」之后、粉丝�
 - **日志覆盖**：以上路径都补了留痕——分页完成与翻页后视口、表情面板渲染到哪个包、关注列表的三种
   跳过原因与空结果、启动恢复选中失败的原因；级别沿用项目约定（用户动作 info、细节与判定 debug），
   不记录 cookie。
+
+## 14. 接口自检结论与根目录开发脚本（会话 2026-10-01）
+
+### 14.1 为什么 SC 只能走 WebSocket（2026-09-30 用本机 `cookie.txt` 实测，脚本已删，结论归档在此）
+
+**结论：B 站目前不通过 REST 接口对外提供 SC 列表**，SC 只能靠弹幕 WebSocket 实时推送
+（`cmd=SUPER_CHAT_MESSAGE`）获取；「进场时已有的 SC」也拿不到。逐条实测（`nav` 登录态 OK、cookie 有效）：
+
+| 接口 | 实测结果 |
+|------|----------|
+| `xlive/web-room/v1/index/getInfoByRoom` | `code=0`，返回完整房间信息（87 个顶层字段） |
+| 同上返回里的 `super_chat_message` | 恒为 `null` —— 2019 年的老字段，已失效 |
+| 同上返回里的 `super_chat_info.message_list` | 200 个在播房间（跨虚拟主播 / 娱乐 / 游戏等分区）**全为空** → 拿不到 SC |
+| `av/v1/SuperChat/config` | 可用（返回 SC 配置，含当前登录用户信息） |
+| `av/v1/SuperChat/getRankMessageList` / `getAnchorRankedList` | `code=0` 但 `data={}` 空 |
+| `av/v1/SuperChat/getMessageList`（老） | `{"code":0,"data":{"list":null}}` |
+| `xlive/…/getDanmuInfo` | **−352 风控**（加 WBI 签名同样 −352）；它是连弹幕服务器（拿 token/host）的前置，被风控会影响 WebSocket 连接 |
+
+需要复测时按上表逐接口重跑即可（当初的自检脚本 `_test_getInfoByRoom.py` 已删除，结论留在这里）。
+
+### 14.2 根目录开发脚本的去留（2026-10-01 整理）
+
+- **保留 `_spike_live_preview.py`**：ROADMAP 63 明确约定「保留在工作区供复测」，`requirements.txt`
+  也引用它复测本机解码内核（需 PySide6≥6.8 / FFmpeg 默认后端）。
+- **保留 `_dm_stress_test.py`**：弹幕写入压测小程序（独立、不依赖项目代码），CHANGELOG 里「弹幕卡死」
+  那几条结论就是它跑出来的；改动弹幕区渲染或行数上限时用它复现临界点。
+- **已删 `_diag_audio_device.py`**：结论与做法已固化在 ROADMAP 76 / CHANGELOG（含两次踩坑与最终方案），
+  且正式程序自带 10 秒巡检 + `window` debug 日志（打印系统默认与各路实际设备），诊断手段不再需要单独脚本。
