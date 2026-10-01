@@ -42,9 +42,11 @@ from blive_sc_get.medal_tasks import (
     is_light_up_task,
     is_task_applicable,
     is_task_complete,
+    medal_for_room,
     medal_level_for_room,
     monitored_medals,
     next_fallback_text,
+    partition_medal_task_rooms,
     normalize_medal,
     normalize_task,
     parse_medal_panel,
@@ -759,6 +761,58 @@ class MonitoredMedalsTests(unittest.TestCase):
             [(0, 0)])
         self.assertEqual(kept, [])
         self.assertEqual(hidden, 1)
+
+
+class MedalTaskRoomPartitionTests(unittest.TestCase):
+    """按粉丝牌把「要刷任务的房间」分桶（ROADMAP 105）。
+
+    只有「持牌」的房间需要请求任务接口；「无牌」与「缺 uid」两类零请求，也不该参与节流。
+    ``medals=None``（列表未就绪 / 定向点名）时不做无牌判定，而空列表是**另一种意思**——
+    账号确实一张牌子都没有，此时所有房间都该判为无牌。
+    """
+
+    MEDALS = [{"medal_id": 1, "target_id": 101, "room_id": 1001},
+              {"medal_id": 2, "target_id": 202, "room_id": 2002}]
+
+    def test_splits_by_uid_and_real_room(self):
+        rooms = [(1016, 101, 1001),   # uid 命中
+                 (555, 999, 2002),    # uid 不在牌列表里，但真实房间号命中（短号场景）
+                 (777, 303, 3003),    # 未持有该主播粉丝牌
+                 (888, 0, 0)]         # 连主播 uid 都没有
+        buckets = partition_medal_task_rooms(rooms, self.MEDALS)
+        self.assertEqual(buckets["fetch"], [(1016, 101), (555, 999)])
+        self.assertEqual(buckets["no_medal"], [777])
+        self.assertEqual(buckets["no_uid"], [888])
+
+    def test_room_without_uid_never_fetched(self):
+        """没有 uid 的房间查不了任务接口（它要的就是 uid），即使牌列表里有它的牌子。"""
+        buckets = partition_medal_task_rooms([(555, 0, 2002)], self.MEDALS)
+        self.assertEqual(buckets["fetch"], [])
+        self.assertEqual(buckets["no_uid"], [555])
+
+    def test_none_medals_means_no_medal_judgement(self):
+        """没有可用列表时（未就绪 / 定向点名）：不判无牌，凡有 uid 的都查。"""
+        buckets = partition_medal_task_rooms([(1016, 101, 1001), (777, 303, 3003)], None)
+        self.assertEqual(buckets["fetch"], [(1016, 101), (777, 303)])
+        self.assertEqual(buckets["no_medal"], [])
+        self.assertEqual(buckets["no_uid"], [])
+
+    def test_empty_medals_list_marks_every_room_no_medal(self):
+        """已就绪但账号一张牌子都没有：全部判无牌（绝不能当成「未就绪」）。"""
+        buckets = partition_medal_task_rooms([(1016, 101, 1001)], [])
+        self.assertEqual(buckets["fetch"], [])
+        self.assertEqual(buckets["no_medal"], [1016])
+
+    def test_empty_rooms(self):
+        self.assertEqual(partition_medal_task_rooms([], self.MEDALS),
+                         {"fetch": [], "no_medal": [], "no_uid": []})
+
+    def test_medal_for_room_matches_uid_or_room(self):
+        self.assertEqual(medal_for_room(self.MEDALS, 101, 0)["medal_id"], 1)
+        self.assertEqual(medal_for_room(self.MEDALS, 0, 2002)["medal_id"], 2)
+        self.assertIsNone(medal_for_room(self.MEDALS, 999, 9999))
+        self.assertIsNone(medal_for_room(self.MEDALS, 0, 0))  # 两个键都没有：无从匹配
+        self.assertIsNone(medal_for_room([None, "坏值"], 101, 1001))
 
 
 class ShowsMedalTasksTests(unittest.TestCase):

@@ -1156,8 +1156,9 @@ class QtScMonitorApp(QMainWindow):
             return
         if self.hub.api is None or not self.hub.api.logged_in:
             return
-        self.hub.submit(self.medal_tab._async_refresh_medals())
-        self.hub.submit(self.medal_tab._async_refresh_tasks(announce=False))
+        # 先拉粉丝牌、再按它刷任务（**串行**）：任务刷新要用列表筛「该刷哪些房间」
+        # （ROADMAP 105；并发提交时任务那侧拿不到列表、会把每个房间都请求一遍）
+        self.hub.submit(self.medal_tab._refresh_medals_then_tasks(announce=False))
 
     def _interrupt_auto_danmaku(self, room_id: int) -> None:
         """开播信号打断该房间正在执行的「自动发弹幕」任务（与 Tk 版一致，ROADMAP 64）。
@@ -2809,8 +2810,9 @@ class QtScMonitorApp(QMainWindow):
         if (room_id is not None and self.hub.ready.is_set()
                 and self.hub.api is not None and self.hub.api.logged_in):
             self.hub.submit(self.medal_tab._async_refresh_medals())
+            # 定向补刷：点名就查，不走粉丝牌/启用筛选（否则刚执行完可能刷不出结果）
             self.hub.submit(self.medal_tab._async_refresh_tasks(
-                room_ids=[room_id], announce=False))
+                room_ids=[room_id], announce=False, targeted=True))
 
     def _input_room_for(self, real_room_id) -> Optional[int]:
         """真实房间号 → 界面里的输入房间号（短号场景 runner 回报的是真实号）。"""

@@ -37,6 +37,7 @@ from .medal_tasks import (
     format_intimacy_change,
     is_task_complete,
     monitored_medals,
+    partition_medal_task_rooms,
     shows_medal_tasks,
     task_label,
 )
@@ -73,6 +74,7 @@ class MedalTab(QWidget):
         super().__init__()
         self.host = host
         self._medals: list = []        # 账号粉丝牌列表（**全部**）
+        self._medals_loaded = False    # 是否成功拉到过粉丝牌列表（ROADMAP 105）
         self._medal_shown = 0          # 其中显示在界面上的数量（已加入监听列表）
         self._medal_hidden = 0         # 未加入监听列表、被隐藏的数量（ROADMAP 103）
         self._medal_levels_room: Dict[int, int] = {}
@@ -253,82 +255,125 @@ class MedalTab(QWidget):
             return
         self.medal_status.setText("正在获取粉丝牌…")
         self.sync_task_rows()
-        host.hub.submit(self._async_refresh_medals())
-        host.hub.submit(self._async_refresh_tasks())
+        host.hub.submit(self._refresh_medals_then_tasks())
 
-    async def _async_refresh_medals(self) -> None:
+    async def _async_fetch_medals(self) -> Optional[list]:
+        """拉取粉丝牌列表并入队；**返回结果**供任务刷新直接使用（避免与界面处理的竞态）。"""
         api = self.api()
         if api is None:
             self.ui_queue().put(("medal_list", {"ok": False, "medals": [],
-                                               "error": "后台未就绪"}))
-            return
+                                                "error": "后台未就绪"}))
+            return None
         try:
             medals = await api.get_medals()
-            self.ui_queue().put(("medal_list", {"ok": True, "medals": medals,
-                                                "error": None}))
         except Exception as exc:
             self.ui_queue().put(("medal_list", {"ok": False, "medals": [],
-                                               "error": str(exc)}))
+                                                "error": str(exc)}))
+            return None
+        self.ui_queue().put(("medal_list", {"ok": True, "medals": medals,
+                                            "error": None}))
+        return medals
+
+    async def _async_refresh_medals(self) -> None:
+        await self._async_fetch_medals()
+
+    async def _refresh_medals_then_tasks(self, announce: bool = True) -> None:
+        """先拉粉丝牌、再按它刷新各房间任务（**串行**，ROADMAP 105）。
+
+        此前两者是**并发提交**的：刷任务时粉丝牌列表还没到手 → 任务那侧拿不到筛选依据 →
+        每个监听房间都真发一次请求（启动首轮最慢的来源之一）。串行后与 Tk 版启动路径一致，
+        且 ``announce=False``（定时静默刷新）时任务那侧同样静默。
+        """
+        medals = await self._async_fetch_medals()
+        await self._async_refresh_tasks(medals=medals, announce=announce)
 
     async def _async_refresh_tasks(self, room_ids: Optional[List[int]] = None,
-                                   announce: bool = True) -> None:
-        """逐个房间刷新粉丝牌任务。
+                                   announce: bool = True,
+                                   medals: Optional[list] = None,
+                                   targeted: bool = False) -> None:
+        """按粉丝牌筛选后逐个房间刷新任务（与 Tk 版同职责，ROADMAP 105）。
 
-        ``get_medal_task_info`` 要的是**主播 uid**（不是房间号）；已拉到粉丝牌
-        列表时，未持有该主播粉丝牌的房间直接标记「无粉丝牌」，不再请求接口。
-        ``room_ids`` 为空表示刷新全部监听房间；``announce=False`` 供定时静默刷新
-        与「任务结束后补刷」使用（不覆盖用户可见提示）。
+        先用粉丝牌列表把房间分成「持牌 / 无牌 / 缺 uid」，**只对持牌的房间请求**，且节流只
+        发生在**两次真实请求之间**——此前每个房间末尾都要等 0.5 秒，房间多而持牌少时几乎全
+        耗在空等上（40 间 / 5 持牌约 20 秒）。
+
+        - ``room_ids`` 为空表示刷新全部监听房间；
+        - ``medals`` 为已拉取的粉丝牌列表（``_refresh_medals_then_tasks`` 串行取到后传入）；
+          ``None`` 时用 ``self._medals``，而 ``_medals_loaded`` 为假表示从没成功拉到过 → 未就绪；
+        - ``announce=False`` 供定时静默刷新与「任务结束后补刷」使用；
+        - ``targeted=True``：定向补刷——不按粉丝牌、也不按启用状态筛选，点名就查。
+
+        全量刷新跳过「停用监听」的房间；粉丝牌列表未就绪时**跳过本轮**并说明——「没拿到列表」
+        不能当成「所有房间都没牌子」。
         """
         host = self.host
         api = self.api()
-        rooms = (list(host.entries.keys()) if room_ids is None
-                 else [r for r in room_ids if r in host.entries])
-        if not rooms:
-            if announce:
-                self.ui_queue().put(("medal_tasks_done", {
-                    "total": 0, "ok": 0, "no_medal": 0, "error": 0}))
-            return
+        if room_ids is None:
+            room_ids = list(host.entries.keys())
         if api is None:
             if announce:
                 self.ui_queue().put(("medal_tasks_done", {
-                    "total": len(rooms), "api": False}))
+                    "total": len(room_ids), "api": False}))
             return
-        known_uids = {int(m.get("target_id") or 0) for m in (self._medals or [])}
-        known_rooms = {int(m.get("room_id") or 0) for m in (self._medals or [])}
-        done = {"total": len(rooms), "ok": 0, "no_medal": 0, "error": 0}
-        for index, room_id in enumerate(rooms):
+        source = self._medals if medals is None else medals
+        if not targeted and not self._medals_loaded:
+            log_task.info("粉丝牌任务刷新跳过：粉丝牌列表尚未加载（待刷 %d 个房间）",
+                          len(room_ids))
+            if announce:
+                self.ui_queue().put(("medal_tasks_done", {
+                    "total": len(room_ids), "ok": 0, "no_medal": 0, "error": 0,
+                    "not_ready": True}))
+            return
+        rooms = []
+        for room_id in room_ids:
             entry = host.entries.get(room_id)
-            uid = int(entry.uid) if entry else 0
-            real_room = host.real_room_id(room_id)
-            if not uid:
+            if entry is None:
+                continue  # 房间已删除：无事可做
+            if not targeted and not entry.enabled:
+                continue  # 停用监听：全量刷新跳过（ROADMAP 105）
+            rooms.append((int(room_id), int(entry.uid or 0),
+                          int(host.real_room_id(room_id))))
+        # 定向补刷传 None：不做无牌判定，有 uid 的房间都查（见 partition_medal_task_rooms）
+        buckets = partition_medal_task_rooms(rooms, None if targeted else source)
+        done = {"total": len(rooms), "ok": 0, "no_medal": 0, "error": 0,
+                "requests": 0, "disabled": len(room_ids) - len(rooms)}
+        for room_id in buckets["no_medal"]:
+            # 未持有该主播粉丝牌：零请求，也不参与节流
+            self.ui_queue().put(("medal_task_info", {
+                "room_id": room_id, "ok": True, "no_medal": True, "tasks": []}))
+            done["no_medal"] += 1
+        for room_id in buckets["no_uid"]:
+            self.ui_queue().put(("medal_task_info", {
+                "room_id": room_id, "ok": False, "no_medal": False,
+                "error": "未知主播 uid", "tasks": []}))
+            done["error"] += 1
+        started = time.time()
+        for index, (room_id, uid) in enumerate(buckets["fetch"]):
+            if index:
+                # 只在两次真实请求之间节流（与 Tk 版一致）
+                await asyncio.sleep(MEDAL_TASK_REFRESH_GAP_S)
+            done["requests"] += 1
+            try:
+                info = await api.get_medal_task_info(uid)
+            except Exception as exc:
                 self.ui_queue().put(("medal_task_info", {
                     "room_id": room_id, "ok": False, "no_medal": False,
-                    "error": "未知主播 uid", "tasks": []}))
+                    "error": str(exc), "tasks": []}))
                 done["error"] += 1
-            elif known_uids and uid not in known_uids and real_room not in known_rooms:
-                self.ui_queue().put(("medal_task_info", {
-                    "room_id": room_id, "ok": True, "no_medal": True, "tasks": []}))
-                done["no_medal"] += 1
             else:
-                try:
-                    info = await api.get_medal_task_info(uid)
-                except Exception as exc:
-                    self.ui_queue().put(("medal_task_info", {
-                        "room_id": room_id, "ok": False, "no_medal": False,
-                        "error": str(exc), "tasks": []}))
-                    done["error"] += 1
-                else:
-                    self.ui_queue().put(("medal_task_info", {
-                        "room_id": room_id, "ok": True,
-                        "no_medal": bool(info.get("no_medal", False)),
-                        "error": None, "tasks": info.get("tasks") or [],
-                        "free_intimacy": info.get("free_intimacy"),
-                        "reach_free_intimacy_limit": info.get(
-                            "reach_free_intimacy_limit")}))
-                    done["ok"] += 1
-            # 逐个房间节流，避免瞬时并发请求触发风控（与 Tk 版一致）
-            if index + 1 < len(rooms):
-                await asyncio.sleep(MEDAL_TASK_REFRESH_GAP_S)
+                self.ui_queue().put(("medal_task_info", {
+                    "room_id": room_id, "ok": True,
+                    "no_medal": bool(info.get("no_medal", False)),
+                    "error": None, "tasks": info.get("tasks") or [],
+                    "free_intimacy": info.get("free_intimacy"),
+                    "reach_free_intimacy_limit": info.get(
+                        "reach_free_intimacy_limit")}))
+                done["ok"] += 1
+        done["elapsed"] = round(time.time() - started, 1)
+        log_task.info("粉丝牌任务刷新完成：请求 %d 次、跳过无牌 %d 个、缺 uid %d 个、"
+                      "跳过停用 %d 个、失败 %d 个（用时 %.1fs）",
+                      done["requests"], done["no_medal"], len(buckets["no_uid"]),
+                      done["disabled"], done["error"], done["elapsed"])
         if announce:
             self.ui_queue().put(("medal_tasks_done", done))
 
@@ -340,6 +385,7 @@ class MedalTab(QWidget):
             return
         all_medals = payload.get("medals") or []
         self._medals = all_medals  # 保留完整列表（新增房间后无需重新请求即可重新筛）
+        self._medals_loaded = True  # 列表已就绪：任务刷新据此判定「未持有粉丝牌」（ROADMAP 105）
         # 只显示**已加入监听列表**的粉丝牌（ROADMAP 103）——理由见 Tk 版同名处理
         medals, self._medal_hidden = monitored_medals(all_medals, self._monitored_rooms())
         self._medal_shown = len(medals)
@@ -421,7 +467,17 @@ class MedalTab(QWidget):
         if payload.get("api") is False:
             self.medal_hint.setText("后台未就绪，任务刷新取消")
             return
-        parts = [f"任务刷新完成（{payload.get('total', 0)} 个房间）"]
+        if payload.get("not_ready"):
+            # 粉丝牌列表就是「该刷哪些房间」的筛选依据，没拿到就不猜（ROADMAP 105）
+            self.medal_hint.setText("粉丝牌列表未就绪，稍后自动重试")
+            return
+        line = f"任务刷新完成（{payload.get('total', 0)} 个房间"
+        if payload.get("disabled"):
+            line += f"，跳过停用监听 {int(payload['disabled'])} 个"
+        line += "）"
+        parts = [line]
+        if payload.get("requests") is not None:
+            parts.append(f"请求 {int(payload['requests'])} 次 · 用时 {payload.get('elapsed', 0)}s")
         if payload.get("ok"):
             parts.append(f"有任务 {payload['ok']}")
         if payload.get("no_medal"):

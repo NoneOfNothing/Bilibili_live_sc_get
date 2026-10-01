@@ -340,6 +340,61 @@ def shows_medal_tasks(task_info: Any) -> bool:
     return not bool(task_info.get("no_medal"))
 
 
+def medal_for_room(medals: List[dict], uid: Any = 0, room_id: Any = 0) -> Optional[dict]:
+    """在粉丝牌列表里找某个直播间的粉丝牌；找不到返回 None。
+
+    判定口径与 ``monitored_medals``、任务表「该房间是否持有粉丝牌」一致：粉丝牌的
+    ``target_id`` 等于主播 uid，**或** ``room_id`` 等于该房间号（**真实房间号**，短号场景
+    由调用方先映射）。uid 与房间号都为 0 时直接返回 None（无从匹配）。
+    """
+    wanted_uid = _int(uid)
+    wanted_room = _int(room_id)
+    if not wanted_uid and not wanted_room:
+        return None
+    for medal in medals or []:
+        if not isinstance(medal, dict):
+            continue
+        if wanted_uid and _int(medal.get("target_id")) == wanted_uid:
+            return medal
+        if wanted_room and _int(medal.get("room_id")) == wanted_room:
+            return medal
+    return None
+
+
+def partition_medal_task_rooms(rooms: Iterable[Tuple[Any, Any, Any]],
+                               medals: Optional[List[dict]]
+                               ) -> Dict[str, List]:
+    """把「要刷任务的房间」按粉丝牌分成三类（ROADMAP 105）。
+
+    ``rooms`` 为 ``(房间号, 主播 uid, 真实房间号)`` 三元组序列（短号场景由调用方先映射）。
+    返回 ``{"fetch": [(房间号, uid), …], "no_medal": [房间号, …], "no_uid": [房间号, …]}``：
+
+    - ``fetch``：在粉丝牌列表里**找得到牌子**的房间——只有这些需要请求任务接口；
+    - ``no_medal``：已有粉丝牌列表但找不到牌子的房间——直接判为「无粉丝牌」，**零请求**，
+      也不参与节流（此前它们虽然不请求，却会让每个房间都白等 0.5 秒）；
+    - ``no_uid``：连主播 uid 都没有的房间（接口按 uid 查询，本就查不了）。
+
+    ``medals`` 传 ``None`` 表示**没有可用的粉丝牌列表**（未就绪，或本次是「点名就查」的
+    定向刷新）：此时不做无牌判定，凡有 uid 的房间都进 ``fetch``——调用方若要「未就绪就跳过
+    本轮」，应在调用前自行判断并提示，不要让它退化成「所有房间都没牌子」。传空列表 ``[]``
+    是**另一种意思**：列表已就绪、账号确实一张牌子都没有 → 所有房间都判为无牌。
+    """
+    fetch: List[Tuple[int, int]] = []
+    no_medal: List[int] = []
+    no_uid: List[int] = []
+    for room_id, uid, real_room in rooms or []:
+        room_value = _int(room_id)
+        uid_value = _int(uid)
+        if not uid_value:
+            no_uid.append(room_value)
+            continue
+        if medals is None or medal_for_room(medals, uid_value, real_room):
+            fetch.append((room_value, uid_value))
+        else:
+            no_medal.append(room_value)
+    return {"fetch": fetch, "no_medal": no_medal, "no_uid": no_uid}
+
+
 def monitored_medals(medals: List[dict],
                      rooms: Iterable[Tuple[Any, Any]]) -> Tuple[List[dict], int]:
     """只保留**已加入监听列表**的直播间的粉丝牌，返回 ``(保留的, 隐藏数量)``（ROADMAP 103）。

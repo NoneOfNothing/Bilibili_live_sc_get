@@ -1195,6 +1195,66 @@ class QtEmoticonPanelTests(unittest.TestCase):
                       "Tk 版查找未按包 id（两版行为会不一致）")
 
 
+class MedalTaskRefreshSpeedupTests(unittest.TestCase):
+    """任务刷新按粉丝牌筛房间、只对真请求节流（ROADMAP 105）。
+
+    提速的两个前提必须同时在：① 只对「持牌」的房间发请求（无牌 / 缺 uid 零请求）；
+    ② 节流只发生在两次真实请求之间（此前每个房间末尾都等 0.5 秒）。
+    另锁两处「必须串行」——启动与定时刷新都得先拉粉丝牌再刷任务，否则任务那侧拿不到筛选依据。
+    """
+
+    def test_tk_refresh_partitions_and_skips_disabled(self):
+        node = _method(_tree("gui_app.py"), "ScMonitorApp", "_async_refresh_medal_tasks")
+        self.assertIn("partition_medal_task_rooms", _names(node), "Tk 未按粉丝牌分桶")
+        self.assertIn("_medals_loaded", _attr_names(node), "Tk 未处理「粉丝牌列表未就绪」")
+        self.assertIn("not_ready", {c.value for c in ast.walk(node)
+                                    if isinstance(c, ast.Constant)},
+                      "Tk 未把「未就绪」上报给提示区")
+        self.assertIn("enabled", _attr_names(node), "Tk 全量刷新未跳过「停用监听」")
+        self.assertIn("targeted", _attr_names(node) | _names(node), "Tk 缺定向补刷开关")
+        self.assertIn("MEDAL_TASK_REFRESH_GAP_S", _names(node), "Tk 节流间隔常量被改动")
+
+    def test_qt_refresh_partitions_and_skips_disabled(self):
+        node = _method(_tree("qt_medal_tab.py"), "MedalTab", "_async_refresh_tasks")
+        self.assertIn("partition_medal_task_rooms", _names(node), "Qt 未按粉丝牌分桶")
+        self.assertIn("_medals_loaded", _attr_names(node), "Qt 未处理「粉丝牌列表未就绪」")
+        self.assertIn("not_ready", {c.value for c in ast.walk(node)
+                                    if isinstance(c, ast.Constant)},
+                      "Qt 未把「未就绪」上报给提示区")
+        self.assertIn("enabled", _attr_names(node), "Qt 全量刷新未跳过「停用监听」")
+        self.assertIn("MEDAL_TASK_REFRESH_GAP_S", _names(node), "Qt 节流间隔常量被改动")
+
+    def test_start_and_tick_refresh_are_sequential(self):
+        """先拉粉丝牌、再刷任务：并发提交时任务那侧拿不到筛选依据（首轮会把每间都请求一遍）。"""
+        qt = _tree("qt_medal_tab.py")
+        combo = _method(qt, "MedalTab", "_refresh_medals_then_tasks")
+        called = _called_attrs(combo)
+        self.assertIn("_async_fetch_medals", called, "Qt 串行组合未先拉粉丝牌")
+        self.assertIn("_async_refresh_tasks", called, "Qt 串行组合未在拉牌后刷任务")
+        on_refresh = _method(qt, "MedalTab", "_on_refresh")
+        self.assertIn("_refresh_medals_then_tasks", _called_attrs(on_refresh),
+                      "Qt 启动/手动刷新未走串行组合")
+        self.assertNotIn("_async_refresh_tasks", _called_attrs(on_refresh),
+                         "Qt 仍并发提交任务刷新（首轮会把每个房间都请求一遍）")
+
+        qt_app = _tree("qt_app.py")
+        tick = _called_attrs(_method(qt_app, "QtScMonitorApp", "_medal_tab_refresh_tick"))
+        self.assertIn("_refresh_medals_then_tasks", tick, "Qt 定时刷新未走串行组合")
+        self.assertNotIn("_async_refresh_tasks", tick, "Qt 定时刷新仍并发提交任务刷新")
+
+        tk_tick = _called_attrs(_method(_tree("gui_app.py"), "ScMonitorApp",
+                                       "_medal_tab_refresh_tick"))
+        self.assertIn("_async_refresh_medals_and_tasks", tk_tick, "Tk 定时刷新未走串行组合")
+
+    def test_targeted_refresh_bypasses_filters(self):
+        """执行完某房间后的定向补刷要「点名就查」，不能因为没牌/已停用而刷不出结果。"""
+        for module in ("gui_app.py", "qt_app.py"):
+            with self.subTest(module=module):
+                source = (PKG / module).read_text(encoding="utf-8")
+                self.assertIn("targeted=True", source,
+                              f"{module} 的定向补刷未传 targeted（会被筛掉）")
+
+
 class MedalRulesWiringTests(unittest.TestCase):
     """粉丝牌规则入口的接线（ROADMAP 101）。
 
