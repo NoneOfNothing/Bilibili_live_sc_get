@@ -30,20 +30,28 @@ SORT_MODES = ("manual", "room", "anchor", "status")
 NOTIFY_SOUNDS = ("上行双音", "三连音", "Windows 系统提示音", "静音")
 DEFAULT_NOTIFY_SOUND = "上行双音"
 
-QUICK_DANMAKU_MAX = 12
-"""每个直播间的快捷弹幕最多保存多少条（下拉过长不好用，也限制配置文件体积）。"""
+def _text_or_empty(value: Any) -> str:
+    """只接受字符串，其余（None / 数字 / 列表…）一律当**空串**＝没记过。
+
+    配置里的坏数据不该让整个房间列表读不出来（与 ``normalize_quick_danmaku`` 同一立场）。
+    """
+    return value if isinstance(value, str) else ""
 
 
 def normalize_quick_danmaku(value: Any) -> List[str]:
     """清洗某个直播间的快捷弹幕文本列表（纯函数，ROADMAP 90）。
 
-    只保留**非空字符串**：去首尾空白、保序去重，最多 ``QUICK_DANMAKU_MAX`` 条。非列表 /
-    含非字符串项一律丢弃而**不抛异常**——配置里的坏数据不该让整个房间列表读不出来。
+    只保留**非空字符串**：去首尾空白、保序去重。非列表 / 含非字符串项一律丢弃而
+    **不抛异常**——配置里的坏数据不该让整个房间列表读不出来。
 
     **不限制单条长度**（ROADMAP 91）：预设只是「待填入输入框的文本」，能不能发由服务端
     判定（发送侧本来也早已取消客户端截断，见 ``gui_app.danmaku_send_guard``）。此前按
     20 字截断，预设里写长句会被悄悄砍短，更糟的是**打开一次管理对话框再关闭就会把截断后
     的文本写回配置**（用户反馈「快捷弹幕预设也不能超过 20 字」）。
+
+    **不限制条数**（ROADMAP 107）：此处曾用 ``QUICK_DANMAKU_MAX``（12 条）截断，用户要求取消，
+    下拉与列表变长后靠滚动查看。注意截断与上面「20 字截断」是同一类坑——**打开一次管理
+    对话框再关闭就会把超出的条目写没**，所以这里一条都不丢。
     """
     if not isinstance(value, (list, tuple)):
         return []
@@ -55,8 +63,6 @@ def normalize_quick_danmaku(value: Any) -> List[str]:
         if not text or text in result:
             continue
         result.append(text)
-        if len(result) >= QUICK_DANMAKU_MAX:
-            break
     return result
 
 
@@ -72,6 +78,9 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     # quick_dm_send_now：点选快捷弹幕时是否**直接发送**（ROADMAP 92，默认否 = 只填入输入框）。
     # 全局偏好（不按房间）；它只决定「点选后的动作」，发送本身仍走原有门控与冷却。
     "quick_dm_send_now": False,
+    # copy_dm_fill：点击弹幕正文时是否**直接填入发送框**（ROADMAP 109，默认否 = 复制到剪贴板）。
+    # 全局偏好（与 quick_dm_send_now 同样三处同步）；勾选后不再占用剪贴板。
+    "copy_dm_fill": False,
     # window_size：上次退出时的窗口尺寸 [宽, 高]（逻辑像素）；[0, 0] 表示尚未记忆
     "window_size": [0, 0],
     # selected_room：上次退出时选中的直播间号（ROADMAP 98）；0 = 没记住。
@@ -132,6 +141,17 @@ class RoomEntry:
     列表顺序即下拉的显示顺序。读入时由 ``normalize_quick_danmaku`` 清洗。
     """
 
+    dm_color: str = ""
+    """该直播间上次发送弹幕所选的颜色**名称**（ROADMAP 106）；空串＝未记忆。
+
+    存名称而非数值：两个下拉都是按名称匹配的，而服务端可用项会随房间 / 登录态变化
+    （``gui_app.select_dm_options``），名称比数值稳。切到该直播间时自动套用，改动即落盘；
+    记忆项不在当前可用项里时由 ``gui_app.resolve_dm_choice`` 回落默认并改写这个值。
+    """
+
+    dm_mode: str = ""
+    """该直播间上次发送弹幕所选的模式（滚动 / 顶部 / 底部）名称（ROADMAP 106）；空串＝未记忆。"""
+
 
 def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
     """读取房间列表；文件缺失或损坏时返回空列表。"""
@@ -167,6 +187,9 @@ def load_room_entries(path: Union[str, Path]) -> List[RoomEntry]:
             auto_danmaku=bool(item.get("auto_danmaku", auto_default)),
             auto_danmaku_when_live=bool(item.get("auto_danmaku_when_live", False)),
             quick_danmaku=normalize_quick_danmaku(item.get("quick_danmaku")),
+            # 发送行的颜色 / 模式记忆（ROADMAP 106）：旧配置缺键即空串＝未记忆
+            dm_color=_text_or_empty(item.get("dm_color")),
+            dm_mode=_text_or_empty(item.get("dm_mode")),
         ))
     logger.debug("读取直播间列表 %s：%d 个房间（其中 %d 个启用）",
                  path, len(entries), sum(1 for e in entries if e.enabled))
@@ -346,6 +369,11 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     prefs["quick_dm_send_now"] = bool(ui.get("quick_dm_send_now", False))
     if prefs["quick_dm_send_now"]:
         logger.info("已按上次设置开启「点选即发送」：点选快捷弹幕会直接发送")
+    # 「点击弹幕填入发送框」（ROADMAP 109）：与上一个键同样，**新增偏好键必须在这里读回**，
+    # 否则就是 ROADMAP 99 那个「写了没读」的坑重演（有通用守卫测试盯着）。
+    prefs["copy_dm_fill"] = bool(ui.get("copy_dm_fill", False))
+    if prefs["copy_dm_fill"]:
+        logger.info("已按上次设置开启「点击弹幕填入发送框」：点弹幕正文会填入发送框（不再复制）")
     size = ui.get("window_size")
     if (isinstance(size, list) and len(size) == 2
             and all(isinstance(value, int) and value > 200 for value in size)):

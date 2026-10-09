@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .gui_app import (
     BOTTOM_HOLD_DEBOUNCE_MS,
+    COPY_DM_FILL_TEXT,
     DM_COPY_HINT_MS,
     DM_COLOR_PRESETS,
     DM_EMOTICON_TAG_PREFIX,
@@ -46,11 +47,13 @@ from .gui_app import (
     build_sc_segments,
     danmaku_content_from_line,
     danmaku_send_guard,
+    dm_history_step,
     dm_trim_index,
     emoticon_from_packages,
     emoticon_tooltip_text,
     live_duration_text,
     merge_quick_danmaku,
+    resolve_dm_choice,
     text_scrolled_to_bottom,
     unseen_badge_text,
 )
@@ -93,6 +96,10 @@ class RoomChatWindow(tk.Toplevel):
         self._dm_meta: Dict[str, Tuple[int, str, str]] = {}
         self._dm_reply_target: Optional[dict] = None
         self._dm_sending = False
+        # 发送历史的浏览游标（ROADMAP 108）：历史本体在宿主的 _dm_send_history 里（按房间），
+        # 本窗口只维护自己的游标与草稿；-1 表示不在历史里（正在编辑）
+        self._hist_index = -1
+        self._hist_draft = ""
         self._queue: "queue.Queue" = queue.Queue()
         self._pending_images: set = set()
         self._emoticon_urls: Dict[str, str] = {}
@@ -208,6 +215,9 @@ class RoomChatWindow(tk.Toplevel):
                                         state="readonly",
                                         values=[name for name, _v in self.dm_modes])
         self.dm_mode_box.pack(side="left", padx=(4, 0))
+        # 用户改动颜色 / 模式下拉即写进房间条目并让宿主落盘（ROADMAP 106，与主界面共用记忆）
+        self.dm_color_box.bind("<<ComboboxSelected>>", self._on_dm_choice_changed)
+        self.dm_mode_box.bind("<<ComboboxSelected>>", self._on_dm_choice_changed)
         self.dm_emoji_btn = ttk.Button(row, text="表情", width=5,
                                        command=self._on_open_emoticons)
         self.dm_emoji_btn.pack(side="left", padx=(4, 0))
@@ -224,17 +234,31 @@ class RoomChatWindow(tk.Toplevel):
             row, text=QUICK_DM_SEND_NOW_TEXT, variable=self.quick_dm_now_var,
             command=self._on_quick_dm_send_now_toggled)
         self.quick_dm_now_check.pack(side="left", padx=(4, 0))
+        # 「点击弹幕填入发送框」（ROADMAP 109）：与主界面是**同一个全局开关**，任一处切换都会同步
+        self.copy_dm_fill_var = tk.BooleanVar(
+            value=bool(self.host.ui_prefs.get("copy_dm_fill", False)))
+        self.copy_dm_fill_check = ttk.Checkbutton(
+            row, text=COPY_DM_FILL_TEXT, variable=self.copy_dm_fill_var,
+            command=self._on_copy_dm_fill_toggled)
+        self.copy_dm_fill_check.pack(side="left", padx=(4, 0))
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
         self.dm_send_entry.bind("<Return>", lambda _e: self._on_send_danmaku())
         self.dm_send_entry.bind("<KeyRelease>", self._update_dm_len_hint)
+        self.dm_send_entry.bind("<KeyRelease>", self._on_dm_entry_typed, add="+")
+        # 上下键取回本房间已发送的历史（ROADMAP 108）；处理函数返回 "break" 吞掉默认行为，
+        # 否则 Tk 会把光标移到行首 / 行尾
+        self.dm_send_entry.bind("<Up>", lambda _e: self._step_dm_history(backwards=True))
+        self.dm_send_entry.bind("<Down>", lambda _e: self._step_dm_history(backwards=False))
         self.dm_len_var = tk.StringVar(value="0")
         self.dm_len_label = ttk.Label(row, textvariable=self.dm_len_var,
                                       foreground="#888888")
         self.dm_len_label.pack(side="left")
         self.dm_send_btn = ttk.Button(row, text="发送", command=self._on_send_danmaku)
         self.dm_send_btn.pack(side="left", padx=(4, 0))
+        # 发送颜色 / 模式：套用本房间记忆（ROADMAP 106）
+        self._apply_dm_memory()
         self.dm_send_hint_var = tk.StringVar(value="")
         ttk.Label(area, textvariable=self.dm_send_hint_var,
                   foreground="#888888").pack(side="top", fill="x")
@@ -328,6 +352,9 @@ class RoomChatWindow(tk.Toplevel):
                 self.host._last_dm_send[int(room_id)] = time.monotonic()
             if not payload.get("emoticon"):
                 self.dm_send_var.set("")
+                # 发送成功＝这段编辑结束，历史游标作废（历史本体由宿主按房间记录，ROADMAP 108）
+                self._hist_index = -1
+                self._hist_draft = ""
                 self._update_dm_len_hint()
                 self._set_dm_reply_target(None)
             self.dm_send_hint_var.set("已发送")
@@ -781,14 +808,52 @@ class RoomChatWindow(tk.Toplevel):
             self._copy_dm_content(content)
 
     def _copy_dm_content(self, content: str) -> None:
+        """点击弹幕正文：按「点击弹幕填入发送框」开关**填入发送框**或**复制到剪贴板**。
+
+        与主界面同一套语义（ROADMAP 109）：勾选后不碰剪贴板、覆盖式填入发送框并聚焦；
+        发送框不可用（未登录 / 写操作关闭 / 本窗口房间已失效等）时回退为复制并说明原因。
+        """
+        if bool(self.host.ui_prefs.get("copy_dm_fill")):
+            reason = self._dm_send_block_reason()
+            if not reason:
+                self._fill_dm_send_box(content)
+                return
+            log_window.info("独立窗口点击弹幕：发送框不可用（%s），回退为复制", reason)
+            if self._copy_to_clipboard(content):
+                self._set_copy_hint(
+                    f"发送框不可用（{reason}），已复制：{self._dm_snippet(content)}")
+            return
+        if self._copy_to_clipboard(content):
+            self._set_copy_hint(f"已复制：{self._dm_snippet(content)}")
+
+    def _copy_to_clipboard(self, content: str) -> bool:
+        """把文本写进剪贴板；Tk 偶尔抛 TclError，失败时静默返回 False。"""
         try:
             self.clipboard_clear()
             self.clipboard_append(content)
             self.update_idletasks()
         except tk.TclError:
-            return
-        snippet = content if len(content) <= 20 else content[:20] + "…"
-        self.dm_copy_hint_var.set(f"已复制：{snippet}")
+            return False
+        return True
+
+    def _dm_snippet(self, content: str, limit: int = 20) -> str:
+        """提示行里显示的短文本（过长截断加省略号）。"""
+        return content if len(content) <= limit else content[:limit] + "…"
+
+    def _fill_dm_send_box(self, text: str) -> None:
+        """把文本**覆盖式**填入发送框并聚焦（ROADMAP 109，与主界面同一语义）。"""
+        self._hist_index = -1
+        self._hist_draft = ""
+        self.dm_send_var.set(text)
+        self._update_dm_len_hint()      # StringVar.set 不触发 KeyRelease，需手动刷字数
+        self.dm_send_entry.focus_set()
+        self.dm_send_entry.icursor(tk.END)
+        self._set_copy_hint(f"已填入发送框：{self._dm_snippet(text)}")
+        log_window.info("独立窗口点击弹幕：填入发送框（%d 字）", len(text))
+
+    def _set_copy_hint(self, text: str) -> None:
+        """显示复制 / 填入提示，并在 ``DM_COPY_HINT_MS`` 后自动清除。"""
+        self.dm_copy_hint_var.set(text)
         if self._copy_hint_id is not None:
             try:
                 self.after_cancel(self._copy_hint_id)
@@ -972,6 +1037,88 @@ class RoomChatWindow(tk.Toplevel):
         except tk.TclError:
             pass  # 窗口正在销毁
 
+    # ---------- 发送颜色 / 模式记忆（ROADMAP 106，与主界面共用房间条目） ----------
+
+    def _dm_memory(self, field: str) -> str:
+        """取本窗口房间记下的颜色 / 模式名称（无记忆时为空串）。"""
+        entry = self.host.entries.get(self._room_id)
+        return str(getattr(entry, field, "") or "") if entry is not None else ""
+
+    def _apply_dm_memory(self) -> None:
+        """套用本窗口房间记录的颜色 / 模式（ROADMAP 106）。
+
+        本窗口的下拉只有**内置预设**（按房间拉取可用项只在主界面做），所以记忆项不在预设里
+        时按默认显示，但**不改写记忆**——那份记忆对主界面可能仍然有效，本窗口没有资格判定它
+        失效；发送时取不到该名称的数值也会退回预设首项（数值取值处本来就有兜底）。
+        """
+        for field, var, options, label in (
+                ("dm_color", self.dm_color_var, self.dm_colors, "颜色"),
+                ("dm_mode", self.dm_mode_var, self.dm_modes, "模式")):
+            names = [name for name, _value in options]
+            remembered = self._dm_memory(field)
+            choice, fell_back = resolve_dm_choice(names, remembered)
+            var.set(choice or names[0])
+            if fell_back:
+                log_window.debug("独立窗口：房间 %s 的%s记忆「%s」不在内置预设里，暂按「%s」显示",
+                                 self._room_id, label, remembered, var.get())
+            elif remembered:
+                log_window.debug("独立窗口：房间 %s 套用记忆%s %s", self._room_id, label, remembered)
+
+    def _on_dm_choice_changed(self, _event=None) -> None:
+        """本窗口改动下拉：写进房间条目并让宿主落盘（与主界面共用同一份记忆）。"""
+        entry = self.host.entries.get(self._room_id)
+        if entry is None:
+            return
+        color, mode = self.dm_color_var.get(), self.dm_mode_var.get()
+        if entry.dm_color == color and entry.dm_mode == mode:
+            return
+        entry.dm_color, entry.dm_mode = color, mode
+        self.host._save_config()
+        log_window.info("独立窗口：房间 %s 记住颜色 %s / 模式 %s", self._room_id, color, mode)
+
+    # ---------- 发送历史（ROADMAP 108：上下键取回，仅内存，历史本体在宿主） ----------
+
+    def _step_dm_history(self, *, backwards: bool) -> str:
+        """输入框的 ↑ / ↓：取回本房间本次运行内已发送的弹幕（历史在宿主、按房间隔离）。
+
+        返回 ``"break"`` 吞掉事件——否则 Tk 默认会把光标移到行首 / 行尾，取回的内容没法接着
+        编辑。历史为空时什么都不做。
+        """
+        if self._hist_index < 0:
+            # 首次进入历史：当前输入内容记为「草稿」，↓ 越过最新一条时回到它
+            self._hist_draft = self.dm_send_var.get()
+        text, index = dm_history_step(
+            self.host._dm_history_of(self._room_id), self._hist_index, self._hist_draft,
+            backwards=backwards)
+        self._hist_index = index
+        if text != self.dm_send_var.get():
+            self.dm_send_var.set(text)
+            self._update_dm_len_hint()
+        self.dm_send_entry.icursor(tk.END)
+        log_window.debug("独立窗口发送历史：房间 %s %s → %s（游标 %d）", self._room_id,
+                         "上一条" if backwards else "下一条",
+                         text if len(text) <= 50 else text[:50] + "…", index)
+        return "break"
+
+    def _on_dm_entry_typed(self, event) -> None:
+        """用户自己敲键（非上下键）＝新的编辑起点，退出历史浏览（ROADMAP 108）。"""
+        if str(getattr(event, "keysym", "")) in ("Up", "Down"):
+            return
+        self._hist_index = -1
+        self._hist_draft = ""
+
+    # ---------- 「点击弹幕填入发送框」（ROADMAP 109：全局偏好，与主界面同步） ----------
+
+    def set_copy_dm_fill(self, enabled: bool) -> None:
+        """宿主统一入口同步勾选框（本窗口只回写，不负责落盘与广播）。"""
+        enabled = bool(enabled)
+        if bool(self.copy_dm_fill_var.get()) != enabled:
+            self.copy_dm_fill_var.set(enabled)
+
+    def _on_copy_dm_fill_toggled(self) -> None:
+        """本窗口勾选框：交给宿主统一入口（写偏好、落盘并同步主界面与其它窗口）。"""
+        self.host.set_copy_dm_fill(self.copy_dm_fill_var.get())
+
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
     def _refresh_quick_danmaku(self) -> None:
@@ -1005,6 +1152,8 @@ class RoomChatWindow(tk.Toplevel):
             self._send_danmaku_text(text)  # 走既有发送链路（门控 / 冷却 / 回复目标一致）
             return
         log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）", text, room_id)
+        self._hist_index = -1       # 填入属于新的编辑起点，历史游标作废（ROADMAP 108）
+        self._hist_draft = ""
         self.dm_send_var.set(merge_quick_danmaku(self.dm_send_var.get(), text))
         self._update_dm_len_hint()  # StringVar.set 不触发 KeyRelease，需手动刷字数
         self.dm_send_entry.focus_set()

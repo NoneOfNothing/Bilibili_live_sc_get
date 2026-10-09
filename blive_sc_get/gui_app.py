@@ -27,7 +27,7 @@ except ImportError:
     Image = None
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import aiohttp
 
@@ -61,7 +61,6 @@ from .medal_tasks import (
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
-    QUICK_DANMAKU_MAX,
     RoomEntry,
     format_live_mark,
     load_emoticon_memory,
@@ -419,6 +418,12 @@ PanedWindow 按 weight 分配增减空间，从而保持该占比。"""
 DANMAKU_SEND_COOLDOWN_S = 2.0
 """同一房间两次发送弹幕的最小间隔（秒）。"""
 
+DM_SEND_HISTORY_MAX = 50
+"""每个直播间在**内存**里保留多少条已发送的文字弹幕（ROADMAP 108，供输入框上下键取回）。
+
+只存在于本次运行的内存中（不落盘、不写配置），重启即清空；超过该条数丢最早的那条。
+"""
+
 DANMAKU_MAX_LEN = 20
 """弹幕长度的**提示阈值**（普通用户约 20 字；超长时服务端可能返回 1003212）。
 
@@ -432,6 +437,14 @@ QUICK_DM_SEND_NOW_TEXT = "点选即发送"
 QUICK_DM_SEND_NOW_HINT = ("勾选后，点选快捷弹幕会**直接发送**（仍受写操作开关、登录态与发送"
                           "冷却约束）；不勾选则只把文本填入输入框，可先改后发。")
 """该勾选框的说明（Qt 用作 tooltip；Tk 版文案已足够直白，仅在日志里体现状态）。"""
+
+COPY_DM_FILL_TEXT = "点击弹幕填入发送框"
+"""「点击弹幕正文直接填入发送框」勾选框的文案（ROADMAP 109，两版共用）。"""
+
+COPY_DM_FILL_HINT = ("勾选后，点击弹幕正文会**直接填入发送框**（覆盖框内原有内容），不再复制到"
+                     "剪贴板；不勾选则保持「复制到剪贴板」。发送框不可用（未登录 / 写操作关闭 / "
+                     "未选房间）时仍回退为复制并说明原因。")
+"""该勾选框的说明（Qt 用作 tooltip）。"""
 
 QUICK_DM_PLACEHOLDER = "快捷弹幕"
 """快捷弹幕下拉的**占位项**（ROADMAP 90）。
@@ -982,6 +995,73 @@ def merge_quick_danmaku(current: str, text: str) -> str:
     return f"{current} {text}"
 
 
+def resolve_dm_choice(names: Sequence[str], remembered: str) -> Tuple[str, bool]:
+    """在可用项里按**记忆名称**定位发送行的颜色 / 模式（纯函数，ROADMAP 106）。
+
+    返回 ``(要选中的名称, 是否发生了回落)``：
+
+    - 记忆项仍在可用项里 → 原样用它；
+    - 记忆项为空（该房间还没记过）→ 用第一项，``fallback=False``（不是「失效」）；
+    - 记忆项**已不可用**（服务端可用项变了、或该房间只剩少数几项）→ 回落第一项并
+      把 ``fallback`` 置真，调用方据此把记忆改写成回落值并落盘（否则每次切房都要回落一次，
+      日志也会一直重复）；
+    - 可用项列表为空（理论上不会，``select_dm_options`` 保证非空）→ 返回空串，调用方跳过。
+
+    两个下拉都是**按名称匹配**的（``dm_color_var`` / ``dm_mode_var`` 存的就是名称），
+    所以记忆也存名称：数值会随服务端可用项变化，名称更稳。
+    """
+    options = [name for name in names if name]
+    if not options:
+        return "", False
+    if remembered and remembered in options:
+        return remembered, False
+    return options[0], bool(remembered)
+
+
+def dm_history_push(history: Sequence[str], text: str,
+                    *, limit: int = DM_SEND_HISTORY_MAX) -> List[str]:
+    """把一条**发送成功**的文字弹幕并入该房间的历史（纯函数，ROADMAP 108）。
+
+    返回新列表，**下标 0 是最新发过的那条**（上下键由近及远取用）；重复的文本会被提到最前
+    （只留一份，避免反复发同一条把历史刷满）；超过 ``limit`` 丢最早的。空文本 / 非正上限
+    原样返回（不改动）。
+    """
+    text = (text or "").strip()
+    if not text or limit <= 0:
+        return list(history)
+    result = [item for item in history if item != text]
+    result.insert(0, text)
+    return result[:limit]
+
+
+def dm_history_step(history: Sequence[str], index: int, draft: str,
+                    *, backwards: bool) -> Tuple[str, int]:
+    """上下键在历史里的取用规则（纯函数，ROADMAP 108）。
+
+    ``index`` 是「距最新一条的距离」：``-1`` 表示不在历史里（正在编辑 ``draft``）、``0``
+    是最新发过的那条、越大越早。``backwards=True``（↑）向**更早**走，走到最早那条就停在那
+    （不越界、不循环）；``backwards=False``（↓）向更新的方向走，越过最新一条就**回到按键前
+    的草稿**。历史为空、或 ``index`` 越界（历史被截断过）时按「不在历史里」处理——空历史下
+    上下键等于什么都不做，与未实现历史前的行为一致。
+
+    返回 ``(要显示在输入框里的文本, 新 index)``。
+    """
+    items = list(history)
+    if not items:
+        return draft, -1
+    if not 0 <= index < len(items):
+        index = -1
+    if backwards:
+        target = index + 1          # 从草稿（-1）按 ↑ 正好落到最新一条（0）
+        if target >= len(items):
+            return items[-1], len(items) - 1   # 已到最早，停在最早那条
+        return items[target], target
+    target = index - 1
+    if target < 0:
+        return draft, -1            # 越过最新一条 → 回到草稿
+    return items[target], target
+
+
 class _QueueLogHandler(logging.Handler):
     """把日志记录转发到 UI 队列，由主线程轮询显示。"""
 
@@ -1106,6 +1186,12 @@ class ScMonitorApp:
         # 发送弹幕相关状态（仅主线程读写）
         self._last_dm_send: Dict[int, float] = {}   # 房间号 -> 上次发送时间(monotonic)，冷却用
         self._room_id_map: Dict[int, int] = {}      # 输入房间号 -> 真实房间号
+        # 发送历史（ROADMAP 108）：房间号 -> 已发送的**文字**弹幕（下标 0 最新），上下键取回。
+        # **只在内存里**（不落盘、不写配置），重启即清空；_dm_hist_index 为 -1 表示不在历史里
+        # （正在编辑），_dm_hist_draft 存「首次按 ↑ 前的输入内容」，↓ 越过最新一条时回到它
+        self._dm_send_history: Dict[int, List[str]] = {}
+        self._dm_hist_index = -1
+        self._dm_hist_draft = ""
         self._dm_sending = False                    # 是否正在发送（防连点）
         self._dm_reply_target: Optional[dict] = None  # 回复/@ 目标 {kind,uid,uname,dmid,text}
         self._dm_send_reason = ""                   # 上次门控原因（避免重复提示）
@@ -1473,6 +1559,9 @@ class ScMonitorApp:
             row, textvariable=self.dm_mode_var, width=5, state="readonly",
             values=[name for name, _mode in self.dm_modes])
         self.dm_mode_box.pack(side="left", padx=(4, 0))
+        # 用户改动颜色 / 模式下拉即按房间落盘（ROADMAP 106）；程序 set() 不触发该事件
+        self.dm_color_box.bind("<<ComboboxSelected>>", self._on_dm_choice_changed)
+        self.dm_mode_box.bind("<<ComboboxSelected>>", self._on_dm_choice_changed)
         # 表情按钮：点击在发送行上方展开/收起该直播间的专属表情面板
         # （点选即发送，写操作，受总开关约束）
         self.dm_emoji_btn = ttk.Button(row, text="表情", width=5,
@@ -1495,12 +1584,25 @@ class ScMonitorApp:
             row, text=QUICK_DM_SEND_NOW_TEXT, variable=self.quick_dm_now_var,
             command=self._on_quick_dm_send_now_toggled)
         self.quick_dm_now_check.pack(side="left", padx=(4, 0))
+        # 「点击弹幕填入发送框」（ROADMAP 109）：同样是全局偏好（ui.copy_dm_fill），
+        # 主界面与各房间独立窗口的勾选框必须一致（统一入口见 set_copy_dm_fill）
+        self.copy_dm_fill_var = tk.BooleanVar(
+            value=bool(self.ui_prefs.get("copy_dm_fill", False)))
+        self.copy_dm_fill_check = ttk.Checkbutton(
+            row, text=COPY_DM_FILL_TEXT, variable=self.copy_dm_fill_var,
+            command=self._on_copy_dm_fill_toggled)
+        self.copy_dm_fill_check.pack(side="left", padx=(4, 0))
         self.dm_send_var = tk.StringVar()
         self.dm_send_entry = ttk.Entry(row, textvariable=self.dm_send_var)
         self.dm_send_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
         self.dm_send_entry.bind("<Return>", lambda _e: self._on_send_danmaku())
         self.dm_send_entry.bind("<KeyRelease>", self._update_dm_len_hint)
+        self.dm_send_entry.bind("<KeyRelease>", self._on_dm_entry_typed, add="+")
         self.dm_send_entry.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
+        # 上下键取回本房间已发送的历史（ROADMAP 108）。处理函数要返回 "break"：
+        # 否则 Tk 默认会把光标移到行首 / 行尾，取回的历史条目根本没法接着改
+        self.dm_send_entry.bind("<Up>", lambda _e: self._step_dm_history(backwards=True))
+        self.dm_send_entry.bind("<Down>", lambda _e: self._step_dm_history(backwards=False))
         self.dm_len_var = tk.StringVar(value="0")
         self.dm_len_label = ttk.Label(row, textvariable=self.dm_len_var,
                                       foreground="#888888")
@@ -3115,15 +3217,57 @@ class ScMonitorApp:
             self._copy_dm_content(content)
 
     def _copy_dm_content(self, content: str) -> None:
-        """复制弹幕正文到剪贴板，并短暂显示「已复制」提示。"""
+        """点击弹幕正文：按「点击弹幕填入发送框」开关**填入发送框**或**复制到剪贴板**。
+
+        ROADMAP 109：勾选后不再占用剪贴板，直接把该条弹幕文本**覆盖式**填进发送框并聚焦
+        （可先改后发）。发送框当前不可用（未登录 / 写操作关闭 / 未选房间 / 正在发送）时填入
+        没有意义，因此**回退为复制**并把原因写进提示——否则用户点了弹幕会觉得「没反应」。
+        """
+        if bool(self.ui_prefs.get("copy_dm_fill")):
+            reason = self._dm_send_block_reason()
+            if not reason:
+                self._fill_dm_send_box(content)
+                return
+            log_window.info("点击弹幕：发送框不可用（%s），回退为复制", reason)
+            if self._copy_to_clipboard(content):
+                self._set_dm_copy_hint(
+                    f"发送框不可用（{reason}），已复制：{self._dm_snippet(content)}")
+            return
+        if self._copy_to_clipboard(content):
+            self._set_dm_copy_hint(f"已复制：{self._dm_snippet(content)}")
+
+    def _copy_to_clipboard(self, content: str) -> bool:
+        """把文本写进剪贴板；Tk 偶尔抛 TclError，失败时静默返回 False（不弹提示）。"""
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(content)
             self.root.update_idletasks()
         except tk.TclError:
-            return
-        snippet = content if len(content) <= 20 else content[:20] + "…"
-        self.dm_copy_hint_var.set(f"已复制：{snippet}")
+            return False
+        return True
+
+    def _dm_snippet(self, content: str, limit: int = 20) -> str:
+        """提示行里显示的短文本（过长截断加省略号）。"""
+        return content if len(content) <= limit else content[:limit] + "…"
+
+    def _fill_dm_send_box(self, text: str) -> None:
+        """把文本**覆盖式**填入发送框并聚焦（ROADMAP 109）。
+
+        覆盖（而非 ``merge_quick_danmaku`` 的追加）是用户明确要求：点弹幕就是想发这一条。
+        填入后视为一次新的编辑起点（清掉历史游标）、光标移到末尾，并复用复制提示行显示
+        「已填入发送框：…」（不新增控件）。
+        """
+        self._reset_dm_history()
+        self.dm_send_var.set(text)
+        self._update_dm_len_hint()      # StringVar.set 不触发 KeyRelease，需手动刷字数
+        self.dm_send_entry.focus_set()
+        self.dm_send_entry.icursor(tk.END)
+        self._set_dm_copy_hint(f"已填入发送框：{self._dm_snippet(text)}")
+        log_window.info("点击弹幕：填入发送框（%d 字）", len(text))
+
+    def _set_dm_copy_hint(self, text: str) -> None:
+        """显示复制 / 填入提示，并在 ``DM_COPY_HINT_MS`` 后自动清除。"""
+        self.dm_copy_hint_var.set(text)
         if self._dm_copy_hint_id is not None:
             try:
                 self.root.after_cancel(self._dm_copy_hint_id)
@@ -3180,6 +3324,150 @@ class ScMonitorApp:
         self.dm_len_label.configure(
             foreground="#c62828" if length > DANMAKU_MAX_LEN else "#888888")
 
+    # ---------- 发送历史（ROADMAP 108：输入框上下键取回，**只在内存**） ----------
+
+    def _history_key(self, room_id) -> int:
+        """把发送回调里的房间号折回界面使用的**输入房间号**。
+
+        发送链路交给后台的是**真实房间号**（短号房间两者不同），回投的 payload 里带的也是它；
+        而历史按输入房间号存（与 ``_selected_room_id`` 一致），故这里反查一次映射。
+        """
+        key = int(room_id)
+        if key in self.entries:
+            return key
+        for input_id, real_id in self._room_id_map.items():
+            if int(real_id) == key:
+                return int(input_id)
+        return key
+
+    def _dm_history_of(self, room_id: Optional[int]) -> List[str]:
+        """取某个房间的发送历史（未选中 / 无记录时为空列表）。"""
+        if room_id is None:
+            return []
+        return list(self._dm_send_history.get(int(room_id), ()))
+
+    def _push_dm_history(self, room_id: int, text: str) -> None:
+        """记录一条**发送成功**的文字弹幕（表情包发送不发文本，天然不入栈）。"""
+        items = dm_history_push(self._dm_send_history.get(room_id, ()), text)
+        self._dm_send_history[room_id] = items
+        log_task.debug("发送历史：房间 %s 记录「%s」，现有 %d 条", room_id,
+                       text if len(text) <= 50 else text[:50] + "…", len(items))
+
+    def _reset_dm_history(self) -> None:
+        """退出历史浏览（用户自己改动输入 / 填入新内容 / 发送成功后都走这里）。"""
+        self._dm_hist_index = -1
+        self._dm_hist_draft = ""
+
+    def _step_dm_history(self, *, backwards: bool) -> str:
+        """输入框的 ↑ / ↓：按房间取回本次运行内已发送的弹幕（ROADMAP 108）。
+
+        返回 ``"break"`` 供 Tk 绑定用——不吞掉事件的话 Tk 默认会把光标移到行首 / 行尾，
+        取回的内容没法接着编辑。历史为空时什么都不做（与未实现历史前一致）。
+        """
+        if self._dm_hist_index < 0:
+            # 首次进入历史：当前输入内容记为「草稿」，↓ 越过最新一条时回到它
+            self._dm_hist_draft = self.dm_send_var.get()
+        text, index = dm_history_step(self._dm_history_of(self._selected_room_id),
+                                     self._dm_hist_index, self._dm_hist_draft,
+                                     backwards=backwards)
+        self._dm_hist_index = index
+        if text != self.dm_send_var.get():
+            self.dm_send_var.set(text)
+            self._update_dm_len_hint()
+        self.dm_send_entry.icursor(tk.END)
+        log_task.debug("发送历史：房间 %s %s → %s（游标 %d）", self._selected_room_id,
+                       "上一条" if backwards else "下一条",
+                       text if len(text) <= 50 else text[:50] + "…", index)
+        return "break"
+
+    def _on_dm_entry_typed(self, event) -> None:
+        """用户自己敲键（非上下键）＝开始新的编辑，退出历史浏览（ROADMAP 108）。"""
+        if str(getattr(event, "keysym", "")) in ("Up", "Down"):
+            return
+        self._reset_dm_history()
+
+    # ---------- 发送颜色 / 模式记忆（ROADMAP 106：按房间，改了即落盘） ----------
+
+    def _selected_dm_entry(self):
+        """当前选中房间的房间条目（未选中 / 已删除时为 None）。"""
+        room_id = self._selected_room_id
+        return self.entries.get(int(room_id)) if room_id is not None else None
+
+    def _dm_memory(self, field: str) -> str:
+        """取当前房间记下的颜色 / 模式名称（无记忆时为空串）。"""
+        entry = self._selected_dm_entry()
+        return str(getattr(entry, field, "") or "") if entry is not None else ""
+
+    def _apply_dm_memory(self) -> None:
+        """切房时套用该房间的颜色 / 模式记忆（ROADMAP 106）。
+
+        此刻下拉里还是**上一个房间**的可用项（本房间的要等
+        ``_load_dm_options_for_selected`` 回来），所以这里只套用、不判定失效：记忆项不在当前
+        列表里也照设（发送时取不到会自动退回首项的值），等 ``_set_dm_options`` 拿到本房间
+        可用项再收口（那里才是判定「记忆已失效」并改写记忆的地方）。该房间没有记忆时回到
+        默认第一项——否则会留着上一个房间的「红 / 顶部」。
+        """
+        for field, var, options, label in (
+                ("dm_color", self.dm_color_var, self.dm_colors, "颜色"),
+                ("dm_mode", self.dm_mode_var, self.dm_modes, "模式")):
+            # 没记忆时回到**内置默认**（白 / 滚动），而不是当下拉里那个属于上一个房间的首项
+            default = (DM_COLOR_PRESETS[0][0] if field == "dm_color"
+                       else next(iter(DM_MODE_TEXTS)))
+            remembered = self._dm_memory(field)
+            var.set(remembered if remembered else default)
+            if remembered:
+                log_window.debug("发送弹幕：切到房间 %s，套用记忆%s %s",
+                                 self._selected_room_id, label, remembered)
+
+    def _remember_dm_choice(self, field: str, name: str) -> bool:
+        """把当前房间的颜色 / 模式**名称**写进房间条目并落盘（值真变化才写）。"""
+        entry = self._selected_dm_entry()
+        if entry is None or not name or getattr(entry, field, "") == name:
+            return False
+        setattr(entry, field, name)
+        self._save_config()
+        log_task.info("发送弹幕：房间 %s 记住%s %s", self._selected_room_id,
+                      "颜色" if field == "dm_color" else "模式", name)
+        return True
+
+    def _on_dm_choice_changed(self, _event=None) -> None:
+        """用户改动颜色 / 模式下拉：按房间记忆并落盘（程序设置不触发该事件）。"""
+        entry = self._selected_dm_entry()
+        if entry is None:
+            return
+        color, mode = self.dm_color_var.get(), self.dm_mode_var.get()
+        if entry.dm_color == color and entry.dm_mode == mode:
+            return
+        entry.dm_color, entry.dm_mode = color, mode
+        self._save_config()
+        log_task.info("发送弹幕：房间 %s 记住颜色 %s / 模式 %s",
+                      self._selected_room_id, color, mode)
+
+    # ---------- 「点击弹幕填入发送框」（ROADMAP 109：全局偏好，三处一致） ----------
+
+    def set_copy_dm_fill(self, enabled: bool) -> None:
+        """「点击弹幕填入发送框」的统一入口（主界面与各房间独立窗口的勾选框都走这里）。
+
+        与「点选即发送」同构：① 偏好落盘；② 回写主界面与各独立窗口的勾选框；③ 记一条 info
+        日志。点击时的**实际行为**由各视图读 ``ui_prefs`` 决定，不各自维护状态（否则会出现
+        「主界面填入、独立窗口仍复制」这种不一致）。
+        """
+        enabled = bool(enabled)
+        if self.ui_prefs.get("copy_dm_fill") != enabled:
+            self.ui_prefs["copy_dm_fill"] = enabled
+            self._save_config()
+            log_window.info("点击弹幕：%s",
+                            "填入发送框（覆盖框内内容，不再复制）" if enabled
+                            else "复制到剪贴板")
+        if bool(self.copy_dm_fill_var.get()) != enabled:
+            self.copy_dm_fill_var.set(enabled)
+        for window in list(self._room_windows.values()):
+            window.set_copy_dm_fill(enabled)
+
+    def _on_copy_dm_fill_toggled(self) -> None:
+        """主界面勾选框：转发到统一入口。"""
+        self.set_copy_dm_fill(self.copy_dm_fill_var.get())
+
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
     def _quick_danmaku_of(self, room_id: Optional[int]) -> List[str]:
@@ -3235,6 +3523,7 @@ class ScMonitorApp:
             self._send_danmaku_text(text)  # 走既有发送链路（门控 / 冷却 / 回复目标一致）
             return
         log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）", text, room_id)
+        self._reset_dm_history()    # 填入属于新的编辑起点，历史游标作废（ROADMAP 108）
         self.dm_send_var.set(merge_quick_danmaku(self.dm_send_var.get(), text))
         self._update_dm_len_hint()  # StringVar.set 不触发 KeyRelease，需手动刷字数
         self.dm_send_entry.focus_set()
@@ -3272,8 +3561,15 @@ class ScMonitorApp:
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="点选后只填入输入框（不会直接发送）；顺序即下拉顺序",
                   foreground="#888888").pack(anchor="w")
-        listbox = tk.Listbox(body, height=10, width=36, exportselection=False)
-        listbox.pack(fill="both", expand=True, pady=(6, 6))
+        # 条数上限已取消（ROADMAP 107）：列表可能很长，补一条纵向滚动条
+        list_wrap = ttk.Frame(body)
+        list_wrap.pack(fill="both", expand=True, pady=(6, 6))
+        list_scroll = ttk.Scrollbar(list_wrap, orient="vertical")
+        listbox = tk.Listbox(list_wrap, height=10, width=36, exportselection=False,
+                             yscrollcommand=list_scroll.set)
+        list_scroll.configure(command=listbox.yview)
+        list_scroll.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
         edit_row = ttk.Frame(body)
         edit_row.pack(fill="x")
         item_var = tk.StringVar()
@@ -3292,10 +3588,7 @@ class ScMonitorApp:
             text = cleaned[0]
             if text in working:
                 return
-            if len(working) >= QUICK_DANMAKU_MAX:
-                messagebox.showinfo("快捷弹幕",
-                                    f"最多只能保存 {QUICK_DANMAKU_MAX} 条", parent=win)
-                return
+            # 条数上限已取消（ROADMAP 107）：不再拦「最多 N 条」，只拦重复
             working.append(text)
             item_var.set("")
             refresh()
@@ -3474,7 +3767,10 @@ class ScMonitorApp:
                 self._last_dm_send[int(room_id)] = time.monotonic()
             if not payload.get("emoticon"):
                 # 表情包发送不影响输入框内容，仅文字弹幕成功后清空
+                # 并入本房间的发送历史（ROADMAP 108，供输入框上下键取回；表情包不计入）
+                self._push_dm_history(self._history_key(room_id), text)
                 self.dm_send_var.set("")
+                self._reset_dm_history()
                 self._update_dm_len_hint()
                 self._set_dm_reply_target(None)
             self.dm_send_hint_var.set("已发送")
@@ -4305,21 +4601,42 @@ class ScMonitorApp:
 
     def _set_dm_options(self, colors: List[Tuple[str, int]],
                         modes: List[Tuple[str, int]]) -> None:
-        """用服务端可用项刷新颜色/模式下拉（保留原选择，失效则回退首项）。
+        """用服务端可用项刷新颜色/模式下拉（按房间记忆定位，失效则回退首项）。
 
         候选完全以服务端可用项为准（可能只有 1 项）；仅查询失败时才用内置
-        预设兜底（详见 select_dm_options）。
+        预设兜底（详见 select_dm_options）。定位与回落见 ``_apply_memory_to_combo``。
         """
         new_colors = select_dm_options(DM_COLOR_PRESETS, colors)
         self.dm_colors = list(new_colors)
         self.dm_color_box.configure(values=[name for name, _v in new_colors])
-        if self.dm_color_var.get() not in {name for name, _v in new_colors}:
-            self.dm_color_var.set(new_colors[0][0])
+        self._apply_memory_to_combo("dm_color", self.dm_color_var, new_colors)
         new_modes = select_dm_options(tuple(DM_MODE_TEXTS.items()), modes)
         self.dm_modes = list(new_modes)
         self.dm_mode_box.configure(values=[name for name, _v in new_modes])
-        if self.dm_mode_var.get() not in {name for name, _v in new_modes}:
-            self.dm_mode_var.set(new_modes[0][0])
+        self._apply_memory_to_combo("dm_mode", self.dm_mode_var, new_modes)
+
+    def _apply_memory_to_combo(self, field: str, var, options: List[Tuple[str, int]]) -> None:
+        """本房间可用项确定后，按记忆定位颜色 / 模式；记忆已失效则回落首项并**改写记忆**。
+
+        优先用记忆（用户改过下拉时记忆已同步，故等价于「保留原选择」）；该房间还没记过时
+        沿用当前选中项（仍在可用项里就保留，否则回落首项）。改写记忆是为了避免「每次切房都
+        判定失效、每次都在日志里刷一遍」——用户下次看到的也就是实际生效的那一项。
+        """
+        names = [name for name, _value in options]
+        remembered = self._dm_memory(field)
+        if remembered:
+            choice, fell_back = resolve_dm_choice(names, remembered)
+        else:
+            current = var.get()
+            choice = current if current in names else (names[0] if names else current)
+            fell_back = False
+        if choice:
+            var.set(choice)
+        if fell_back:
+            log_task.info("发送弹幕：房间 %s 的%s记忆「%s」已不可用，改用「%s」",
+                          self._selected_room_id,
+                          "颜色" if field == "dm_color" else "模式", remembered, choice)
+            self._remember_dm_choice(field, choice)
 
     def _append_dm_batch(self, batch: List[dict]) -> None:
         """批量插入当前房间的弹幕（本轮 poll 聚合一次插入，降低重排开销）。
@@ -4903,6 +5220,9 @@ class ScMonitorApp:
         self._set_dm_reply_target(None)   # 回复/@ 目标属于具体房间，切房即清除
         self._hide_emoticon_panel()       # 表情面板展示的是具体房间的表情，切房即收起
         self._refresh_dm_send_state()
+        # 发送颜色 / 模式：先按房间套用记忆（ROADMAP 106）；随后拉回的可用项会在
+        # _set_dm_options 里复核（记忆项已失效则回落默认并改写记忆）
+        self._apply_dm_memory()
         # 可用颜色/样式随直播间变化（接口按 room_id 查询），切房即重新拉取
         self._load_dm_options_for_selected()
         if room_id is None:

@@ -47,6 +47,8 @@ from .gui_app import (
     AUTOSCROLL_DEADZONE,
     AUTOSCROLL_SPEED,
     AUTOSCROLL_TICK_MS,
+    COPY_DM_FILL_HINT,
+    COPY_DM_FILL_TEXT,
     DM_COLOR_PRESETS,
     DM_EMOTICON_INFO_MAX,
     DM_MODE_TEXTS,
@@ -59,12 +61,14 @@ from .gui_app import (
     QUICK_DM_SEND_NOW_TEXT,
     danmaku_content_from_line,
     danmaku_send_guard,
+    dm_history_step,
     dm_trim_index,
     emoticon_from_packages,
     emoticon_package_id,
     emoticon_packages_signature,
     emoticon_tooltip_text,
     merge_quick_danmaku,
+    resolve_dm_choice,
     select_dm_options,
     unseen_badge_text,
 )
@@ -225,6 +229,15 @@ class DmPanel(QWidget):
         self._dm_reply_target: Optional[dict] = None
         self._dm_sending = False
         self._last_dm_send = 0.0
+        # 发送历史的浏览游标（ROADMAP 108）：历史本体在宿主的 _dm_send_history 里（按房间），
+        # 本面板只维护自己的游标与草稿；_hist_index 为 -1 表示不在历史里（正在编辑），
+        # _hist_applying 用来区分「程序按上下键填入」与「用户自己打字」（后者要退出历史浏览）
+        self._hist_index = -1
+        self._hist_draft = ""
+        self._hist_applying = False
+        # 挂了上下键事件过滤器的输入框（建 UI 时才存在；eventFilter 可能在那之前就被
+        # dm_text 的事件调到，故用这个字段而不是直接访问 self.dm_send_entry）
+        self._key_entry: Optional[QLineEdit] = None
         # 可用颜色/模式（登录后按房间从服务端刷新；失败时用内置预设）
         self._dm_colors: List[Tuple[str, int]] = list(DM_COLOR_PRESETS)
         self._dm_modes: List[Tuple[str, int]] = list(DM_MODE_TEXTS.items())
@@ -308,10 +321,13 @@ class DmPanel(QWidget):
         self.dm_modes = QComboBox()
         for name, _mode in self._dm_modes:
             self.dm_modes.addItem(name)
+        # activated：只有**用户**选择才触发（程序 setCurrentIndex 不触发），正好用来落盘记忆
+        self.dm_modes.activated.connect(self._on_dm_choice_changed)
         send.addWidget(self.dm_modes)
         self.dm_colors = QComboBox()
         for name, _code in self._dm_colors:
             self.dm_colors.addItem(name)
+        self.dm_colors.activated.connect(self._on_dm_choice_changed)
         send.addWidget(self.dm_colors)
         # 表情按钮：展开/收起该直播间的专属表情面板（点选即发送，写操作）
         self.dm_emoji_btn = QPushButton("表情")
@@ -338,10 +354,20 @@ class DmPanel(QWidget):
         self.quick_dm_now_check.setChecked(self._quick_send_now())
         self.quick_dm_now_check.toggled.connect(self._on_quick_dm_send_now_toggled)
         send.addWidget(self.quick_dm_now_check)
+        # 「点击弹幕填入发送框」（ROADMAP 109）：与主界面 / 各独立窗口是**同一个全局开关**
+        self.copy_dm_fill_check = QCheckBox(COPY_DM_FILL_TEXT)
+        self.copy_dm_fill_check.setToolTip(COPY_DM_FILL_HINT)
+        self.copy_dm_fill_check.setChecked(self._copy_dm_fill())
+        self.copy_dm_fill_check.toggled.connect(self._on_copy_dm_fill_toggled)
+        send.addWidget(self.copy_dm_fill_check)
         self.dm_send_entry = QLineEdit()
         # 与 Tk 版一致：不硬截断输入，超长仅标红提示（是否接受由服务端判定）
         self.dm_send_entry.textChanged.connect(self._update_dm_len_hint)
+        self.dm_send_entry.textChanged.connect(self._on_dm_entry_typed)
         self.dm_send_entry.returnPressed.connect(self.on_send_danmaku)
+        # 上下键取回本房间的发送历史（ROADMAP 108）：复用面板既有的 eventFilter
+        self._key_entry = self.dm_send_entry
+        self.dm_send_entry.installEventFilter(self)
         send.addWidget(self.dm_send_entry, 1)
         self.dm_len_label = QLabel("")
         self.dm_len_label.setStyleSheet("color:#888; font-size: 11px")
@@ -510,6 +536,20 @@ class DmPanel(QWidget):
     # ---------- 弹幕交互：点击跳转/复制 + 右键回复/@ + 表情悬浮 ----------
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
+        # 注意：本过滤器会装到多个控件上，且 `_build_ui` 早期（输入框还没建出来）就可能
+        # 被 dm_text 的事件调到——所以这里取 `_key_entry`（可为 None），不能直接访问
+        # `self.dm_send_entry`，否则构建期会抛 AttributeError（探针实测踩到过）。
+        if self._key_entry is not None and obj is self._key_entry and \
+                event.type() == QEvent.KeyPress:
+            # 输入框的上下键取回发送历史（ROADMAP 108）；命中即吞掉，别让 QLineEdit
+            # 把光标移到行首 / 行尾
+            if event.key() == Qt.Key_Up:
+                self._step_dm_history(backwards=True)
+                return True
+            if event.key() == Qt.Key_Down:
+                self._step_dm_history(backwards=False)
+                return True
+            return False
         if obj is self.dm_text or obj is self.dm_text.viewport():
             if event.type() == QEvent.MouseButtonPress:
                 self._on_dm_press(event)
@@ -616,16 +656,50 @@ class DmPanel(QWidget):
         self.dm_copy_hint.setVisible(bool(text))
 
     def _copy_dm_content(self, content: str) -> None:
-        """复制弹幕正文到系统剪贴板，并短暂显示「已复制」提示。"""
+        """点击弹幕正文：按「点击弹幕填入发送框」开关**填入发送框**或**复制到剪贴板**。
+
+        与 Tk 版同一套语义（ROADMAP 109）：勾选后不碰剪贴板、覆盖式填入发送框并聚焦；
+        发送框不可用（未登录 / 写操作关闭 / 未选房间 / 弹幕区未开启）时回退为复制并说明原因。
+        """
+        if self._copy_dm_fill():
+            reason = self._dm_send_block_reason()
+            if not reason:
+                self._fill_dm_send_box(content)
+                return
+            log_window.info("点击弹幕：发送框不可用（%s），回退为复制", reason)
+            self.host.copy_to_clipboard(content)
+            self._show_copy_hint(
+                f"发送框不可用（{reason}），已复制：{self._dm_snippet(content)}")
+            return
         self.host.copy_to_clipboard(content)
-        snippet = content if len(content) <= 20 else content[:20] + "…"
-        self._set_copy_hint(f"已复制：{snippet}")
+        self._show_copy_hint(f"已复制：{self._dm_snippet(content)}")
+
+    def _dm_snippet(self, content: str, limit: int = 20) -> str:
+        """提示行里显示的短文本（过长截断加省略号）。"""
+        return content if len(content) <= limit else content[:limit] + "…"
+
+    def _show_copy_hint(self, text: str) -> None:
+        """显示复制 / 填入提示，并启动 ``COPY_HINT_MS`` 的自动清除定时器。"""
+        self._set_copy_hint(text)
         if self._copy_hint_timer is None:
             self._copy_hint_timer = QTimer(self)
             self._copy_hint_timer.setSingleShot(True)
             self._copy_hint_timer.timeout.connect(self._clear_copy_hint)
         self._copy_hint_timer.stop()
         self._copy_hint_timer.start(COPY_HINT_MS)
+
+    def _fill_dm_send_box(self, text: str) -> None:
+        """把文本**覆盖式**填入发送框并聚焦（ROADMAP 109，与 Tk 版同一语义）。
+
+        ``setText`` 会触发 ``textChanged``（字数提示随之更新），所以先把历史游标清掉，
+        免得那次信号把游标当成「用户编辑」再重置一遍（结果一样，只是别绕）。
+        """
+        self._reset_dm_history()
+        self.dm_send_entry.setText(text)
+        self.dm_send_entry.setFocus()
+        self.dm_send_entry.setCursorPosition(len(text))
+        self._show_copy_hint(f"已填入发送框：{self._dm_snippet(text)}")
+        log_window.info("点击弹幕：填入发送框（%d 字）", len(text))
 
     def _clear_copy_hint(self) -> None:
         self._set_copy_hint("")
@@ -1125,6 +1199,128 @@ class DmPanel(QWidget):
         self.dm_len_label.setStyleSheet(f"color:{color}; font-size:11px")
         self.dm_len_label.setText(str(len(text)))
 
+    # ---------- 发送颜色 / 模式记忆（ROADMAP 106，与 Tk 版共用房间条目） ----------
+
+    def _dm_memory(self, field: str) -> str:
+        """取本面板当前房间记下的颜色 / 模式名称（无记忆时为空串）。"""
+        room_id = self.selected_room
+        entry = self.host.entries.get(int(room_id)) if room_id is not None else None
+        return str(getattr(entry, field, "") or "") if entry is not None else ""
+
+    def _remember_dm_choice(self, field: str, name: str) -> bool:
+        """把当前房间的颜色 / 模式**名称**写进房间条目并落盘（值真变化才写）。"""
+        room_id = self.selected_room
+        entry = self.host.entries.get(int(room_id)) if room_id is not None else None
+        if entry is None or not name or getattr(entry, field, "") == name:
+            return False
+        setattr(entry, field, name)
+        self.host._save_config()
+        log_task.info("发送弹幕：房间 %s 记住%s %s", room_id,
+                      "颜色" if field == "dm_color" else "模式", name)
+        return True
+
+    def _on_dm_choice_changed(self, *_args) -> None:
+        """用户改动颜色 / 模式下拉：按房间记忆并落盘（ROADMAP 106）。
+
+        连的是 ``activated``（只有用户操作才触发），所以程序 ``setCurrentIndex`` 不会误写。
+        """
+        room_id = self.selected_room
+        entry = self.host.entries.get(int(room_id)) if room_id is not None else None
+        if entry is None:
+            return
+        color, mode = self.dm_colors.currentText(), self.dm_modes.currentText()
+        if entry.dm_color == color and entry.dm_mode == mode:
+            return
+        entry.dm_color, entry.dm_mode = color, mode
+        self.host._save_config()
+        log_task.info("发送弹幕：房间 %s 记住颜色 %s / 模式 %s", room_id, color, mode)
+
+    def _apply_memory_to_combo(self, combo, field: str, options: List[Tuple[str, int]],
+                               *, allow_writeback: bool) -> None:
+        """按记忆定位颜色 / 模式；``allow_writeback`` 为真时把回落结果写回记忆。
+
+        **只有拿到本房间可用项时（``_set_dm_options``）才允许改写记忆**：切房瞬间下拉里还是
+        上一个房间的可用项，那时判定的「失效」不作数（``allow_writeback=False``；若记忆项不在
+        这份过期列表里就先不动，等本房间可用项到达再定位——Qt 的下拉没法显示列表外的值）。
+        该房间没有记忆时回到**第一项**（默认白 / 滚动）。
+        """
+        names = [name for name, _value in options]
+        remembered = self._dm_memory(field)
+        if remembered:
+            if remembered in names:
+                choice, fell_back = remembered, False
+            elif not allow_writeback:
+                return
+            else:
+                choice, fell_back = resolve_dm_choice(names, remembered)
+        else:
+            choice, fell_back = (names[0] if names else combo.currentText()), False
+        index = combo.findText(choice)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        if fell_back:
+            log_task.info("发送弹幕：房间 %s 的%s记忆「%s」已不可用，改用「%s」",
+                          self.selected_room,
+                          "颜色" if field == "dm_color" else "模式", remembered, choice)
+            self._remember_dm_choice(field, choice)
+
+    def _apply_dm_memory(self) -> None:
+        """切房时套用该房间的颜色 / 模式记忆（ROADMAP 106，本房间可用项到达后再收口）。"""
+        self._apply_memory_to_combo(self.dm_colors, "dm_color", self._dm_colors,
+                                    allow_writeback=False)
+        self._apply_memory_to_combo(self.dm_modes, "dm_mode", self._dm_modes,
+                                    allow_writeback=False)
+
+    # ---------- 发送历史（ROADMAP 108：上下键取回，仅内存，历史本体在宿主） ----------
+
+    def _reset_dm_history(self) -> None:
+        """退出历史浏览（填入新内容 / 发送成功 / 用户自己打字后都走这里）。"""
+        self._hist_index = -1
+        self._hist_draft = ""
+
+    def _step_dm_history(self, *, backwards: bool) -> None:
+        """输入框的 ↑ / ↓：取回本房间本次运行内已发送的弹幕（历史在宿主、按房间隔离）。"""
+        if self._hist_index < 0:
+            # 首次进入历史：当前输入内容记为「草稿」，↓ 越过最新一条时回到它
+            self._hist_draft = self.dm_send_entry.text()
+        text, index = dm_history_step(
+            self.host._dm_history_of(self.selected_room), self._hist_index,
+            self._hist_draft, backwards=backwards)
+        self._hist_index = index
+        if text != self.dm_send_entry.text():
+            self._hist_applying = True     # 别让 textChanged 把游标又清掉
+            try:
+                self.dm_send_entry.setText(text)
+            finally:
+                self._hist_applying = False
+            self.dm_send_entry.setCursorPosition(len(text))
+        log_window.debug("发送历史：房间 %s %s → %s（游标 %d）", self.selected_room,
+                         "上一条" if backwards else "下一条",
+                         text if len(text) <= 50 else text[:50] + "…", index)
+
+    def _on_dm_entry_typed(self, _text: str = "") -> None:
+        """用户自己改动输入框＝新的编辑起点，退出历史浏览（ROADMAP 108）。"""
+        if self._hist_applying:
+            return
+        self._reset_dm_history()
+
+    # ---------- 「点击弹幕填入发送框」（ROADMAP 109：全局偏好，各视图一致） ----------
+
+    def _copy_dm_fill(self) -> bool:
+        """「点击弹幕填入发送框」是否开启（读全局偏好；各视图不各自维护状态）。"""
+        return bool(self.host.ui_prefs.get("copy_dm_fill", False))
+
+    def set_copy_dm_fill(self, enabled: bool) -> None:
+        """外部（宿主统一入口）同步勾选框；本面板不负责落盘与广播。"""
+        enabled = bool(enabled)
+        if self.copy_dm_fill_check.isChecked() != enabled:
+            self.copy_dm_fill_check.blockSignals(True)  # 防回环
+            self.copy_dm_fill_check.setChecked(enabled)
+            self.copy_dm_fill_check.blockSignals(False)
+
+    def _on_copy_dm_fill_toggled(self, checked: bool) -> None:
+        """本面板勾选框：交给宿主统一入口（写偏好、落盘并同步所有面板与窗口）。"""
+        self.host.set_copy_dm_fill(bool(checked))
+
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
     def _refresh_quick_danmaku(self) -> None:
@@ -1176,6 +1372,7 @@ class DmPanel(QWidget):
             return
         log_window.info("快捷弹幕：填入「%s」（房间 %s，仅填入不发送）",
                         text, self.selected_room)
+        self._reset_dm_history()    # 填入属于新的编辑起点，历史游标作废（ROADMAP 108）
         self.dm_send_entry.setText(
             merge_quick_danmaku(self.dm_send_entry.text(), text))
         self.dm_send_entry.setFocus()
@@ -1236,27 +1433,25 @@ class DmPanel(QWidget):
 
     def _set_dm_options(self, colors: List[Tuple[str, int]],
                         modes: List[Tuple[str, int]]) -> None:
-        """用服务端可用项刷新下拉（保留原选择，失效则回退首项）。"""
+        """用服务端可用项刷新下拉（按房间记忆定位；记忆已失效则回退首项并**改写记忆**）。"""
         new_colors = select_dm_options(DM_COLOR_PRESETS, colors)
         self._dm_colors = list(new_colors)
-        current_color = self.dm_colors.currentText()
         self.dm_colors.blockSignals(True)
         self.dm_colors.clear()
         for name, _value in new_colors:
             self.dm_colors.addItem(name)
-        index = self.dm_colors.findText(current_color)
-        self.dm_colors.setCurrentIndex(index if index >= 0 else 0)
         self.dm_colors.blockSignals(False)
+        self._apply_memory_to_combo(self.dm_colors, "dm_color", new_colors,
+                                    allow_writeback=True)
         new_modes = select_dm_options(tuple(DM_MODE_TEXTS.items()), modes)
         self._dm_modes = list(new_modes)
-        current_mode = self.dm_modes.currentText()
         self.dm_modes.blockSignals(True)
         self.dm_modes.clear()
         for name, _value in new_modes:
             self.dm_modes.addItem(name)
-        index = self.dm_modes.findText(current_mode)
-        self.dm_modes.setCurrentIndex(index if index >= 0 else 0)
         self.dm_modes.blockSignals(False)
+        self._apply_memory_to_combo(self.dm_modes, "dm_mode", new_modes,
+                                    allow_writeback=True)
 
     # ---- 发送 ----
 
@@ -1330,6 +1525,8 @@ class DmPanel(QWidget):
             if not payload.get("emoticon"):
                 # 表情包发送不影响输入框内容，仅文字弹幕成功后清空
                 self.dm_send_entry.clear()
+                # 发送成功＝这段编辑结束，历史游标作废（历史本体由宿主按房间记录，ROADMAP 108）
+                self._reset_dm_history()
                 self._update_dm_len_hint()
                 self._clear_dm_reply_target()
             self._set_hint("已发送")
@@ -1691,5 +1888,8 @@ class DmPanel(QWidget):
     def on_room_selected(self, room_id: Optional[int]) -> None:
         self._clear_dm_reply_target()
         self._refresh_dm_send_state()
+        # 发送颜色 / 模式：按房间套用记忆（ROADMAP 106）；随后到达的本房间可用项
+        # 会在 _set_dm_options 里收口（记忆项已失效则回落默认并改写记忆）
+        self._apply_dm_memory()
         # 表情面板展示的是具体房间的表情：切房即收起（并记住停留的包）
         self.hide_emoticon_panel()

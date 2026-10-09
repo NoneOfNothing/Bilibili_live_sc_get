@@ -89,9 +89,13 @@
 | 4.5 | 发送弹幕（配色/样式/分屏/门控/防连点） | `_on_send_danmaku`/`_dm_send_block_reason`/`_load_dm_options_for_selected` | Qt 同款门控 + 服务端颜色/模式按房间刷新 + `replay_dmid` 回复 | ✅ |
 | 4.6 | 表情面板（入口/分页/换包/图片/悬停） | `_on_open_emoticons`/`_build_emoticon_panel` 系列（下载图片、缩放、缓存、记忆包序号、Esc 收起） | 发送行「表情」按钮 + 分页/换包/悬停/图片限流下载与缓存/按房间记忆包序号/Esc 收起 | ✅ |
 | 4.7 | 弹幕输入不硬截断（仅超长标红） | 去掉客户端长度校验 | `setMaxLength` 已移除，仅标红提示 | ✅ |
-| 4.8 | 点击弹幕正文复制到剪贴板 | `_copy_dm_content`（`clipboard_append`）+ 独立复制提示行 | `host.copy_to_clipboard()` + 独立 `dm_copy_hint` 行（不覆盖发送提示） | ✅ |
+| 4.8 | 点击弹幕正文复制到剪贴板（ROADMAP 109 起可改为填入发送框） | `_copy_dm_content`（`clipboard_append`）+ 独立复制提示行；勾选 `ui.copy_dm_fill` 时**覆盖式填入发送框**、发送框不可用则回退复制并说明原因 | `host.copy_to_clipboard()` + 独立 `dm_copy_hint` 行（不覆盖发送提示）；勾选后同样改为填入 `dm_send_entry` | ✅ |
 | 4.9 | 表情条滚轮横向翻动 | `_on_emoticon_wheel` | `eventFilter` 拦 Wheel → 横向滚动条；单行自然宽度 `_sync_strip_width` | ✅ |
 | 4.10 | 直播预览（拉流 + 播放） | 无（Tk 没有可用的视频组件） | **Qt 专属增强**（ROADMAP 63 · P1~P4 全部完成）：独立浮窗（`QMediaPlayer` + `LiveStreamProxy` 回环代理注入防盗链头；HLS 优先 / 每 10 分钟无缝换源 / 出错换格式重试 / **断流自愈**（5 秒心跳 + 宽限期 + 重试上限）/ **自动追边**（落后超 `max_drift_sec` 默认 3 秒重载跳最新）；清晰度按新接口 `accept_qn` 只列该房间可用档位，未登录仅 360P·720P，**清晰度记忆**写 `ui.preview_quality`）；P3 **多路宫格**（最多 4 路 `preview.max_rooms`，仅主路出声，副路卡顿或 CPU 偏高自动停路，双击格子放大、双击房间行加入/停止）；P2 观看时长上报（`webHeartBeat`，写操作默认关闭、只对主路）；P4 加密房间密码（右键输入，**仅存内存**不落盘）；失败提示翻成人话 | ✅ |
+| 4.11 | 发送行颜色 / 模式按房间记忆（ROADMAP 106） | `RoomEntry.dm_color` / `dm_mode` + 共享纯函数 `resolve_dm_choice` + `_apply_memory_to_combo`（切房套用、改动落盘、拿到本房间可用项时回落并改写记忆） | 同左（`_dm_memory` / `_remember_dm_choice`，落盘经宿主 `_save_config`） | ✅ |
+| 4.12 | 输入框 ↑ / ↓ 翻出发送历史（ROADMAP 108） | `<Up>` / `<Down>` 绑 `_step_dm_history`（**返回 `"break"`**），历史存 `host._dm_send_history`（仅内存） | `eventFilter` 拦 `Key_Up` / `Key_Down`，用 `_key_entry` 判等（构建期安全） | ✅ |
+| 4.13 | 「点击弹幕填入发送框」开关（ROADMAP 109） | 发送行勾选框 + 宿主 `set_copy_dm_fill` 落盘并广播到各独立窗口 | `copy_dm_fill_check` + 宿主 `set_copy_dm_fill` 广播给每个 `DmPanel`（`blockSignals` 防回环） | ✅ |
+| 4.14 | 快捷弹幕不限条数（ROADMAP 107） | 删掉 `QUICK_DANMAKU_MAX` 与对话框拦截；管理对话框补纵向滚动条 | 同左（`QListWidget` 自带滚动） | ✅ |
 
 ### 粉丝牌页
 
@@ -217,6 +221,11 @@
     `record_live_time`（唯一能给出真实下播时刻的公开来源，实测 950 个主播约 4.8 秒、监听房间命中 20/22）
     + 退出时给仍在直播房间记的**下播估算**（＝退出时刻），排序取两者**较晚**的那个
     （纯函数 `gui_app.merge_offline_marks`）。
+35. **Qt 的弹幕输入框上下键历史在构建期抛异常**（ROADMAP 108）—— `DmPanel.eventFilter` 装在
+    `dm_text` 等多个控件上，而 `dm_text` 早于 `dm_send_entry` 创建：**构建期的任意事件**都会让它
+    访问尚不存在的 `self.dm_send_entry`，抛 `AttributeError` 后面板直接建不出来（纯 AST 接线测试
+    看不出来，离屏探针一建面板就现形）。现改比对 `_key_entry`（`__init__` 里先置 `None`、建出
+    输入框时赋值），并加了回归测试守着。
 
 ## 已知差异（保留）
 

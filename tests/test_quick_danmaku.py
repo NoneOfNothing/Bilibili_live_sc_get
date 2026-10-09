@@ -14,7 +14,6 @@ from blive_sc_get.gui_app import merge_quick_danmaku
 from blive_sc_get.gui_config import (
     DEFAULT_UI_PREFS,
     NOTIFY_SOUNDS,
-    QUICK_DANMAKU_MAX,
     SORT_MODES,
     RoomEntry,
     load_room_entries,
@@ -72,9 +71,13 @@ class NormalizeQuickDanmakuTests(unittest.TestCase):
         """
         self.assertEqual(normalize_quick_danmaku(["字" * 200]), ["字" * 200])
 
-    def test_caps_item_count(self):
-        items = [f"第{i}条" for i in range(QUICK_DANMAKU_MAX + 5)]
-        self.assertEqual(len(normalize_quick_danmaku(items)), QUICK_DANMAKU_MAX)
+    def test_keeps_every_item(self):
+        """条数上限已取消（ROADMAP 107）：多长的列表都原样保留，绝不截断。
+
+        截断是「打开一次管理对话框再关闭就把超出的条目写没」的根源（与上面 20 字截断同类）。
+        """
+        items = [f"第{i}条" for i in range(200)]
+        self.assertEqual(normalize_quick_danmaku(items), items)
 
 
 class MergeQuickDanmakuTests(unittest.TestCase):
@@ -284,6 +287,7 @@ class QuickSendNowPersistenceTests(unittest.TestCase):
             "dm_visible": not DEFAULT_UI_PREFS["dm_visible"],
             "dm_emoticon_image": not DEFAULT_UI_PREFS["dm_emoticon_image"],
             "quick_dm_send_now": not DEFAULT_UI_PREFS["quick_dm_send_now"],
+            "copy_dm_fill": not DEFAULT_UI_PREFS["copy_dm_fill"],
             "window_size": [900, 800],
             "selected_room": 12345,
             "room_windows": {"12345": {"x": 10, "y": 20, "width": 640, "height": 720}},

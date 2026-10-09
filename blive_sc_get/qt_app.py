@@ -85,6 +85,7 @@ from .gui_app import (
     PANE_RATIO,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    dm_history_push,
     emoticon_packages_signature,
     format_live_mark,
     merge_offline_marks,
@@ -96,7 +97,6 @@ from .gui_app import (
 )
 from .gui_config import (
     NOTIFY_SOUNDS,
-    QUICK_DANMAKU_MAX,
     RoomEntry,
     load_emoticon_memory,
     load_room_entries,
@@ -834,6 +834,9 @@ class QtScMonitorApp(QMainWindow):
         # 正在打开的快捷弹幕管理对话框（ROADMAP 100）：按钮可开可关，故记下它属于哪个房间
         self._quick_dm_manager = None
         self._quick_dm_manager_room = None
+        # 发送历史（ROADMAP 108）：room_id -> 已发送的**文字**弹幕（下标 0 最新），供输入框
+        # 上下键取回。**只在内存里**（不落盘、不写配置），重启即清空
+        self._dm_send_history: Dict[int, list] = {}
         # 房间号 -> {"index": 收起的表情包序号, "name": 包名}（持久化到 gui_rooms.json）
         self._emoticon_memory: Dict[int, dict] = load_emoticon_memory(self.config_path)
         # 房间号 -> 可用表情包（表情面板与「弹幕表情悬浮看原图」共用，见 Tk 版 self._emoticons）
@@ -2235,6 +2238,61 @@ class QtScMonitorApp(QMainWindow):
         for panel in list(self._dm_panels):
             panel.set_quick_dm_send_now(enabled)
 
+    # ---------- 发送历史（ROADMAP 108：输入框上下键取回，**只在内存**） ----------
+
+    def _history_key(self, room_id) -> int:
+        """把发送回调里的房间号折回界面使用的**输入房间号**。
+
+        发送链路交给后台的是**真实房间号**（短号房间两者不同），回投的 payload 里带的也是它；
+        而历史按输入房间号存（与 ``_selected_room_id`` 一致），故这里反查一次映射。
+        """
+        key = int(room_id)
+        if key in self.entries:
+            return key
+        for input_id, real_id in self._room_id_map.items():
+            if int(real_id) == key:
+                return int(input_id)
+        return key
+
+    def _dm_history_of(self, room_id) -> list:
+        """取某个房间的发送历史（未选中 / 无记录时为空列表）。"""
+        if room_id is None:
+            return []
+        return list(self._dm_send_history.get(int(room_id), ()))
+
+    def _push_dm_history(self, payload: dict) -> None:
+        """记录一条**发送成功**的文字弹幕（表情包发送不发文本，天然不入栈）。"""
+        if not payload.get("ok") or payload.get("emoticon"):
+            return
+        text = str(payload.get("text") or "")
+        room_id = payload.get("room_id")
+        if room_id is None:
+            return
+        key = self._history_key(room_id)
+        items = dm_history_push(self._dm_send_history.get(key, ()), text)
+        self._dm_send_history[key] = items
+        log_task.debug("发送历史：房间 %s 记录「%s」，现有 %d 条", key,
+                       text if len(text) <= 50 else text[:50] + "…", len(items))
+
+    # ---------- 「点击弹幕填入发送框」（ROADMAP 109：全局偏好，各视图一致） ----------
+
+    def set_copy_dm_fill(self, enabled: bool) -> None:
+        """「点击弹幕填入发送框」的统一入口（主界面与各房间独立窗口的勾选框都走这里）。
+
+        与「点选即发送」同构：① 偏好落盘；② 广播给**每一个**弹幕面板（各自的
+        `set_copy_dm_fill` 只回写勾选框、`blockSignals` 防回环）；③ 记日志。点击时的
+        **实际行为**由各面板读 ``ui_prefs`` 决定，不各自维护状态。
+        """
+        enabled = bool(enabled)
+        if self.ui_prefs.get("copy_dm_fill") != enabled:
+            self.ui_prefs["copy_dm_fill"] = enabled
+            self._save_config()
+            log_window.info("点击弹幕：%s（%d 个弹幕面板同步）",
+                            "填入发送框（覆盖框内内容，不再复制）" if enabled
+                            else "复制到剪贴板", len(self._dm_panels))
+        for panel in list(self._dm_panels):
+            panel.set_copy_dm_fill(enabled)
+
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         """首次显示后按 PANE_RATIO 分配板块高度（此前分割器还没有真实高度）。"""
         super().showEvent(event)
@@ -2512,6 +2570,9 @@ class QtScMonitorApp(QMainWindow):
                     for panel in self.dm_panels_for(item[1].get("room_id")):
                         panel.on_dm_config(item[1])
                 elif kind == "dm_send_result":
+                    # 发送历史按房间记在宿主（ROADMAP 108）：各面板读到的是同一份，
+                    # 独立窗口与主视图之间也能互相翻到
+                    self._push_dm_history(item[1])
                     for panel in self.dm_panels_for(item[1].get("room_id")):
                         panel.on_dm_send_result(item[1])
                 elif kind == "following":
@@ -3213,7 +3274,8 @@ class QtScMonitorApp(QMainWindow):
         layout.addWidget(listbox, 1)
         edit_row = QHBoxLayout()
         item_edit = QLineEdit()
-        item_edit.setPlaceholderText(f"输入后回车添加（最多 {QUICK_DANMAKU_MAX} 条）")
+        # 条数上限已取消（ROADMAP 107）：不再写「最多 N 条」，列表变长靠滚动查看
+        item_edit.setPlaceholderText("输入后回车添加")
         edit_row.addWidget(item_edit, 1)
 
         def refresh() -> None:
@@ -3227,10 +3289,7 @@ class QtScMonitorApp(QMainWindow):
             text = cleaned[0]
             if text in working:
                 return
-            if len(working) >= QUICK_DANMAKU_MAX:
-                QMessageBox.information(
-                    dialog, "快捷弹幕", f"最多只能保存 {QUICK_DANMAKU_MAX} 条")
-                return
+            # 条数上限已取消（ROADMAP 107）：只拦重复，不再拦「最多 N 条」
             working.append(text)
             item_edit.clear()
             refresh()
