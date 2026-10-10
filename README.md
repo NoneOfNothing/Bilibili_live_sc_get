@@ -228,6 +228,8 @@ cookie 只用于读取弹幕连接 token，请注意保管，不要泄露或提�
 
 双击 `start_gui.bat`，或 `python main.py --gui` / `python gui.py`。
 
+程序图标取自 `assets/app.ico`（Tk / Qt 两版的标题栏与任务栏，ROADMAP 111；文件缺失或加载失败时自动跳过并记日志，不影响启动）。
+
 **无控制台窗口启动**：`start_gui.bat` 启动 GUI 后不会保留黑色 cmd 窗口（日志看 GUI 的「调试」页签）；首次运行需要初始化虚拟环境时会短暂显示一个进度窗口，装完自动关闭。如果连首次初始化也不想看到窗口（例如加入开机自启），用 `start_gui_silent.vbs`——完全零窗口，但要求已经运行过一次 `start_gui.bat` 完成初始化。
 
 - **直播间页签**：

@@ -44,6 +44,7 @@ from .gui_app import (
     QUICK_DM_PLACEHOLDER,
     QUICK_DM_SEND_NOW_TEXT,
     SC_TITLE_MAX_LEN,
+    apply_app_icon_tk,
     build_sc_segments,
     danmaku_content_from_line,
     danmaku_send_guard,
@@ -122,6 +123,7 @@ class RoomChatWindow(tk.Toplevel):
         # 打开时不抢主窗口焦点（与开播悬浮窗同款做法，见 overlay.apply_noactivate）
         apply_noactivate(self)
         self._build_ui()
+        apply_app_icon_tk(self)  # 程序图标（ROADMAP 111；Toplevel 不一定继承 root，显式设置最稳）
         self.bind("<Configure>", self._on_configure)
         self.protocol("WM_DELETE_WINDOW", self.shutdown)
         host.register_room_window(self)

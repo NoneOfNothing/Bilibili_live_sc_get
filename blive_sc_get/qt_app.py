@@ -42,6 +42,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QIcon,
     QPainter,
     QPen,
     QFontMetrics,
@@ -85,6 +86,7 @@ from .gui_app import (
     PANE_RATIO,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    APP_ICON_PATH,
     NEW_ROOM_MARK_S,
     backfill_offline_marks,
     dm_history_push,
@@ -3448,6 +3450,14 @@ def run_gui_qt(output_dir: str = "data") -> int:
     """启动 Qt 版图形界面。"""
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("blive_sc_get_qt")
+    # 程序图标（ROADMAP 111）：设一次即覆盖主窗口 / 房间独立窗口 / 预览浮窗 / 所有对话框
+    # 与任务栏；文件缺失或无法加载时 QIcon 为空，记日志跳过、不影响启动
+    icon = QIcon(str(APP_ICON_PATH))
+    if icon.isNull():
+        log_app.debug("程序图标缺失或无法加载，跳过（%s）", APP_ICON_PATH)
+    else:
+        app.setWindowIcon(icon)
+        log_app.debug("已设置程序图标（assets/app.ico）")
     window = QtScMonitorApp(output_dir)
     window.show()
     app.exec()

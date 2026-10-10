@@ -99,6 +99,32 @@ log_app = get_logger(CATEGORY_APP, "gui.app")
 
 COOKIE_FILE_PATH = Path(__file__).resolve().parent.parent / COOKIE_FILE_NAME
 
+APP_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "app.ico"
+"""程序图标（assets/app.ico，多尺寸 ICO，ROADMAP 111）。
+
+按仓库根解析（blive_sc_get 的上一级），Tk / Qt 两版共用：Tk 走 :func:`apply_app_icon_tk`，
+Qt 用 ``QIcon(str(APP_ICON_PATH))``。文件缺失或加载失败时只记日志、不影响启动。
+"""
+
+
+def apply_app_icon_tk(window) -> bool:
+    """给 Tk 窗口设置程序图标（容错版），返回是否生效（ROADMAP 111）。
+
+    ``iconbitmap`` 只接受 .ico，文件缺失 / 格式不对时抛 ``tk.TclError``——任何失败都只记
+    debug 日志并返回 False，绝不能让程序起不来。Tk 的 Toplevel 在 Windows 上通常会继承
+    root 的图标，但房间独立窗口显式设置一遍最稳。
+    """
+    if not APP_ICON_PATH.is_file():
+        log_app.debug("程序图标不存在，跳过（%s）", APP_ICON_PATH)
+        return False
+    try:
+        window.iconbitmap(str(APP_ICON_PATH))
+    except tk.TclError as exc:
+        log_app.debug("设置程序图标失败：%s", exc)
+        return False
+    log_app.debug("已设置程序图标（%s）", APP_ICON_PATH.name)
+    return True
+
 DEBUG_LOG_MAX_LINES = 4000
 
 HISTORY_PAGE_SIZE = 100
@@ -6169,6 +6195,7 @@ def run_gui(output_dir: str = "data") -> int:
     except Exception:
         pass
     root = tk.Tk()
+    apply_app_icon_tk(root)  # 程序图标（ROADMAP 111；失败只记日志，不影响启动）
     ScMonitorApp(root, output_dir)
     root.mainloop()
     return 0

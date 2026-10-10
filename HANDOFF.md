@@ -84,6 +84,7 @@ python -m venv .venv
 | `QT_PORTING.md` | Tk→Qt 逐项核对表（当前 48/48 ✅） |
 | `ROADMAP.md` | 历史功能/优化/BUG 追踪 |
 | `CHANGELOG.md` | 版本更新日志（读写口径以它为准） |
+| `assets/app.ico` | 程序图标（ROADMAP 111，Tk / Qt 两版共用；路径常量 `gui_app.APP_ICON_PATH`，缺失时自动跳过） |
 
 ## 6. 配置与数据（别搞乱）
 
