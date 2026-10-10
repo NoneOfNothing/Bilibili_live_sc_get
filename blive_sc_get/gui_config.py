@@ -92,7 +92,10 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     # live_started_at / live_offline_at：「按直播状态」排序的时间基准（ROADMAP 87）——
     # 各房间的**真实开播时刻**与**最近关播时刻**（epoch 秒），{"<房间号>": 时刻}。
     # 持久化后重启仍按同样的先后排序（此前只存在内存里，重启即丢，顺序被打乱）；
-    # 启动读取时会丢弃过旧 / 非法的记录（见 gui_app.prune_live_marks）。
+    # 启动读取时会丢弃非法 / 未来时间的记录（见 gui_app.prune_live_marks），保留期不同：
+    # 开播时刻最多信 24 小时（跨场次沿用会把「已播」算错），关播时刻**永久保留**
+    # （它只参与排序、旧记录依然准确，ROADMAP 110；没有记录的房间由宿主补「很久之前」的
+    # 默认值，见 gui_app.NEW_ROOM_MARK_S / backfill_offline_marks）。
     "live_started_at": {},
     "live_offline_at": {},
 }

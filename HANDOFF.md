@@ -185,7 +185,10 @@ python -m venv .venv
   `live_started_at`（**真实开播时刻**，与第 11 节的「已播」共用同一字典：接口值优先、
   可校正本地观测、下播清空）与 `_offline_at`（关播时刻，纯函数 `update_offline_at`）
   都写进 `gui_rooms.json` 的 `ui.live_started_at` / `ui.live_offline_at`，启动时经
-  `prune_live_marks` 读回（丢弃 >24 小时 / 未来 / 非法记录）。排序时 `live_since`
+  `prune_live_marks` 读回（**规则不同**，ROADMAP 110：开播时刻 >24 小时丢弃——跨场次
+  沿用会把「已播」算错；关播时刻**永久保留**、只丢未来 / 非法值——它只参与排序、旧记录
+  依然准确；恢复后 `backfill_offline_marks` 给没有关播记录的房间补 `NEW_ROOM_MARK_S`
+  （2000-01-01）默认标记，让新监控 / 从未观察到直播的房间确定性沉底）。排序时 `live_since`
   直接传 `live_started_at`，**旧的自增标记 `_live_since` 已整体弃用**。
   因此**重启后顺序不变**；启动时就已在直播的房间等于用「已播」时长**反推**了开播时间。
   `update_offline_at` 靠 `was_live` 只认「直播中 → 非直播中」的真实跳变（重复上报不推后、

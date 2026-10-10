@@ -152,20 +152,32 @@ SORT_MODE_HELP = {
 
 
 LIVE_MARK_MAX_AGE_S = 24 * 3600
-"""持久化的开播 / 关播时间最多信 24 小时。
+"""持久化的**开播**时间最多信 24 小时。
 
-单场直播极少播满一整天，更旧的时间只可能是**上次会话**留下的、与当前这一场无关的记录
-——继续沿用会让「已播」显示成几十小时，也会把排序带偏，故读取时直接丢弃。
+单场直播极少播满一整天，更旧的开播时刻只可能是**上一场次**留下的、与当前这一场无关的
+记录——继续沿用会让「已播」显示成几十小时，也会把直播中那一组的排序带偏，故读取时
+直接丢弃。**关播时刻永久保留**（它只参与排序、不驱动「已播」，一条几个月前的关播记录
+依然是「最近一次下播」的准确描述，ROADMAP 110），两者规则分开。
+"""
+
+NEW_ROOM_MARK_S = 946684800.0
+"""新监控直播间 / 从未记过关播的房间的**默认关播标记**（2000-01-01，ROADMAP 110）。
+
+「按直播状态」的已下播分组按关播时刻倒序——没有记录的房间只能靠自定义顺序，先后与
+真实下播日期完全脱钩（用户反馈「数天未开播的直播间排在其他直播间上面」）。给它们统一
+补上这个「很久之前」的默认值，让没有真实关播记录的房间**确定性地沉底**；之后一旦观察到
+真实关播（或退出估算、或关注列表的真实值），标记就会被真实时间覆盖。
 """
 
 
 def prune_live_marks(marks: dict, now: Optional[float] = None,
-                     max_age_s: float = LIVE_MARK_MAX_AGE_S) -> Dict[int, float]:
+                     max_age_s: Optional[float] = LIVE_MARK_MAX_AGE_S) -> Dict[int, float]:
     """丢掉过旧的持久化时间标记（纯函数，两版共用，启动时调用）。
 
+    ``max_age_s`` 为 ``None`` 表示**不限龄**（关播时刻永久保留，只丢非法值）。其余规则：
     只保留「距今不超过 ``max_age_s``」且不是未来时间的记录；房间号统一成 ``int``、时间
-    统一成 ``float``，其余（非法键值、0、负数）一律丢弃——配置文件是用户可编辑的，
-    坏数据不能把排序带崩。
+    统一成 ``float``，非法键值、0、负数一律丢弃——配置文件是用户可编辑的，坏数据不能把
+    排序带崩。
     """
     current = time.time() if now is None else float(now)
     result: Dict[int, float] = {}
@@ -177,7 +189,7 @@ def prune_live_marks(marks: dict, now: Optional[float] = None,
             continue
         if moment <= 0 or moment > current + 60.0:  # 未来时间：时钟回拨或脏数据
             continue
-        if current - moment > max_age_s:
+        if max_age_s is not None and current - moment > max_age_s:
             continue
         result[room_id] = moment
     return result
@@ -187,15 +199,19 @@ def restore_live_marks(ui_prefs: dict, *, now: Optional[float] = None
                        ) -> Tuple[Dict[int, float], Dict[int, float]]:
     """从 ui 段恢复「按直播状态」的时间基准，并记录恢复情况（两版共用）。
 
-    返回 ``(开播时刻, 关播时刻)`` 两个字典。过旧 / 未来 / 非法的记录由
-    :func:`prune_live_marks` 丢掉——**这里专门记一条日志**：万一顺序没恢复成预期，从日志
-    就能分清是「历史记录被丢了」还是「本地压根没存过」，不用去猜。
+    返回 ``(开播时刻, 关播时刻)`` 两个字典。**两者规则不同**（ROADMAP 110）：开播时刻
+    最多信 24 小时（``LIVE_MARK_MAX_AGE_S``，跨场次沿用必然把「已播」算错）；关播时刻
+    **永久保留**（``max_age_s=None``，它只参与排序、旧记录依然准确）。未来 / 非法的记录
+    由 :func:`prune_live_marks` 丢掉——**这里专门记一条日志**：万一顺序没恢复成预期，
+    从日志就能分清是「历史记录被丢了」还是「本地压根没存过」。
     """
     raw_live = ui_prefs.get("live_started_at") or {}
     raw_offline = ui_prefs.get("live_offline_at") or {}
-    live = prune_live_marks(raw_live, now=now)
-    offline = prune_live_marks(raw_offline, now=now)
-    dropped = (len(raw_live) - len(live)) + (len(raw_offline) - len(offline))
+    live = prune_live_marks(raw_live, now=now, max_age_s=LIVE_MARK_MAX_AGE_S)
+    offline = prune_live_marks(raw_offline, now=now, max_age_s=None)
+    dropped_live = len(raw_live) - len(live)
+    dropped_offline = len(raw_offline) - len(offline)
+    dropped = dropped_live + dropped_offline
     if not live and not offline:
         log_data.debug("「按直播状态」排序：本地没有可用的开播/关播时间记录%s",
                        f"（丢弃 {dropped} 条过期/非法记录）" if dropped else "")
@@ -204,8 +220,31 @@ def restore_live_marks(ui_prefs: dict, *, now: Optional[float] = None
                   len(live), len(offline),
                   f"，丢弃过期/非法记录 {dropped} 条" if dropped else "")
     if dropped:
+        log_data.debug("丢弃明细：开播 %d 条（>24 小时，视为上一场次）、关播 %d 条（未来/非法值）",
+                       dropped_live, dropped_offline)
         log_data.debug("丢弃后保留的记录：开播 %s，关播 %s", live, offline)
     return live, offline
+
+
+def backfill_offline_marks(offline_at: dict, room_ids,
+                           mark: float = NEW_ROOM_MARK_S) -> int:
+    """给还没有关播记录的房间补上默认标记（就地更新，返回补了几个，两版共用）。
+
+    启动恢复后调用一次：凡是没记过关播时刻的被监控房间（老数据、或从未观察到直播），
+    统一补成 ``NEW_ROOM_MARK_S``（很久之前）——这样已下播分组的**每个**房间都有标记、
+    都按时间倒序排，新监控的房间也确定性地沉底，而不是凭自定义顺序插进中间（ROADMAP 110）。
+    之后真实关播（运行期观测 / 退出估算 / 关注列表）会把它覆盖成真实时间。
+    """
+    filled = 0
+    for room_id in room_ids:
+        try:
+            key = int(room_id)
+        except (TypeError, ValueError):
+            continue
+        if offline_at.get(key) is None:
+            offline_at[key] = float(mark)
+            filled += 1
+    return filled
 
 
 def update_offline_at(offline_at: dict, room_id: int, is_live: bool,
@@ -1168,6 +1207,12 @@ class ScMonitorApp:
         #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
+        # 没记过关播时刻的房间（老数据）补一个「很久之前」的默认值：让它们确定性地沉底，
+        # 而不是凭自定义顺序插进中间（ROADMAP 110）
+        backfilled = backfill_offline_marks(self._offline_at, self.entries)
+        if backfilled:
+            log_data.info("已为 %d 个没有关播记录的房间补上默认标记（很久之前，排序沉底）",
+                          backfilled)
         self._live_duration_tick = 0.0  # 「已播」字段上次刷新时刻（秒级节流用）
         # 关注列表给出的**真实下播时刻**（ROADMAP 97，仅本次运行有效）：程序关闭期间下播的
         # 房间收不到关播信号，只能靠它排序；与 _offline_at 合并时取较晚的那个。
@@ -4763,7 +4808,8 @@ class ScMonitorApp:
         程序关闭期间下播的房间收不到关播信号，重启后既无开播也无下播记录，在「按直播状态」
         排序里会掉进「无记录」那一档；记下「最后一次确认它还在直播」的时刻，重启后就有序可排
         （比真实下播时刻略早，但相对先后是对的）。之后若从关注列表拿到真实下播时刻，会取较晚
-        的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，24 小时内有效）。
+        的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，**永久保留**
+        ——它只参与排序、不驱动「已播」，不做按龄裁剪）。
         """
         if self._offline_estimate_done:
             return
@@ -4893,6 +4939,10 @@ class ScMonitorApp:
                                           uid=int(payload.get("uid") or 0))
         self.client_states[room_id] = "starting"
         self.live_state[room_id] = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
+        # 新监控的直播间默认「很久之前开播」（ROADMAP 110）：没有真实关播记录前先给一个
+        # 很老的标记，让它确定性地沉底；若它此刻正在直播，首个状态事件会把这个标记清掉，
+        # 之后由真实开播 / 关播时刻接管
+        self._offline_at[room_id] = NEW_ROOM_MARK_S
         # 新加的房间可能本来就在直播：立刻记下「已播」起点，不必等首次 status 事件
         if update_live_started_at(self.live_started_at, room_id,
                                   self.live_state[room_id] == "直播中",

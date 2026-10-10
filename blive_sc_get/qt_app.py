@@ -85,6 +85,8 @@ from .gui_app import (
     PANE_RATIO,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    NEW_ROOM_MARK_S,
+    backfill_offline_marks,
     dm_history_push,
     emoticon_packages_signature,
     format_live_mark,
@@ -798,6 +800,12 @@ class QtScMonitorApp(QMainWindow):
         #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
+        # 没记过关播时刻的房间（老数据）补一个「很久之前」的默认值：让它们确定性地沉底，
+        # 而不是凭自定义顺序插进中间（ROADMAP 110）
+        backfilled = backfill_offline_marks(self._offline_at, self.entries)
+        if backfilled:
+            log_data.info("已为 %d 个没有关播记录的房间补上默认标记（很久之前，排序沉底）",
+                          backfilled)
         # 关注列表给出的**真实下播时刻**（ROADMAP 97，仅本次运行有效）：程序关闭期间下播的
         # 房间收不到关播信号，只能靠它排序；与 _offline_at 合并时取较晚的那个。
         self._remote_offline_at: Dict[int, float] = {}
@@ -1881,6 +1889,10 @@ class QtScMonitorApp(QMainWindow):
                                           uid=int(payload.get("uid") or 0))
         self.client_states[room_id] = "starting"
         self.live_state[room_id] = LIVE_STATUS_TEXT.get(int(payload.get("live_status") or 0), "未知")
+        # 新监控的直播间默认「很久之前开播」（ROADMAP 110）：没有真实关播记录前先给一个
+        # 很老的标记，让它确定性地沉底；若它此刻正在直播，首个状态事件会把这个标记清掉，
+        # 之后由真实开播 / 关播时刻接管
+        self._offline_at[room_id] = NEW_ROOM_MARK_S
         # 新加的房间可能本来就在直播：立刻记下「已播」起点，不必等首次 status 事件
         if update_live_started_at(self.live_started_at, room_id,
                                   self.live_state[room_id] == "直播中",
@@ -2096,7 +2108,8 @@ class QtScMonitorApp(QMainWindow):
         程序关闭期间下播的房间收不到关播信号，重启后既无开播也无下播记录，在「按直播状态」
         排序里会掉进「无记录」那一档；记下「最后一次确认它还在直播」的时刻，重启后就有序可排
         （比真实下播时刻略早，但相对先后是对的）。之后若从关注列表拿到真实下播时刻，会取较晚
-        的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，24 小时内有效）。
+        的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，**永久保留**
+        ——它只参与排序、不驱动「已播」，不做按龄裁剪）。
         """
         if self._offline_estimate_done:
             return

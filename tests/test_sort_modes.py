@@ -13,8 +13,10 @@ from pathlib import Path
 from blive_sc_get.api import FOLLOWING_URL
 from blive_sc_get.gui_app import (
     LIVE_MARK_MAX_AGE_S,
+    NEW_ROOM_MARK_S,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    backfill_offline_marks,
     merge_offline_marks,
     order_room_ids,
     prune_live_marks,
@@ -175,6 +177,60 @@ class LiveMarkPersistenceTests(unittest.TestCase):
     def test_empty_and_none_are_safe(self):
         self.assertEqual(prune_live_marks({}), {})
         self.assertEqual(prune_live_marks(None), {})
+
+    def test_offline_marks_never_expire(self):
+        """关播时刻**永久保留**、开播时刻只保留 24 小时（ROADMAP 110）。
+
+        数天未开播的房间的关播记录依然是「它最近一次下播」的准确描述——此前统一按
+        24 小时裁掉，会让它掉进「无记录」档、按自定义顺序乱排（用户反馈「数天未开播的
+        直播间排在其他直播间上面」）。开播时刻没有这个豁免：跨场次沿用会把「已播」算错。
+        """
+        now = 1900000000.0  # 真实量级（2030 年），比 NEW_ROOM_MARK_S（2000 年）晚
+        year_old = now - 365 * 86400
+        # 关播时刻：一年前也保留（max_age_s=None = 不限龄）；非法 / 未来值仍会丢
+        self.assertEqual(
+            prune_live_marks({"1": year_old, "2": now + 3600, "3": 0},
+                             now=now, max_age_s=None),
+            {1: year_old})
+        # 开播时刻仍按 24 小时裁（LIVE_MARK_MAX_AGE_S 默认值）
+        self.assertEqual(prune_live_marks({"1": year_old}, now=now), {})
+
+    def test_backfill_offline_marks_seeds_missing_only(self):
+        """补默认标记：只补「没有记录」的房间，已有记录（含真实时间）一律不动。"""
+        offline = {11: 1790000000.0}          # 已有真实记录
+        filled = backfill_offline_marks(offline, [11, 22, "33", "abc"])
+        self.assertEqual(filled, 2)
+        self.assertEqual(offline[11], 1790000000.0, "已有记录不许被默认值覆盖")
+        self.assertEqual(offline[22], NEW_ROOM_MARK_S)
+        self.assertEqual(offline[33], NEW_ROOM_MARK_S)
+        # 再次补：没有可补的，返回 0（幂等）
+        self.assertEqual(backfill_offline_marks(offline, [11, 22, 33]), 0)
+
+    def test_days_offline_room_orders_by_its_real_offline_time(self):
+        """修复目标场景：3 天前下播的房间按**真实关播时间**排在「昨天关播」的后面，
+        而不是掉进「无记录」档、凭自定义顺序压过别人。"""
+        base = [11, 22]
+        now = 4000000.0
+        offline = {11: now - 3 * 86400, 22: now - 86400}
+        self.assertEqual(
+            order_room_ids(base, "status", live_states={}, offline_at=offline),
+            [22, 11], "最近关播的应排在前，与自定义顺序无关")
+        # 对照「修前」行为：关播记录若被 24 小时规则裁掉，就只剩自定义顺序（BUG 的样子）
+        self.assertEqual(
+            order_room_ids(base, "status", live_states={}, offline_at={}),
+            [11, 22])
+
+    def test_new_room_seed_sinks_to_the_bottom(self):
+        """新监控的直播间默认「很久之前开播」：默认标记让它排在所有有真实关播记录的
+        房间后面，直到它真的下播（拿到真实关播时刻）为止。"""
+        base = [11, 22, 33]
+        now = 1900000000.0  # 真实量级，NEW_ROOM_MARK_S（2000 年）比所有真实记录都早
+        offline = {11: now - 86400,          # 昨天关播
+                   22: NEW_ROOM_MARK_S,      # 新监控（默认标记）
+                   33: now - 3 * 86400}      # 3 天前关播
+        self.assertEqual(
+            order_room_ids(base, "status", live_states={}, offline_at=offline),
+            [11, 33, 22], "新房间应沉底，老房间按关播时间倒序")
 
     def test_observation_fallback_is_logged(self):
         """没有接口开播时刻、回退「本地观测」时要留痕。
@@ -383,6 +439,41 @@ class FollowingOfflineMarksTests(unittest.TestCase):
         self.assertIn("parse_following_live_marks", _names(fetch), "未复用解析函数")
         self.assertIn("FOLLOWING_PAGE_SIZE", _names(fetch), "未按实测页大小翻页")
         self.assertIn("FOLLOWING_MAX_PAGES", _names(fetch), "未限制最多翻多少页")
+
+
+class OfflineMarkRetentionWiringTests(unittest.TestCase):
+    """ROADMAP 110 的宿主接线：关播时刻永久保留、新房间 / 老房间都有默认标记。"""
+
+    def test_restore_uses_permanent_retention_for_offline_marks(self):
+        """启动恢复：开播时刻按 24 小时裁、关播时刻不限龄（max_age_s=None）。"""
+        restore = next((node for node in ast.walk(_module_tree("gui_app.py"))
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "restore_live_marks"), None)
+        self.assertIsNotNone(restore, "未找到 restore_live_marks")
+        source = ast.unparse(restore)
+        self.assertIn("max_age_s=None", source, "关播时刻未改为永久保留")
+        self.assertIn("LIVE_MARK_MAX_AGE_S", source, "开播时刻的 24 小时规则丢失")
+
+    def test_hosts_backfill_missing_marks(self):
+        """两版启动恢复后都要给没有关播记录的房间补默认标记（很久之前，沉底）。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                init = _method(_module_tree(module), cls, "__init__")
+                self.assertIn("backfill_offline_marks", _names(init),
+                              f"{module} 启动时未补默认关播标记")
+
+    def test_add_result_seeds_new_room_mark(self):
+        """新监控的直播间默认「很久之前开播」：两版加房成功都要写入默认关播标记。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                node = _method(_module_tree(module), cls, "_on_add_result")
+                source = ast.unparse(node)
+                self.assertIn("_offline_at[room_id] = NEW_ROOM_MARK_S", source,
+                              f"{module} 新加房间未写入默认关播标记")
+                self.assertIn("NEW_ROOM_MARK_S", _names(node),
+                              f"{module} 未使用共享常量 NEW_ROOM_MARK_S")
 
 
 if __name__ == "__main__":

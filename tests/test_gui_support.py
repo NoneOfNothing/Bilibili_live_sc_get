@@ -1542,6 +1542,18 @@ class RestoreLiveMarksTests(unittest.TestCase):
         self.assertEqual(restore_live_marks({}, now=self.NOW), ({}, {}))
         self.assertEqual(restore_live_marks({"live_started_at": {}}, now=self.NOW), ({}, {}))
 
+    def test_offline_marks_never_expire(self):
+        """关播时刻永久保留（ROADMAP 110）：数天未开播的房间不再掉进「无记录」档；
+        开播时刻仍只信 24 小时（跨场次沿用会把「已播」算错）。"""
+        now = 1900000000.0  # 真实量级，比 NEW_ROOM_MARK_S（2000 年）晚
+        prefs = {"live_started_at": {"11": now - 3 * 86400},        # 过旧 → 丢
+                 "live_offline_at": {"22": now - 3 * 86400,         # 保留
+                                     "33": now - 365 * 86400}}      # 一年前也保留
+        live, offline = restore_live_marks(prefs, now=now)
+        self.assertEqual(live, {})
+        self.assertEqual(offline, {22: now - 3 * 86400,
+                                   33: now - 365 * 86400})
+
 
 class FormatLiveMarkTests(unittest.TestCase):
     """日志用的时间串：正常值转本地时间，非法值给「—」且不抛异常。"""
