@@ -27,7 +27,7 @@ except ImportError:
     Image = None
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import aiohttp
 
@@ -1039,6 +1039,44 @@ def select_dm_options(presets, offered):
         seen.add(name)
         deduped.append((name, value))
     return deduped or list(presets)
+
+
+def merge_quick_presets(global_items: Iterable[str],
+                        room_items: Iterable[str]) -> List[str]:
+    """把「全局快捷弹幕」与「该房间的快捷弹幕」合成下拉候选（纯函数，ROADMAP 113）。
+
+    **全局在前、房间在后**（用户确认的顺序：常用语放全局、房间专属语靠后），跨组**同名只
+    保留第一次出现**的那条（即全局那份的位置）——下拉里不做归属标记，重复列出只会让人以为
+    存了两份。两组都过一遍 :func:`normalize_quick_danmaku`（去首尾空白 / 保序去重 / 丢弃
+    非字符串），配置里的坏数据不该让下拉崩掉。
+    """
+    merged: List[str] = []
+    for group in (global_items or (), room_items or ()):
+        for text in normalize_quick_danmaku(group):
+            if text not in merged:
+                merged.append(text)
+    return merged
+
+
+def move_quick_preset(source: Iterable[str],
+                      target: Iterable[str], text: str) -> Tuple[List[str], List[str]]:
+    """把 ``text`` 从一组快捷弹幕**移动**到另一组（纯函数，ROADMAP 115）。
+
+    支撑管理对话框里的右键「转移」：全局 ↔ 本房间互转。
+
+    - 源里没有这条 → 两组原样返回（右键菜单只对真实条目弹出，这里只是兜底）；
+    - 目标里**已有同名** → 不重复添加，但源里那份照样删掉（文本仍在目标里，不丢数据，
+      也顺手消掉了两档重复）；
+    - 目标里没有 → 追加到末尾（与「顺序即下拉顺序」一致，用户可再上下移微调）。
+    """
+    texts = [str(item) for item in (source or ())]
+    if text not in texts:
+        return texts, [str(item) for item in (target or ())]
+    remaining = [item for item in texts if item != text]
+    target_items = [str(item) for item in (target or ())]
+    if text not in target_items:
+        target_items.append(text)
+    return remaining, target_items
 
 
 def merge_quick_danmaku(current: str, text: str) -> str:
@@ -3549,8 +3587,13 @@ class ScMonitorApp:
         return list(entry.quick_danmaku) if entry is not None else []
 
     def _refresh_quick_danmaku(self) -> None:
-        """按当前选中房间刷新快捷弹幕下拉（展开前还会再刷一次，见 postcommand）。"""
-        presets = self._quick_danmaku_of(self._selected_room_id)
+        """按当前选中房间刷新快捷弹幕下拉（展开前还会再刷一次，见 postcommand）。
+
+        候选 = **全局快捷弹幕在前 + 该房间自己的项在后**，同名只显示一次（ROADMAP 113，
+        见 ``merge_quick_presets``）。
+        """
+        presets = merge_quick_presets(self.ui_prefs.get("global_quick_danmaku"),
+                                      self._quick_danmaku_of(self._selected_room_id))
         # 首项固定为占位文本（真实项 → 按正常颜色显示，不像 placeholder 那样发灰）
         self.quick_dm_combo["values"] = [QUICK_DM_PLACEHOLDER] + presets
         # 无预设时灰掉（明确表示该房间还没配过），有预设才可选
@@ -3619,10 +3662,10 @@ class ScMonitorApp:
         entry = self.entries.get(room_id) if room_id is not None else None
         if entry is None:
             return
-        original = list(entry.quick_danmaku)
-        working = list(original)
-        log_window.info("快捷弹幕：打开管理对话框（房间 %s，现有 %d 条）",
-                        room_id, len(original))
+        working = list(entry.quick_danmaku)
+        global_working = list(self.ui_prefs.get("global_quick_danmaku") or [])
+        log_window.info("快捷弹幕：打开管理对话框（房间 %s，全局 %d 条 / 本房间 %d 条）",
+                        room_id, len(global_working), len(working))
 
         win = tk.Toplevel(self.root)
         win.title(f"快捷弹幕 — 房间 {room_id}")
@@ -3630,69 +3673,184 @@ class ScMonitorApp:
         win.resizable(False, False)
         body = ttk.Frame(win, padding=8)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="点选后只填入输入框（不会直接发送）；顺序即下拉顺序",
-                  foreground="#888888").pack(anchor="w")
-        # 条数上限已取消（ROADMAP 107）：列表可能很长，补一条纵向滚动条
-        list_wrap = ttk.Frame(body)
-        list_wrap.pack(fill="both", expand=True, pady=(6, 6))
-        list_scroll = ttk.Scrollbar(list_wrap, orient="vertical")
-        listbox = tk.Listbox(list_wrap, height=10, width=36, exportselection=False,
-                             yscrollcommand=list_scroll.set)
-        list_scroll.configure(command=listbox.yview)
-        list_scroll.pack(side="right", fill="y")
-        listbox.pack(side="left", fill="both", expand=True)
+        ttk.Label(body, text="点选后只填入输入框（不会直接发送）；上表为全局（所有直播间可见）、"
+                             "下表为本房间专属；顺序即下拉顺序",
+                  foreground="#888888", wraplength=380,
+                  justify="left").pack(anchor="w")
+
+        # 「改哪个列表」由下方「添加到」单选**明确指定**（默认本房间）——空列表也能加第一条，
+        # 目标一眼可见（ROADMAP 113）。点列表只是顺手把单选切过去。
+        scope_var = tk.StringVar(value="room")
+
+        def make_section(title: str, scope: str) -> tk.Listbox:
+            ttk.Label(body, text=title).pack(anchor="w", pady=(6, 0))
+            wrap = ttk.Frame(body)
+            wrap.pack(fill="both", expand=True)
+            scroll = ttk.Scrollbar(wrap, orient="vertical")
+            box = tk.Listbox(wrap, height=6, width=36, exportselection=False,
+                             yscrollcommand=scroll.set)
+            scroll.configure(command=box.yview)
+            scroll.pack(side="right", fill="y")
+            box.pack(side="left", fill="both", expand=True)
+            box.bind("<Button-1>", lambda _e: scope_var.set(scope), add="+")
+            # 右键：对点中的那一条弹菜单（转移 / 删除 / 上移 / 下移，ROADMAP 115）
+            box.bind("<Button-3>", lambda event, s=scope: popup(event, s))
+            return box
+
+        global_box = make_section("全局快捷弹幕（所有直播间）", "global")
+        room_box = make_section(f"本房间专属（{room_id}）", "room")
+        boxes = {"global": (global_box, global_working),
+                 "room": (room_box, working)}
+
+        scope_row = ttk.Frame(body)
+        scope_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(scope_row, text="添加到：").pack(side="left")
+        for text, value in (("全局", "global"), ("本房间", "room")):
+            ttk.Radiobutton(scope_row, text=text, value=value,
+                            variable=scope_var).pack(side="left", padx=(4, 0))
         edit_row = ttk.Frame(body)
-        edit_row.pack(fill="x")
+        edit_row.pack(fill="x", pady=(4, 0))
         item_var = tk.StringVar()
         item_entry = ttk.Entry(edit_row, textvariable=item_var)
         item_entry.pack(side="left", fill="x", expand=True)
 
-        def refresh() -> None:
-            listbox.delete(0, tk.END)
-            for text in working:
-                listbox.insert(tk.END, text)
+        def scope_name(scope: str) -> str:
+            return "全局" if scope == "global" else f"房间 {room_id}"
+
+        def refresh(scope: Optional[str] = None) -> None:
+            for name in ((scope,) if scope else ("global", "room")):
+                box, items = boxes[name]
+                box.delete(0, tk.END)
+                for text in items:
+                    box.insert(tk.END, text)
+
+        def active():
+            """当前范围 ``(范围名, 列表, 数据)``：由「添加到」单选决定。"""
+            scope = scope_var.get()
+            box, items = boxes[scope]
+            return scope, box, items
+
+        def persist(*scopes: str) -> None:
+            """把一个或多个范围的改动**立即**写盘并刷新所有下拉（ROADMAP 113 / 115）。
+
+            右键转移会同时改两档，故支持一次传多个范围：只在真的变了时写盘，且只写一次。
+            """
+            changed = False
+            for scope in scopes:
+                if scope == "global":
+                    if list(global_working) != list(self.ui_prefs.get("global_quick_danmaku") or []):
+                        self.ui_prefs["global_quick_danmaku"] = list(global_working)
+                        changed = True
+                        log_task.info("全局快捷弹幕已更新：共 %d 条", len(global_working))
+                elif list(working) != list(entry.quick_danmaku):
+                    entry.quick_danmaku = list(working)
+                    changed = True
+                    log_task.info("快捷弹幕已更新：房间 %s，共 %d 条", room_id, len(working))
+            if not changed:
+                return
+            self._save_config()
+            self._refresh_quick_danmaku()
+            # 全局列表会影响每个独立窗口的下拉，一并刷新
+            for window in list(self._room_windows.values()):
+                refresh_window = getattr(window, "_refresh_quick_danmaku", None)
+                if refresh_window is not None:
+                    refresh_window()
+
+        def transfer(scope: str, index: int) -> None:
+            """右键「转移」：把该条从这张表**移动**到另一张表（ROADMAP 115）。
+
+            目标已有同名时不重复添加，源里那份照样删掉（文本仍在目标里，不丢数据）。
+            """
+            if scope == "global":
+                src, dst, target_scope = global_working, working, "room"
+            else:
+                src, dst, target_scope = working, global_working, "global"
+            if not 0 <= index < len(src):
+                return
+            text = src[index]
+            already = text in dst
+            src[:], dst[:] = move_quick_preset(src, dst, text)
+            refresh("global")
+            refresh("room")
+            persist(scope, target_scope)
+            log_window.info("快捷弹幕：右键转移「%s」：%s → %s%s", text, scope_name(scope),
+                            scope_name(target_scope),
+                            "（目标已有同名，源里的已移除）" if already else "")
 
         def add(_event=None) -> None:
             cleaned = normalize_quick_danmaku([item_var.get()])
             if not cleaned:
                 return
             text = cleaned[0]
-            if text in working:
+            scope, box, items = active()
+            if text in items:
                 return
             # 条数上限已取消（ROADMAP 107）：不再拦「最多 N 条」，只拦重复
-            working.append(text)
+            items.append(text)
             item_var.set("")
-            refresh()
-            listbox.see(tk.END)
-            log_window.debug("快捷弹幕：添加「%s」（房间 %s，暂存 %d 条）",
-                             text, room_id, len(working))
+            refresh(scope)
+            box.see(tk.END)
+            persist(scope)      # 立即落盘（用户要求）
+            log_window.debug("快捷弹幕：添加「%s」（%s，现有 %d 条）",
+                             text, scope_name(scope), len(items))
 
         def current_index() -> Optional[int]:
-            selected = listbox.curselection()
+            selected = active()[1].curselection()
             return int(selected[0]) if selected else None
 
         def remove() -> None:
             index = current_index()
-            if index is not None:
-                removed = working[index]
-                del working[index]
-                refresh()
-                log_window.debug("快捷弹幕：删除「%s」（房间 %s，暂存 %d 条）",
-                                 removed, room_id, len(working))
+            if index is None:
+                return
+            scope, box, items = active()
+            removed = items[index]
+            del items[index]
+            refresh(scope)
+            persist(scope)
+            log_window.debug("快捷弹幕：删除「%s」（%s，现有 %d 条）",
+                             removed, scope_name(scope), len(items))
 
         def move(offset: int) -> None:
             index = current_index()
             if index is None:
                 return
+            scope, box, items = active()
             target = index + offset
-            if not 0 <= target < len(working):
+            if not 0 <= target < len(items):
                 return
-            working[index], working[target] = working[target], working[index]
-            refresh()
-            listbox.selection_set(target)
-            log_window.debug("快捷弹幕：%s「%s」（房间 %s）",
+            items[index], items[target] = items[target], items[index]
+            refresh(scope)
+            box.selection_set(target)
+            persist(scope)
+            log_window.debug("快捷弹幕：%s「%s」（%s）",
                              "上移" if offset < 0 else "下移",
-                             working[target], room_id)
+                             items[target], scope_name(scope))
+
+        # 右键菜单（ROADMAP 115）：转移 / 删除 / 上移 / 下移，作用于**点中的那一条**
+        menu = tk.Menu(win, tearoff=False)
+
+        def popup(event, scope: str) -> None:
+            """在鼠标位置弹出右键菜单（点在空白处不弹）。"""
+            box = boxes[scope][0]
+            index = box.nearest(event.y)
+            bbox = box.bbox(index) if 0 <= index < box.size() else None
+            if bbox is None or not (bbox[1] <= event.y <= bbox[1] + bbox[3]):
+                return
+            box.selection_clear(0, tk.END)
+            box.selection_set(index)
+            scope_var.set(scope)        # 顺手把「添加到」切到这张表
+            menu.delete(0, tk.END)
+            menu.add_command(
+                label=f"转移到{'本房间' if scope == 'global' else '全局'}",
+                command=lambda: transfer(scope, index))
+            menu.add_separator()
+            menu.add_command(label="删除", command=remove)
+            menu.add_command(label="上移", command=lambda: move(-1))
+            menu.add_command(label="下移", command=lambda: move(1))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
 
         item_entry.bind("<Return>", add)
         ttk.Button(edit_row, text="添加", width=6,
@@ -3705,15 +3863,10 @@ class ScMonitorApp:
                        command=command).pack(side="left", padx=(0, 4))
 
         def on_close() -> None:
-            """收尾（「关闭」按钮 / 窗口 X / 再点一次「管理」都汇聚到这里）：写回 + 落盘。"""
+            """收尾：改动已即时落盘，这里只收拾窗口（「关闭」/ 窗口 X / 再点一次都走它）。"""
             self._quick_dm_manager = None
             self._quick_dm_manager_room = None
             self._quick_dm_manager_close = None
-            if working != original:
-                entry.quick_danmaku = list(working)
-                self._save_config()
-                log_task.info("快捷弹幕已更新：房间 %s，共 %d 条", room_id, len(working))
-            self._refresh_quick_danmaku()
             win.destroy()
 
         ttk.Button(button_row, text="关闭", width=6,

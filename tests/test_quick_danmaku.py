@@ -10,7 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from blive_sc_get.gui_app import merge_quick_danmaku
+from blive_sc_get.gui_app import (merge_quick_danmaku, merge_quick_presets,
+                                  move_quick_preset)
 from blive_sc_get.gui_config import (
     DEFAULT_UI_PREFS,
     NOTIFY_SOUNDS,
@@ -78,6 +79,61 @@ class NormalizeQuickDanmakuTests(unittest.TestCase):
         """
         items = [f"第{i}条" for i in range(200)]
         self.assertEqual(normalize_quick_danmaku(items), items)
+
+
+class MergeQuickPresetsTests(unittest.TestCase):
+    """全局 + 房间两级候选的合成规则（ROADMAP 113）。"""
+
+    def test_global_first_then_room(self):
+        self.assertEqual(merge_quick_presets(["打卡"], ["专属"]), ["打卡", "专属"])
+
+    def test_duplicate_keeps_the_global_one(self):
+        """跨组同名只显示一次，且保留**全局那份的位置**（下拉里不做归属标记）。"""
+        self.assertEqual(merge_quick_presets(["打卡", "好耶"], ["好耶", "专属"]),
+                         ["打卡", "好耶", "专属"])
+
+    def test_empty_groups(self):
+        self.assertEqual(merge_quick_presets([], ["房间"]), ["房间"])
+        self.assertEqual(merge_quick_presets(["全局"], []), ["全局"])
+        self.assertEqual(merge_quick_presets(None, None), [])
+
+    def test_bad_items_are_cleaned(self):
+        """两组都过一遍清洗：空白 / 非字符串 / 组内重复都丢掉。"""
+        self.assertEqual(
+            merge_quick_presets([" 打卡 ", "", 5, "打卡"], ["好耶", None, "   "]),
+            ["打卡", "好耶"])
+
+    def test_order_is_stable(self):
+        self.assertEqual(
+            merge_quick_presets(["a", "b"], ["c", "a", "d"]), ["a", "b", "c", "d"])
+
+
+class MoveQuickPresetTests(unittest.TestCase):
+    """右键「转移」的语义（ROADMAP 115）：**移动**，目标同名不重复加、源里照删。"""
+
+    def test_moves_to_the_end_of_target(self):
+        source, target = move_quick_preset(["打卡", "好耶"], ["专属"], "打卡")
+        self.assertEqual(source, ["好耶"])
+        self.assertEqual(target, ["专属", "打卡"], "转移到目标列表末尾")
+
+    def test_target_already_has_it_removes_source_without_duplicate(self):
+        source, target = move_quick_preset(["打卡", "好耶"], ["打卡"], "好耶")
+        self.assertEqual(source, ["打卡"])
+        self.assertEqual(target, ["打卡", "好耶"])
+
+    def test_target_already_has_the_same_item(self):
+        """目标已有同名：源里那份删掉、目标不重复添加（文本仍在目标里，不丢数据）。"""
+        source, target = move_quick_preset(["打卡", "好耶"], ["好耶", "专属"], "好耶")
+        self.assertEqual(source, ["打卡"])
+        self.assertEqual(target, ["好耶", "专属"], "目标不应出现重复条目")
+
+    def test_missing_text_is_noop(self):
+        source, target = move_quick_preset(["打卡"], ["专属"], "不存在")
+        self.assertEqual((source, target), (["打卡"], ["专属"]))
+
+    def test_empty_and_none(self):
+        self.assertEqual(move_quick_preset([], ["a"], "a"), ([], ["a"]))
+        self.assertEqual(move_quick_preset(None, None, "a"), ([], []))
 
 
 class MergeQuickDanmakuTests(unittest.TestCase):
@@ -288,6 +344,7 @@ class QuickSendNowPersistenceTests(unittest.TestCase):
             "dm_emoticon_image": not DEFAULT_UI_PREFS["dm_emoticon_image"],
             "quick_dm_send_now": not DEFAULT_UI_PREFS["quick_dm_send_now"],
             "copy_dm_fill": not DEFAULT_UI_PREFS["copy_dm_fill"],
+            "global_quick_danmaku": ["全局打卡"],
             "window_size": [900, 800],
             "selected_room": 12345,
             "room_windows": {"12345": {"x": 10, "y": 20, "width": 640, "height": 720}},
@@ -346,8 +403,8 @@ class QuickDanmakuManagerToggleTests(unittest.TestCase):
     自然没有「再点一次」这回事。所以这里同时锁住三件事：
     ① 对话框改为非模态（否则按钮依然点不到）；
     ② 按钮按「当前是否开着」分支：同一房间再点一次＝关闭，换过房间＝先收掉旧的再开新的；
-    ③ 关闭走对话框**自己的收尾路径**（写回配置 + 刷新下拉）——直接 destroy() 会跳过
-    「关闭即保存」，用户刚改的内容就丢了。
+    ③ 关闭走对话框**自己的收尾路径**（清引用 + 销毁）——改动已**即时落盘**（ROADMAP 113
+    用户确认：每次增删移就写盘），收尾不再承担保存。
     """
 
     def test_tk_button_toggles_and_dialog_is_not_modal(self):
@@ -364,11 +421,22 @@ class QuickDanmakuManagerToggleTests(unittest.TestCase):
                       "Tk 关闭时未走对话框自己的收尾（会丢掉未保存的编辑）")
         self.assertIn("_quick_dm_manager", _attr_names(close_node), "Tk 未清跟踪字段")
 
-    def test_tk_close_path_still_saves_and_refreshes(self):
-        """收尾路径必须保留「关闭即保存」：写回 + 落盘 + 刷新下拉。"""
+    def test_tk_edits_are_saved_immediately(self):
+        """每次增删移**立即落盘**（ROADMAP 113 用户确认），不再等关闭时统一保存。"""
         node = _func("gui_app.py", "_open_quick_danmaku_manager")
-        self.assertIn("_save_config", _called(node), "Tk 收尾不再落盘")
-        self.assertIn("_refresh_quick_danmaku", _called(node), "Tk 收尾不再刷新下拉")
+        persist = [n for n in ast.walk(node)
+                   if isinstance(n, ast.FunctionDef) and n.name == "persist"]
+        self.assertTrue(persist, "Tk 缺少「立即落盘」的帮助函数")
+        self.assertIn("_save_config", _called(persist[0]), "persist 未落盘")
+        self.assertIn("_refresh_quick_danmaku", _called(persist[0]),
+                      "persist 后未刷新下拉")
+        for operation in ("add", "remove", "move"):
+            fn = [n for n in ast.walk(node)
+                  if isinstance(n, ast.FunctionDef) and n.name == operation]
+            self.assertTrue(fn, f"缺少 {operation}")
+            local_calls = {c.func.id for c in ast.walk(fn[0])
+                           if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertIn("persist", local_calls, f"Tk {operation} 后未立即落盘")
 
     def test_qt_button_toggles_and_dialog_is_not_blocking(self):
         open_node = _func("qt_app.py", "open_quick_danmaku_manager")
@@ -404,15 +472,24 @@ class QuickDanmakuManagerToggleTests(unittest.TestCase):
                       _called(_func("qt_app.py", "closeEvent")),
                       "Qt 退出时未先收尾管理对话框")
 
-    def test_qt_close_path_still_saves_and_refreshes(self):
+    def test_qt_edits_are_saved_immediately(self):
+        """每次增删移**立即落盘**（ROADMAP 113 用户确认）；收尾只清引用。"""
         node = _func("qt_app.py", "open_quick_danmaku_manager")
-        # save_and_refresh 是本函数内的嵌套函数，按裸名字调用，故看 Name 调用而非属性调用
-        local_calls = {n.func.id for n in ast.walk(node)
-                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        self.assertIn("save_and_refresh", local_calls, "Qt 收尾不再保存")
-        self.assertIn("_save_config", _called(node), "Qt 收尾不再落盘")
+        persist = [n for n in ast.walk(node)
+                   if isinstance(n, ast.FunctionDef) and n.name == "persist"]
+        self.assertTrue(persist, "Qt 缺少「立即落盘」的帮助函数")
+        self.assertIn("_save_config", _called(persist[0]), "persist 未落盘")
+        self.assertIn("_refresh_quick_danmaku", _called(persist[0]),
+                      "persist 后未刷新各面板下拉")
+        for operation in ("add", "remove", "move"):
+            fn = [n for n in ast.walk(node)
+                  if isinstance(n, ast.FunctionDef) and n.name == operation]
+            self.assertTrue(fn, f"缺少 {operation}")
+            local_calls = {c.func.id for c in ast.walk(fn[0])
+                           if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertIn("persist", local_calls, f"Qt {operation} 后未立即落盘")
         self.assertIn("finished", _attr_names(node),
-                      "Qt 未把收尾挂到 finished（关窗 X 会跳过保存）")
+                      "Qt 未把收尾挂到 finished（关窗 X 会跳过收尾清理）")
 
 
 if __name__ == "__main__":

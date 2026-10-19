@@ -68,6 +68,7 @@ from .gui_app import (
     emoticon_packages_signature,
     emoticon_tooltip_text,
     merge_quick_danmaku,
+    merge_quick_presets,
     resolve_dm_choice,
     select_dm_options,
     unseen_badge_text,
@@ -1324,10 +1325,16 @@ class DmPanel(QWidget):
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
     def _refresh_quick_danmaku(self) -> None:
-        """按本面板当前房间刷新快捷弹幕下拉（该房间没有预设时置灰）。"""
+        """按本面板当前房间刷新快捷弹幕下拉（合并后为空才置灰）。
+
+        候选与主界面一致：**全局快捷弹幕在前 + 该房间自己的项在后**，同名只显示一次
+        （ROADMAP 113）。
+        """
         room_id = self.selected_room
         entry = self.host.entries.get(int(room_id)) if room_id is not None else None
-        presets: List[str] = list(entry.quick_danmaku) if entry is not None else []
+        room_presets: List[str] = list(entry.quick_danmaku) if entry is not None else []
+        presets: List[str] = merge_quick_presets(
+            self.host.ui_prefs.get("global_quick_danmaku"), room_presets)
         self.quick_dm_combo.blockSignals(True)
         self.quick_dm_combo.clear()
         # 首项固定为占位文本（真实项 → 按正常颜色显示，不像 placeholder 那样发灰）

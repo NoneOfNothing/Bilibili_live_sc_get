@@ -81,6 +81,11 @@ DEFAULT_UI_PREFS: Dict[str, object] = {
     # copy_dm_fill：点击弹幕正文时是否**直接填入发送框**（ROADMAP 109，默认否 = 复制到剪贴板）。
     # 全局偏好（与 quick_dm_send_now 同样三处同步）；勾选后不再占用剪贴板。
     "copy_dm_fill": False,
+    # global_quick_danmaku：**全局**快捷弹幕（ROADMAP 113，与房间级的 RoomEntry.quick_danmaku
+    # 并存）。每个房间的发送行下拉 = 全局项在前 + 该房间自己的项在后，同名只显示一次；
+    # 管理对话框里「上：全局 / 下：当前房间」两个列表分别编辑。清洗见
+    # normalize_quick_danmaku（去空白 / 去重 / 保序 / 丢坏数据，不限条数）。
+    "global_quick_danmaku": [],
     # window_size：上次退出时的窗口尺寸 [宽, 高]（逻辑像素）；[0, 0] 表示尚未记忆
     "window_size": [0, 0],
     # selected_room：上次退出时选中的直播间号（ROADMAP 98）；0 = 没记住。
@@ -375,6 +380,10 @@ def load_ui_prefs(path: Union[str, Path]) -> Dict[str, object]:
     # 「点击弹幕填入发送框」（ROADMAP 109）：与上一个键同样，**新增偏好键必须在这里读回**，
     # 否则就是 ROADMAP 99 那个「写了没读」的坑重演（有通用守卫测试盯着）。
     prefs["copy_dm_fill"] = bool(ui.get("copy_dm_fill", False))
+    # 全局快捷弹幕（ROADMAP 113）：与房间级同一套清洗规则；旧配置缺键 → 空列表
+    prefs["global_quick_danmaku"] = normalize_quick_danmaku(ui.get("global_quick_danmaku"))
+    if prefs["global_quick_danmaku"]:
+        logger.info("已载入 %d 条全局快捷弹幕", len(prefs["global_quick_danmaku"]))
     if prefs["copy_dm_fill"]:
         logger.info("已按上次设置开启「点击弹幕填入发送框」：点弹幕正文会填入发送框（不再复制）")
     size = ui.get("window_size")

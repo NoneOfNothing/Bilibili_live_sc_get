@@ -63,6 +63,11 @@ class RoomChatWindow(QWidget):
         self.sc_panel = ScPanel(host, lambda: self._room_id)
         self.dm_panel = DmPanel(host, lambda: self._room_id, always_visible=True,
                                 show_quick_manage=False)
+        # ROADMAP 114：面板构造时快捷弹幕下拉是**禁用**的（`setEnabled(False)`，要等第一次
+        # `_refresh_dm_send_state` 才会按房间预设打开）。主视图有宿主的选房/刷新路径，
+        # 独立窗口此前**没有任何路径**触发它 → 下拉永远是灰的；顺带把「颜色/模式按房间
+        # 记忆」（106）也套用上。on_room_selected 正是选房时要做的初始化。
+        self.dm_panel.on_room_selected(self._room_id)
         splitter.addWidget(self.sc_panel)
         splitter.addWidget(self.dm_panel)
         splitter.setSizes([1, 1])  # SC 与弹幕对半（可拖动调整）

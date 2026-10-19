@@ -96,6 +96,7 @@
 | 4.12 | 输入框 ↑ / ↓ 翻出发送历史（ROADMAP 108） | `<Up>` / `<Down>` 绑 `_step_dm_history`（**返回 `"break"`**），历史存 `host._dm_send_history`（仅内存） | `eventFilter` 拦 `Key_Up` / `Key_Down`，用 `_key_entry` 判等（构建期安全） | ✅ |
 | 4.13 | 「点击弹幕填入发送框」开关（ROADMAP 109） | 发送行勾选框 + 宿主 `set_copy_dm_fill` 落盘并广播到各独立窗口 | `copy_dm_fill_check` + 宿主 `set_copy_dm_fill` 广播给每个 `DmPanel`（`blockSignals` 防回环） | ✅ |
 | 4.14 | 快捷弹幕不限条数（ROADMAP 107） | 删掉 `QUICK_DANMAKU_MAX` 与对话框拦截；管理对话框补纵向滚动条 | 同左（`QListWidget` 自带滚动） | ✅ |
+| 4.15 | 全局快捷弹幕（ROADMAP 113） | 管理对话框上下两列表（上全局 / 下当前房间）；下拉 = 全局在前 + 房间在后、同名去重（`merge_quick_presets`） | 同左（两个 `QListWidget`，按钮作用于有选中行的列表） | ✅ |
 
 ### 粉丝牌页
 
@@ -226,6 +227,13 @@
     访问尚不存在的 `self.dm_send_entry`，抛 `AttributeError` 后面板直接建不出来（纯 AST 接线测试
     看不出来，离屏探针一建面板就现形）。现改比对 `_key_entry`（`__init__` 里先置 `None`、建出
     输入框时赋值），并加了回归测试守着。
+36. **Qt 房间表单元格可编辑**（ROADMAP 112）—— `QTableWidgetItem` 默认带 `ItemIsEditable`，双击 / F2
+    能改出与真实数据不一致的假文本（只改界面、不回写模型）。现整表 `NoEditTriggers` + 每个项
+    `flags & ~Qt.ItemIsEditable`；整行选择与 Ctrl 多选保持不变。
+37. **Qt 独立窗口快捷弹幕永远置灰**（ROADMAP 114）—— 房间窗口建好 `DmPanel` 后从未调用
+    `on_room_selected()`，而下拉在构造时是 `setEnabled(False)`、只有 `_refresh_dm_send_state()`
+    才会打开；主视图有宿主路径、独立窗口没有。现建面板后立即 `on_room_selected(room)`，
+    顺带让 106 的颜色 / 模式记忆在独立窗口生效。
 
 ## 已知差异（保留）
 

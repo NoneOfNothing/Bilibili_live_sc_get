@@ -63,6 +63,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -93,6 +94,7 @@ from .gui_app import (
     emoticon_packages_signature,
     format_live_mark,
     merge_offline_marks,
+    move_quick_preset,
     order_room_ids,
     parse_add_input,
     restore_live_marks,
@@ -1056,6 +1058,10 @@ class QtScMonitorApp(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(compact_row_height(self.table))
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        # 整表只读（ROADMAP 112）：QTableWidgetItem 默认带 ItemIsEditable，双击 / F2 能把
+        # 单元格改成与真实数据不一致的假文本（改的只是界面，不回写模型）。关掉编辑触发器，
+        # 只保留整行选择与 Ctrl 多选（批量预览在用）；双击仍然触发「加入/停止预览」。
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self._on_room_selected)
         # 拖动排序由 ProtectedLinkTable **自管**（不用 Qt 拖放：平台拖放循环里滚轮收不到，
         # 且 QTableWidget 的落数据是「覆盖目标单元格 / 清空源单元格」语义，见该类文档）
@@ -1370,6 +1376,9 @@ class QtScMonitorApp(QMainWindow):
             else:
                 item.setText(text)
             item.setForeground(color)
+            # 建行 / 刷新行 / 拖动重建都汇聚到这里：逐项摘掉「可编辑」标记（ROADMAP 112）。
+            # 只关触发器是不够的——将来谁恢复了触发器，单元格又会变成可改。
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         # 被占用时把「谁在占用」挂在状态格提示上，避免用户只看到「被占用」无从下手
         status_item = self.table.item(row, 2)
         if status_item is not None:
@@ -3273,81 +3282,188 @@ class QtScMonitorApp(QMainWindow):
         if entry is None:
             log_window.warning("快捷弹幕：房间 %s 不在房间列表中，忽略管理请求", room_id)
             return
-        log_window.info("快捷弹幕：打开管理对话框（房间 %s，现有 %d 条）",
-                        room_id, len(entry.quick_danmaku))
-        original = list(entry.quick_danmaku)
-        working = list(original)
+        global_working = list(self.ui_prefs.get("global_quick_danmaku") or [])
+        log_window.info("快捷弹幕：打开管理对话框（房间 %s，全局 %d 条 / 本房间 %d 条）",
+                        room_id, len(global_working), len(entry.quick_danmaku))
+        working = list(entry.quick_danmaku)
 
         dialog = QDialog(self)
         dialog.setWindowTitle(f"快捷弹幕 — 房间 {room_id}")
         # 非模态：管理按钮要能再点一次（ROADMAP 100），exec()/模态都会挡住主窗口
         dialog.setModal(False)
-        dialog.resize(380, 420)
+        dialog.resize(420, 640)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("点选后只填入输入框（不会直接发送）；顺序即下拉顺序"))
-        listbox = QListWidget()
-        layout.addWidget(listbox, 1)
+        layout.addWidget(QLabel("点选后只填入输入框（不会直接发送）；上表为全局（所有直播间可见）、"
+                                "下表为本房间专属；顺序即下拉顺序"))
+        # 列表只负责显示与选中；「改哪个列表」由「添加到」单选**明确指定**（默认本房间）——
+        # 空列表也能加第一条（ROADMAP 113）。点列表只是顺手把单选切过去。
+        global_list = QListWidget()
+        room_list = QListWidget()
+        layout.addWidget(QLabel("全局快捷弹幕（所有直播间）"))
+        layout.addWidget(global_list, 1)
+        layout.addWidget(QLabel(f"本房间专属（{room_id}）"))
+        layout.addWidget(room_list, 1)
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("添加到："))
+        global_radio = QRadioButton("全局")
+        room_radio = QRadioButton("本房间")
+        room_radio.setChecked(True)          # 默认本房间
+        scope_row.addWidget(global_radio)
+        scope_row.addWidget(room_radio)
+        scope_row.addStretch(1)
+        layout.addLayout(scope_row)
+        global_list.itemPressed.connect(lambda *_a: global_radio.setChecked(True))
+        room_list.itemPressed.connect(lambda *_a: room_radio.setChecked(True))
+        # 右键菜单（ROADMAP 115）：转移 / 删除 / 上移 / 下移，作用于**点中的那一条**
+        for _box, _name in ((global_list, "global"), (room_list, "room")):
+            _box.setContextMenuPolicy(Qt.CustomContextMenu)
+            _box.customContextMenuRequested.connect(
+                lambda pos, n=_name: show_menu(pos, n))
         edit_row = QHBoxLayout()
         item_edit = QLineEdit()
         # 条数上限已取消（ROADMAP 107）：不再写「最多 N 条」，列表变长靠滚动查看
         item_edit.setPlaceholderText("输入后回车添加")
         edit_row.addWidget(item_edit, 1)
 
-        def refresh() -> None:
-            listbox.clear()
-            listbox.addItems(working)
+        def scope() -> str:
+            """「添加到」的目标范围。"""
+            return "global" if global_radio.isChecked() else "room"
+
+        def scope_name(name: str) -> str:
+            return "全局" if name == "global" else f"房间 {room_id}"
+
+        def active():
+            """当前操作对象 ``(范围名, 列表, 数据)``：由「添加到」单选决定。"""
+            name = scope()
+            if name == "global":
+                return name, global_list, global_working
+            return name, room_list, working
+
+        def refresh(scope_filter: str = "") -> None:
+            for name, box, items in (("global", global_list, global_working),
+                                     ("room", room_list, working)):
+                if scope_filter and name != scope_filter:
+                    continue
+                box.clear()
+                box.addItems(items)
+
+        def persist(*names: str) -> None:
+            """把一个或多个范围的改动**立即**写盘并刷新所有下拉（ROADMAP 113 / 115）。
+
+            右键转移会同时改两档，故支持一次传多个范围：只在真的变了时写盘，且只写一次。
+            """
+            changed = False
+            for name in names:
+                if name == "global":
+                    if list(global_working) != list(self.ui_prefs.get("global_quick_danmaku") or []):
+                        self.ui_prefs["global_quick_danmaku"] = list(global_working)
+                        changed = True
+                        log_task.info("全局快捷弹幕已更新：共 %d 条", len(global_working))
+                elif list(working) != list(entry.quick_danmaku):
+                    entry.quick_danmaku = list(working)
+                    changed = True
+                    log_task.info("快捷弹幕已更新：房间 %s，共 %d 条", room_id, len(working))
+            if not changed:
+                return
+            self._save_config()
+            # 主界面与各独立窗口的下拉一起刷新（全局项会影响每个房间的候选）
+            for panel in list(self._dm_panels):
+                panel._refresh_quick_danmaku()
+
+        def transfer(name: str, row: int) -> None:
+            """右键「转移」：把该条从这张表**移动**到另一张表（ROADMAP 115）。
+
+            目标已有同名时不重复添加，源里那份照样删掉（文本仍在目标里，不丢数据）。
+            """
+            if name == "global":
+                src, dst, target = global_working, working, "room"
+            else:
+                src, dst, target = working, global_working, "global"
+            if not 0 <= row < len(src):
+                return
+            text = src[row]
+            already = text in dst
+            src[:], dst[:] = move_quick_preset(src, dst, text)
+            refresh("global")
+            refresh("room")
+            persist(name, target)
+            log_window.info("快捷弹幕：右键转移「%s」：%s → %s%s", text, scope_name(name),
+                            scope_name(target),
+                            "（目标已有同名，源里的已移除）" if already else "")
+
+        # 菜单**先建好并复用**（每次右键只重填条目）：对话框本身必须非模态，不能用 exec
+        # 阻塞；也免得每点一次就多一个子对象。
+        menus = {"global": QMenu(global_list), "room": QMenu(room_list)}
+        for _menu in menus.values():
+            # 预览浮窗可能置顶，会把菜单压在它下面（与房间列表的右键菜单同一处理）
+            _menu.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        def show_menu(pos, name: str) -> None:
+            """右键：只对**真实条目**弹菜单（转移 / 删除 / 上移 / 下移）。"""
+            box = global_list if name == "global" else room_list
+            item = box.itemAt(pos)
+            if item is None:
+                return
+            row = box.row(item)
+            box.setCurrentRow(row)
+            menu = menus[name]
+            menu.clear()
+            menu.addAction(f"转移到{'本房间' if name == 'global' else '全局'}",
+                           lambda: transfer(name, row))
+            menu.addSeparator()
+            menu.addAction("删除", remove)
+            menu.addAction("上移", lambda: move(-1))
+            menu.addAction("下移", lambda: move(1))
+            menu.popup(box.viewport().mapToGlobal(pos))
 
         def add() -> None:
             cleaned = normalize_quick_danmaku([item_edit.text()])
             if not cleaned:
                 return
             text = cleaned[0]
-            if text in working:
+            name, box, items = active()
+            if text in items:
                 return
             # 条数上限已取消（ROADMAP 107）：只拦重复，不再拦「最多 N 条」
-            working.append(text)
+            items.append(text)
             item_edit.clear()
-            refresh()
-            listbox.setCurrentRow(len(working) - 1)
-            log_window.debug("快捷弹幕：添加「%s」（房间 %s，暂存 %d 条）",
-                             text, room_id, len(working))
+            refresh(name)
+            box.setCurrentRow(len(items) - 1)
+            persist(name)       # 立即落盘（用户要求）
+            log_window.debug("快捷弹幕：添加「%s」（%s，现有 %d 条）",
+                             text, scope_name(name), len(items))
 
         def remove() -> None:
-            row = listbox.currentRow()
-            if row >= 0:
-                removed = working[row]
-                del working[row]
-                refresh()
-                log_window.debug("快捷弹幕：删除「%s」（房间 %s，暂存 %d 条）",
-                                 removed, room_id, len(working))
+            name, box, items = active()
+            row = box.currentRow()
+            if row < 0 or row >= len(items):
+                return
+            removed = items[row]
+            del items[row]
+            refresh(name)
+            persist(name)
+            log_window.debug("快捷弹幕：删除「%s」（%s，现有 %d 条）",
+                             removed, scope_name(name), len(items))
 
         def move(offset: int) -> None:
-            row = listbox.currentRow()
+            name, box, items = active()
+            row = box.currentRow()
             target = row + offset
-            if row < 0 or not 0 <= target < len(working):
+            if row < 0 or not 0 <= target < len(items):
                 return
-            working[row], working[target] = working[target], working[row]
-            refresh()
-            listbox.setCurrentRow(target)
-            log_window.debug("快捷弹幕：%s「%s」（房间 %s）",
+            items[row], items[target] = items[target], items[row]
+            refresh(name)
+            box.setCurrentRow(target)
+            persist(name)
+            log_window.debug("快捷弹幕：%s「%s」（%s）",
                              "上移" if offset < 0 else "下移",
-                             working[target], room_id)
-
-        def save_and_refresh() -> None:
-            if working != original:
-                entry.quick_danmaku = list(working)
-                self._save_config()
-                log_task.info("快捷弹幕已更新：房间 %s，共 %d 条", room_id, len(working))
-            # 主界面与各独立窗口的下拉一起刷新（覆盖「同一房间同时开窗」的情况）
-            for panel in list(self._dm_panels):
-                panel._refresh_quick_danmaku()
+                             items[target], scope_name(name))
 
         def on_close() -> None:
             dialog.accept()
 
         def finish() -> None:
-            """对话框收尾（「关闭」按钮 / 关窗 X / 再点一次「管理」都汇聚到这里）。"""
-            save_and_refresh()
+            """对话框收尾：改动已即时落盘，这里只清掉宿主记录的引用。"""
             if self._quick_dm_manager is dialog:
                 self._quick_dm_manager = None
                 self._quick_dm_manager_room = None

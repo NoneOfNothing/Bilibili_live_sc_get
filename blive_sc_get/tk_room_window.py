@@ -54,6 +54,7 @@ from .gui_app import (
     emoticon_tooltip_text,
     live_duration_text,
     merge_quick_danmaku,
+    merge_quick_presets,
     resolve_dm_choice,
     text_scrolled_to_bottom,
     unseen_badge_text,
@@ -1124,9 +1125,15 @@ class RoomChatWindow(tk.Toplevel):
     # ---------- 快捷弹幕（ROADMAP 90：按房间独立，点选只填入输入框） ----------
 
     def _refresh_quick_danmaku(self) -> None:
-        """刷新本窗口固定房间的快捷弹幕下拉（管理入口只在主界面）。"""
+        """刷新本窗口固定房间的快捷弹幕下拉（管理入口只在主界面）。
+
+        候选与主界面一致：**全局快捷弹幕在前 + 该房间自己的项在后**，同名只显示一次
+        （ROADMAP 113）。
+        """
         entry = self.host.entries.get(self._room_id)
-        presets = list(entry.quick_danmaku) if entry is not None else []
+        room_presets = list(entry.quick_danmaku) if entry is not None else []
+        presets = merge_quick_presets(self.host.ui_prefs.get("global_quick_danmaku"),
+                                      room_presets)
         # 首项固定为占位文本（真实项 → 按正常颜色显示，与 Qt 版一致）
         self.quick_dm_combo["values"] = [QUICK_DM_PLACEHOLDER] + presets
         self.quick_dm_combo.configure(state="readonly" if presets else "disabled")

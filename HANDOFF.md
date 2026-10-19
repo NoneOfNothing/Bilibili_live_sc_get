@@ -322,3 +322,26 @@ SC 头部信息行新增 `已播 01:23:45`（排在「舰长」之后、粉丝�
 - **测试**：`tests/test_dm_send_ux.py`（33 项：纯函数语义 + 三处视图 AST 接线，含
   「eventFilter 构建期不许直接访问输入框」与「`DEFAULT_UI_PREFS` 的 `copy_dm_fill` 必须读得回」
   两道守卫）；故障植入验证——临时植入 7 处故障共触发 9 项失败，还原即全绿。
+
+## 16. 房间列表只读与快捷弹幕两级化（ROADMAP 112–114，会话 2026-10-18）
+
+- **112 · Qt 房间表整表只读**：`QTableWidgetItem` 默认带 `ItemIsEditable`，双击 / F2 能改出与
+  真实数据不一致的假文本（只改界面、不回写 `entries`）。现 `setEditTriggers(NoEditTriggers)`
+  + 在唯一创建点 `_refresh_row` 逐项 `flags & ~Qt.ItemIsEditable`（建行 / 刷新 / 拖动重建都走它）；
+  **别改掉** `SelectRows` / `ExtendedSelection`（Ctrl 多选批量预览在用），双击仍触发加入/停止预览。
+- **113 · 全局快捷弹幕**：新增 `ui.global_quick_danmaku`；三处下拉统一走
+  `merge_quick_presets(global, room)`（**全局在前、房间在后、同名只留第一次出现**，合并后为空
+  才置灰）。两版管理对话框是**上下两个列表 + 显式「添加到」单选**（默认本房间）——目标必须
+  显式可选：早先按「有选中项的列表 / 最后点过的」推断，空列表时无处可点，**第一条全局项加不
+  进去**（Qt 侧尤其死路，探针复现）。**每次增删移立即落盘**（用户要求），值没变不写；落盘后
+  立刻刷新主界面与各独立窗口的下拉，关闭只清引用。
+- **114 · Qt 独立窗口快捷弹幕置灰**：`DmPanel` 的下拉构造时是禁用的，只有
+  `_refresh_dm_send_state()` 会打开；房间窗口创建面板后**必须** `on_room_selected(room)`
+  （这也是 106 颜色 / 模式记忆在独立窗口生效的前提）。以后新加任何「面板 + 固定房间」的视图，
+  都别忘了这一步。
+- **115 · 右键转移**：两列表都有右键菜单（转移 / 删除 / 上移 / 下移）；转移＝在全局 ↔ 本房间
+  之间**移动**（纯函数 `move_quick_preset`，目标同名不重复加、源里照删）。转移同时改两档，
+  `persist(*scopes)` 一次写盘。Qt 侧菜单**预先建好复用**并用 `popup()`（对话框必须非模态，
+  不能用 `exec`），且与其它弹出菜单一致设 `WindowStaysOnTopHint`（预览浮窗可能置顶）。
+- **测试**：`tests/test_dm_rooms_ux.py`（9 项：房间表只读 AST、两版对话框两列表、刷新范围回归、
+  独立窗口接线、offscreen 复现下拉可用与候选顺序）+ `test_quick_danmaku.py` 的合并规则 5 项。
