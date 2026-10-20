@@ -567,6 +567,13 @@ EMOTICON_REFRESH_COOLDOWN_S = 30.0
 反复请求接口（接口需登录态，频繁请求有风控风险）。
 """
 
+CHARGE_EMOTICON_REFRESH_COOLDOWN_S = 600.0
+"""刷新「充电表情包」的最小间隔（秒，账号级）。
+
+充电表情包要同时拉「账号级全站包」与「各 UP 的充电权益」，比房间表情更重；
+充电状态与 1000 人门槛变化都很慢，10 分钟一次足够，也避免频繁请求触发风控。
+"""
+
 EMOTICON_IMAGE_CACHE_MAX = 300
 """表情图片缓存上限（按 url 计），避免长时间运行后无限增长。"""
 
@@ -789,6 +796,93 @@ def emoticon_package_id(package) -> int:
         return max(0, int((package or {}).get("id") or 0))
     except (AttributeError, TypeError, ValueError):  # 不是 dict / 脏值
         return 0
+
+
+def package_ref_mid(package) -> int:
+    """取表情包关联的 UP mid（充电包才有；取不到 / 脏值返回 0）。"""
+    try:
+        return max(0, int((package or {}).get("ref_mid") or 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _merge_charge_package(primary: dict, extra: Optional[dict]) -> dict:
+    """同 UP 的两个充电包合成一个（纯函数）：``primary`` 优先，补入 ``extra`` 独有的表情。
+
+    账号面板的真实包 id / 包名 / 封面更准（带「某某UP（充电）」），权益接口只是
+    同一个包的另一份来源，因此以账号面板为主；``extra`` 只在缺封面时补封面。
+    """
+    merged = dict(primary)
+    emoticons = [e for e in primary.get("emoticons") or [] if isinstance(e, dict)]
+    seen = {str(e.get("unique") or "") for e in emoticons}
+    for item in (extra or {}).get("emoticons") or []:
+        if not isinstance(item, dict):
+            continue
+        unique = str(item.get("unique") or "")
+        if not unique or unique in seen:
+            continue
+        seen.add(unique)
+        emoticons.append(item)
+    merged["emoticons"] = emoticons
+    if not merged.get("cover") and (extra or {}).get("cover"):
+        merged["cover"] = extra["cover"]
+    if not merged.get("ref_mid") and (extra or {}).get("ref_mid"):
+        merged["ref_mid"] = extra["ref_mid"]
+    return merged
+
+
+def merge_charge_emoticons(room_packages, global_packages, up_packages,
+                           room_uid: int) -> List[dict]:
+    """把「充电表情包」合并进某房间的表情包列表（纯函数，ROADMAP 116）。
+
+    - ``room_packages``：直播间接口给的原始包（房间专属 / UP主大表情 / 装扮表情）；
+    - ``global_packages``：**已通过权益校验**的全站充电包（包上带 ``ref_mid``）；
+    - ``up_packages``：当前直播间 UP 的权益包（0 或 1 个，来自充电权益接口）；
+    - ``room_uid``：当前直播间 UP 的 mid。
+
+    顺序固定为：房间包 → 当前 UP 的充电包 → 其它 UP 的全站充电包；同 UP 的两份
+    来源合成一个包。跨包按 ``unique`` 去重，**先出现者优先**（房间包在最前，重复
+    项不会把充电包撑大；反之亦然）。空包剔除；没有任何充电包时返回原列表的浅拷贝，
+    保证不传充电包时行为与改动前完全一致。
+    """
+    result = [dict(p) for p in (room_packages or []) if isinstance(p, dict)]
+    global_list = [dict(p) for p in (global_packages or [])
+                   if isinstance(p, dict) and package_ref_mid(p)]
+    up_pkg = next((p for p in (up_packages or []) if isinstance(p, dict)), None)
+    try:
+        uid = max(0, int(room_uid or 0))
+    except (TypeError, ValueError):
+        uid = 0
+
+    charge: List[dict] = []
+    if uid:
+        matched = next((p for p in global_list if package_ref_mid(p) == uid), None)
+    else:
+        matched = None
+    if matched is not None:
+        charge.append(_merge_charge_package(matched, up_pkg))
+        global_list = [p for p in global_list if p is not matched]
+    elif up_pkg is not None:
+        charge.append(dict(up_pkg))
+    charge.extend(global_list)
+
+    seen: set = set()
+    merged: List[dict] = []
+    for package in result + charge:
+        emoticons = []
+        for item in package.get("emoticons") or []:
+            if not isinstance(item, dict):
+                continue
+            unique = str(item.get("unique") or "")
+            if not unique or unique in seen:
+                continue
+            seen.add(unique)
+            emoticons.append(item)
+        if not emoticons:
+            continue  # 空包会让面板多出一页空白
+        package["emoticons"] = emoticons
+        merged.append(package)
+    return merged
 
 
 def emoticon_from_packages(packages, unique: str) -> dict:
@@ -1328,6 +1422,14 @@ class ScMonitorApp:
         self._emoticon_memory: Dict[int, Dict[str, object]] = load_emoticon_memory(
             self.config_path)
         self._emoticon_fetched_at: Dict[int, float] = {}  # 房间号 -> 上次拉取表情包的时间(monotonic)
+        # 充电表情包（ROADMAP 116）：账号级全站包与按 UP 的权益结论分开缓存，
+        # 冷却也独立于按房间的 _emoticon_fetched_at（否则会互相压制）
+        self._charge_global: Optional[List[dict]] = None   # 账号级全站充电包（未过滤权益）
+        self._charge_global_at = 0.0                       # 上次拉账号包的时间(monotonic)
+        self._charge_up: Dict[int, List[dict]] = {}         # UP mid -> 权益包（[] = 无使用权）
+        self._charge_up_at: Dict[int, float] = {}           # UP mid -> 上次查询权益的时间
+        # 房间号 -> 合并后的展示列表（房间包 + 有权益的充电包），充电包变化时整表失效
+        self._emoticon_display: Dict[int, List[dict]] = {}
         self._emoticon_regrid_id: Optional[str] = None  # 宽度变化后重排的 after id
         self._emoticon_buttons: Dict[str, tk.Button] = {}   # 图片 url -> 按钮
         self._emoticon_images: Dict[str, tk.PhotoImage] = {}  # 图片 url -> 面板/提示用图片
@@ -4064,7 +4166,7 @@ class ScMonitorApp:
             return
         self._show_emoticon_panel()
         self._emoticon_panel_room = room_id
-        packages = self._emoticons.get(room_id)
+        packages = self._display_emoticons(room_id)
         log_window.debug("展开表情面板（房间 %s，%s）", room_id,
                          f"缓存里有 {len(packages)} 个包，先用缓存呈现"
                          if packages else "暂无缓存，先请求接口")
@@ -4074,6 +4176,7 @@ class ScMonitorApp:
             self._render_emoticons(room_id, None, "正在获取该直播间的专属表情…")
         # 表情包会随粉丝灯牌升级等条件解锁，每次展开都后台刷新一次
         self._refresh_emoticons(room_id)
+        self._ensure_charge_emoticons(room_id)
 
     def _build_emoticon_panel(self, parent) -> None:
         """构建内嵌表情面板：分页栏（按表情包分页）+ 可滚动的表情网格。
@@ -4269,6 +4372,124 @@ class ScMonitorApp:
         self._emoticon_memory[room_id] = memory
         self._save_config()
 
+    # ---------- 充电表情包（ROADMAP 116） ----------
+
+    def _room_uid(self, room_id: int) -> int:
+        """房间对应主播的 uid（0 = 未知，此时不查该 UP 的充电权益）。"""
+        entry = self.entries.get(int(room_id))
+        try:
+            return max(0, int(getattr(entry, "uid", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _rebuild_display_emoticons(self, room_id: int) -> List[dict]:
+        """重算某房间的展示列表：房间包 + 已通过权益校验的充电包（ROADMAP 116）。"""
+        uid = self._room_uid(room_id)
+        entitled_global = [package for package in (self._charge_global or [])
+                           if isinstance(package, dict)
+                           and self._charge_up.get(package_ref_mid(package))]
+        merged = merge_charge_emoticons(
+            self._emoticons.get(room_id) or [], entitled_global,
+            self._charge_up.get(uid) or [], uid)
+        self._emoticon_display[int(room_id)] = merged
+        return merged
+
+    def _display_emoticons(self, room_id: int) -> List[dict]:
+        """该房间最终用于展示 / 弹幕兜底的表情包列表（带房间级缓存）。"""
+        cached = self._emoticon_display.get(int(room_id))
+        if cached is not None:
+            return cached
+        return self._rebuild_display_emoticons(int(room_id))
+
+    def _ensure_charge_emoticons(self, room_id: int) -> None:
+        """展开面板时补拉充电表情（账号级全站包 + 当前 UP 的权益，带独立冷却）。"""
+        api = self.hub.api
+        if api is None or not api.logged_in:
+            return  # 游客没有充电表情，也不去打扰接口
+        uid = self._room_uid(room_id)
+        now = time.monotonic()
+        need_global = (now - self._charge_global_at
+                       >= CHARGE_EMOTICON_REFRESH_COOLDOWN_S)
+        need_up = bool(uid) and (now - self._charge_up_at.get(uid, 0.0)
+                                 >= CHARGE_EMOTICON_REFRESH_COOLDOWN_S)
+        if not need_global and not need_up:
+            log_data.debug("充电表情缓存有效（房间 %s，UP %s），不重复请求", room_id, uid or "-")
+            return
+        if need_global:
+            self._charge_global_at = now
+        if need_up:
+            self._charge_up_at[uid] = now
+        log_data.debug("刷新充电表情（房间 %s，UP %s；账号包%s，UP 权益%s）",
+                       room_id, uid or "-",
+                       "要刷新" if need_global else "命中缓存",
+                       "要刷新" if need_up else "命中缓存")
+        self.hub.submit(self._async_load_charge_emoticons(
+            room_id, uid, need_global, need_up))
+
+    async def _async_load_charge_emoticons(self, room_id: int, uid: int,
+                                           need_global: bool, need_up: bool) -> None:
+        """后台拉取充电表情：先账号级全站包，再逐个 UP 确认使用权。
+
+        权益结论按 UP 缓存 10 分钟；没有权益的 UP 记 ``[]``（不是失败），
+        展示层据此直接丢弃它的充电包。请求失败记 ``None``，保留旧结论。
+        """
+        api = self.hub.api
+        if api is None:
+            return
+        started = time.monotonic()
+        global_packages = (await api.get_account_charge_emoticons()
+                           if need_global else None)
+        targets: List[int] = [uid] if (need_up and uid) else []
+        for package in global_packages or []:
+            mid = package_ref_mid(package)
+            if mid and mid != uid:
+                targets.append(mid)
+        results: Dict[int, Optional[List[dict]]] = {}
+        now = time.monotonic()
+        for mid in dict.fromkeys(mid for mid in targets if mid):
+            if (mid != uid and mid in self._charge_up
+                    and now - self._charge_up_at.get(mid, 0.0)
+                    < CHARGE_EMOTICON_REFRESH_COOLDOWN_S):
+                continue  # 已有未过期的权益结论：不重复请求
+            results[mid] = await api.get_up_charge_emoticons(mid)
+        self.ui_queue.put(("charge_emoticons", {
+            "room_id": room_id,
+            "global": global_packages,
+            "results": results,
+            "elapsed": time.monotonic() - started,
+        }))
+
+    def _on_charge_emoticons(self, payload: dict) -> None:
+        """充电表情结果回投：写缓存、失效展示缓存，并按需重绘面板。"""
+        room_id = int(payload.get("room_id") or 0)
+        global_packages = payload.get("global")
+        if global_packages is not None:
+            self._charge_global = global_packages
+            log_data.info("账号充电表情：%d 个全站可用包（房间 %s）",
+                          len(global_packages), room_id)
+        for mid, packages in (payload.get("results") or {}).items():
+            mid = int(mid)
+            if packages is None:
+                continue  # 请求失败：保留旧结论，不把已有充电包清掉
+            self._charge_up[mid] = packages
+            self._charge_up_at[mid] = time.monotonic()
+            if not packages:
+                log_data.debug("UP %s 无充电表情使用权（或没有充电表情），不展示其充电包", mid)
+        # 充电包是账号级结果，所有房间的展示列表都可能变化
+        self._emoticon_display.clear()
+        log_data.debug("充电表情刷新完成（房间 %s，%.0fms，账号包 %s 个，权益结论 %s 个）",
+                       room_id, (payload.get("elapsed") or 0) * 1000,
+                       len(self._charge_global or []),
+                       len(payload.get("results") or {}))
+        if self._emoticon_visible and self._emoticon_panel_room is not None:
+            shown = self._emoticon_panel_room
+            self._render_emoticons(shown, self._display_emoticons(shown), "")
+        for window in list(self._room_windows.values()):
+            wid = int(getattr(window, "_room_id", 0) or 0)
+            if wid:
+                window.on_emoticons({"room_id": wid,
+                                     "packages": self._display_emoticons(wid)})
+
     def _refresh_emoticons(self, room_id: int) -> None:
         """后台刷新该房间的可用表情包。
 
@@ -4296,8 +4517,10 @@ class ScMonitorApp:
             # 刷新失败（或确实为空）：保留上次结果，不把已有表情包清空
             if room_id not in self._emoticons:
                 self._emoticons[room_id] = []
+                self._emoticon_display.pop(room_id, None)
                 if self._emoticon_visible and self._emoticon_panel_room == room_id:
-                    self._render_emoticons(room_id, [], "")
+                    # 房间本身没有表情时，仍可能有账号级充电包可展示
+                    self._render_emoticons(room_id, self._display_emoticons(room_id), "")
             return
         previous = self._emoticons.get(room_id)
         changed = (previous is None
@@ -4308,12 +4531,15 @@ class ScMonitorApp:
                         "（粉丝灯牌升级等可能解锁新表情包）",
                         room_id, len(previous), len(packages))
         self._emoticons[room_id] = packages
+        # 原始房间包变了：展示列表（含充电包）随之重算
+        self._emoticon_display.pop(room_id, None)
+        display = self._display_emoticons(room_id)
         # 弹幕表情此前缺图片地址的，用刚拉到的表情包补上；正在展示的提示立即刷新
         resolved = ""
         for unique, info in self._dm_emoticon_info.items():
             if info.get("room_id") != room_id or self._dm_emoticon_urls.get(unique):
                 continue
-            url = str(emoticon_from_packages(packages, unique).get("url") or "")
+            url = str(emoticon_from_packages(display, unique).get("url") or "")
             if url:
                 info["url"] = url
                 self._dm_emoticon_urls[unique] = url
@@ -4325,7 +4551,7 @@ class ScMonitorApp:
             return  # 面板已收起或已切到其他房间，仅入缓存
         if not changed:
             return  # 内容没变：保留当前表情包与横向滚动位置，不做无谓重绘
-        self._render_emoticons(room_id, packages, "")
+        self._render_emoticons(room_id, display, "")
 
     def _render_emoticons(self, room_id: int, packages: Optional[List[dict]],
                           hint: str) -> None:
@@ -4591,7 +4817,8 @@ class ScMonitorApp:
         """
         emoticon = dm.get("emoticon") or {}
         room_id = dm.get("room_id")
-        packages = self._emoticons.get(room_id)
+        packages = (self._display_emoticons(int(room_id))
+                    if room_id is not None else [])
         pkg = emoticon_from_packages(packages, unique)
         try:
             pkg_id = int(pkg.get("id") or 0)
@@ -4618,11 +4845,12 @@ class ScMonitorApp:
             return
         unique = str(info.get("unique") or "")
         room_id = info.get("room_id")
-        packages = self._emoticons.get(room_id)
-        if packages is None:
+        if room_id is None or self._emoticons.get(room_id) is None:
             if room_id is not None:
                 self._request_room_packages(int(room_id))
             return
+        # 用合并后的列表：充电表情不在房间原始包里，但同样要能补出 url
+        packages = self._display_emoticons(int(room_id))
         url = str(emoticon_from_packages(packages, unique).get("url") or "")
         if url:
             info["url"] = url
@@ -5195,6 +5423,9 @@ class ScMonitorApp:
             if had_live or had_offline:
                 log_room.debug("房间 %s 的排序时间基准已随删除清理", room_id)
             self._emoticon_memory.pop(room_id, None)  # 表情包记忆随房间一并清理
+            self._emoticons.pop(room_id, None)
+            self._emoticon_fetched_at.pop(room_id, None)
+            self._emoticon_display.pop(room_id, None)
             # 房间被删除：一并关掉它的独立窗口（窗口里已没有任何可显示的内容）
             window = self._room_windows.get(int(room_id))
             if window is not None:
@@ -6213,6 +6444,12 @@ class ScMonitorApp:
                     # 可用表情随登录身份变化，缓存与刷新冷却一并失效
                     self._emoticons.clear()
                     self._emoticon_fetched_at.clear()
+                    self._emoticon_display.clear()
+                    # 充电表情与账号绑定：换账号后旧的权益结论全部作废
+                    self._charge_global = None
+                    self._charge_global_at = 0.0
+                    self._charge_up.clear()
+                    self._charge_up_at.clear()
                     self._refresh_dm_send_state()
                     self._load_dm_options_for_selected()
                 elif kind == "dm_config":
@@ -6221,8 +6458,15 @@ class ScMonitorApp:
                     self._on_following_marks(item[1])  # ROADMAP 97：真实下播时刻
                 elif kind == "emoticons":
                     self._on_emoticons(item[1])
-                    for window in list(self._room_windows.values()):
-                        window.on_emoticons(item[1])
+                    # 独立窗口收到的是**合并后**的列表（房间包 + 有权益的充电包）
+                    wid = item[1].get("room_id")
+                    if wid is not None:
+                        merged = {"room_id": wid,
+                                  "packages": self._display_emoticons(int(wid))}
+                        for window in list(self._room_windows.values()):
+                            window.on_emoticons(merged)
+                elif kind == "charge_emoticons":
+                    self._on_charge_emoticons(item[1])
                 elif kind == "emoticon_image":
                     self._on_emoticon_image(item[1])
                     for window in list(self._room_windows.values()):

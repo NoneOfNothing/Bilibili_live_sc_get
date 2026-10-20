@@ -1601,6 +1601,9 @@ class DmPanel(QWidget):
         if room_id is None or self.api is None:
             return
         self.host.request_room_packages(room_id)
+        # ROADMAP 116：充电表情包是账号级的（房间接口不下发），单独补拉；
+        # 宿主内部有 10 分钟冷却与权益校验，未登录时会直接返回
+        self.host.request_charge_emoticons(room_id)
 
     def on_emoticons(self, payload: dict) -> None:
         """表情包到达（宿主统一拉取的结果）：只在本面板正展示该房间时才重绘。"""

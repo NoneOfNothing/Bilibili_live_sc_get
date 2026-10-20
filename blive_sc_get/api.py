@@ -182,6 +182,33 @@ DM_CONFIG_URL = "https://api.live.bilibili.com/xlive/web-room/v1/dM/GetDMConfigB
 ROOM_EMOTICON_URL = (
     "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
 )
+ACCOUNT_EMOTICON_URL = "https://api.bilibili.com/x/emote/user/panel/web"
+"""账号级表情面板（ROADMAP 116）：全站可用的充电表情包只在这里下发。
+
+``GetEmoticons`` 是「这个直播间能发什么」的维度，实测即便在该 UP 的直播间、
+且账号已充电、该 UP 已满 1000 人，也不会返回充电表情包；充电表情包属于
+「账号在全站能用什么」，由本接口下发给已登录账号（``business=reply``）。
+"""
+
+UP_CHARGE_RIGHT_URL = "https://api.bilibili.com/x/upowerv2/gw/rights/guide"
+"""单个 UP 的充电权益（含充电表情列表与解锁状态，ROADMAP 116）。
+
+需要 ``csrf``（Cookie 里的 ``bili_jct``）与 ``up_mid``；返回 ``rights[].right_list[]``
+里 ``right_type == "emote"`` 的项，``locked == false`` 才表示当前账号有使用权。
+"""
+
+CHARGE_EMOTICON_TYPE = 12
+"""充电表情包的 ``pkg_type``（账号级面板里的取值）。"""
+
+CHARGE_EMOTICON_SIZE = 162
+"""充电表情的显示/发送边长（像素）。实测这类表情是 162×162 的方形图。"""
+
+CHARGE_EMOTICON_UPGRADE_CODE = 203010
+"""充电权益接口对「该 UP 没有充电表情」返回的业务码（不是失败）。"""
+
+_API_QUIET_CODES = frozenset({CHARGE_EMOTICON_UPGRADE_CODE})
+"""预期内的业务码：只记 debug，不打 warning（否则每次刷新都会为没有充电表情的 UP 告警）。"""
+
 GUARD_TOP_LIST_URL = "https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList"
 MEDAL_PANEL_URL = "https://api.live.bilibili.com/xlive/app-ucenter/v1/fansMedal/panel"
 MEDAL_TASK_URL = (
@@ -430,6 +457,166 @@ def parse_room_emoticon_packages(data: Any) -> List[Dict[str, Any]]:
     return packages
 
 
+# ---------- 充电表情包（ROADMAP 116） ----------
+
+UPOWER_TOKEN_RE = re.compile(r"^\[UPOWER_[^_\]]+_(.+)\]$")
+"""充电表情的唯一标识形如 ``[UPOWER_<UP主mid>_<表情名>]``（发送时再加 ``upower_`` 前缀）。"""
+
+
+def _right_is_unlocked(value: Any) -> bool:
+    """充电权益项是否「已解锁」（``locked`` 只认显式的 false / 0）。
+
+    缺字段、``None``、异常值一律当作**未解锁**——宁可少显示，也不要把用户
+    点了却发不出去的表情摆进面板。
+    """
+    if value is False:
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip() == "0"
+    return False
+
+
+def _charge_emoticon_name(raw: Dict[str, Any]) -> str:
+    """取充电表情的短名（按钮上显示）：优先 ``meta.alias``，否则从唯一标识里提取。"""
+    meta = raw.get("meta")
+    if isinstance(meta, dict):
+        alias = str(meta.get("alias") or "").strip()
+        if alias:
+            return alias
+    match = UPOWER_TOKEN_RE.match(str(raw.get("text") or "").strip())
+    return match.group(1).strip() if match else ""
+
+
+def _charge_emoticon_entry(*, token: str, name: str, url: str,
+                           emote_id: Any, size: Any = None) -> Optional[Dict[str, Any]]:
+    """构造一个充电表情条目（与直播间表情同结构，发送时 ``unique`` 即 ``msg``）。
+
+    - ``token``：接口给的 ``[UPOWER_<mid>_<name>]`` 原文；
+    - ``unique``：发送标识 ``upower_`` + token（网页端 DOM 的 ``data-file-id`` 形式）；
+    - ``text``：面板按钮上的短文本 ``[表情名]``（完整 token 太长）；
+    - 尺寸：``meta.size == 1`` 是小表情（40），其余按 162 的方形图处理。
+    """
+    token = str(token or "").strip()
+    url = str(url or "").strip()
+    if not token or not url or "UPOWER_" not in token:
+        return None
+    short = str(name or "").strip() or "表情"
+    side = 40 if _as_int(size) == 1 else CHARGE_EMOTICON_SIZE
+    return {
+        "unique": "upower_" + token,
+        "id": _as_int(emote_id),
+        "trigger": token,
+        "text": f"[{short}]",
+        "url": url,
+        "width": side,
+        "height": side,
+        "bulge_display": 1,
+    }
+
+
+def parse_account_charge_emoticons(data: Any) -> List[Dict[str, Any]]:
+    """从账号级表情面板（``x/emote/user/panel/web``）里取出**充电表情包**（纯函数）。
+
+    实测结构：``data.packages[]``，充电包的 ``type == 12``（``label.text == "充电"``、
+    包名带「（充电）」、``ref_mid`` 为 UP mid）；包内 ``emote[].text`` 形如
+    ``[UPOWER_1298779265_品]``。同响应里的 ``type == 3`` 购买表情包**不能用于
+    直播间弹幕**，必须忽略。
+
+    ``ref_mid`` 保留在包上，供宿主再按 UP 校验「当前账号是否有使用权益」。
+    """
+    packages_raw = data.get("packages") if isinstance(data, dict) else data
+    if not isinstance(packages_raw, list):
+        return []
+    packages: List[Dict[str, Any]] = []
+    seen: set = set()
+    for item in packages_raw:
+        if not isinstance(item, dict):
+            continue
+        if _as_int(item.get("type")) != CHARGE_EMOTICON_TYPE:
+            continue
+        ref_mid = _as_int(item.get("ref_mid"))
+        emoticons: List[Dict[str, Any]] = []
+        raw_items = item.get("emote")
+        for raw in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+            entry = _charge_emoticon_entry(
+                token=raw.get("text"), name=_charge_emoticon_name(raw),
+                url=raw.get("url"), emote_id=raw.get("id"),
+                size=meta.get("size"))
+            if entry is None or entry["unique"] in seen:
+                continue
+            seen.add(entry["unique"])
+            emoticons.append(entry)
+        if not emoticons:
+            continue  # 空包直接剔除，界面不会多出一页空白
+        packages.append({
+            "name": str(item.get("text") or "").strip() or "充电表情",
+            "id": _as_int(item.get("id")),
+            "type": CHARGE_EMOTICON_TYPE,
+            "cover": str(item.get("url") or "").strip(),
+            "ref_mid": ref_mid,
+            "emoticons": emoticons,
+        })
+    return packages
+
+
+def parse_up_charge_emoticons(data: Any, up_mid: int) -> List[Dict[str, Any]]:
+    """从充电权益接口（``x/upowerv2/gw/rights/guide``）取出该 UP 的充电表情（纯函数）。
+
+    **权益是展示前置条件**：只收 ``right_type == "emote"``、``locked == false`` 且
+    列表非空的项；多档 ``level_type`` 会重复同一批表情，按唯一标识去重。没有已解锁
+    项的 UP 返回 ``[]``（宿主据此判定「当前账号无使用权」，不展示其充电包）。
+
+    权益接口不返回包 id，这里用 **UP mid** 作包 id（真实表情包 id 目前是 5~6 位，
+    不会撞车），保证「按包 id 记忆当前表情包」在刷新后仍能定位。
+    """
+    if not isinstance(data, dict):
+        return []
+    up = data.get("up") if isinstance(data.get("up"), dict) else {}
+    up_name = str(up.get("name") or "").strip()
+    raw_items: List[Any] = []
+    for right in data.get("rights") or []:
+        if not isinstance(right, dict):
+            continue
+        for item in right.get("right_list") or []:
+            if not isinstance(item, dict) or item.get("right_type") != "emote":
+                continue
+            if not _right_is_unlocked(item.get("locked")):
+                continue
+            group = item.get("list")
+            if isinstance(group, list) and group:
+                raw_items.extend(group)
+    emoticons: List[Dict[str, Any]] = []
+    seen: set = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        entry = _charge_emoticon_entry(
+            token=f"[UPOWER_{int(up_mid)}_{name}]", name=name,
+            url=raw.get("icon"), emote_id=raw.get("id"))
+        if entry is None or entry["unique"] in seen:
+            continue
+        seen.add(entry["unique"])
+        emoticons.append(entry)
+    if not emoticons:
+        return []
+    return [{
+        "name": f"{up_name}（充电）" if up_name else "充电表情",
+        "id": abs(int(up_mid)),
+        "type": CHARGE_EMOTICON_TYPE,
+        "cover": emoticons[0]["url"],
+        "ref_mid": int(up_mid),
+        "emoticons": emoticons,
+    }]
+
+
 def _normalize_emoticons(raw_items: Any) -> List[Dict[str, Any]]:
     """把原始表情项逐条归一化，丢弃不可用（``perm`` 非 1）或字段缺失的项。"""
     result: List[Dict[str, Any]] = []
@@ -562,6 +749,8 @@ class BilibiliLiveAPI:
         elapsed = (time.monotonic() - started) * 1000
         if code in (None, 0):
             logger.info("接口 %s 返回（code=%s，%.0fms）", label, code, elapsed)
+        elif code in _API_QUIET_CODES:
+            logger.debug("接口 %s 返回业务码 %s（预期内，%.0fms）", label, code, elapsed)
         else:
             logger.warning("接口 %s 返回异常（code=%s，message=%s，%.0fms）",
                            label, code, payload.get("message"), elapsed)
@@ -1101,6 +1290,65 @@ class BilibiliLiveAPI:
             logger.debug("获取直播间表情失败 room=%s: code=%s", room_id, data.get("code"))
             return []
         return parse_room_emoticon_packages(data.get("data"))
+
+    async def get_account_charge_emoticons(self) -> Optional[List[Dict[str, Any]]]:
+        """查询账号级「全站可用充电表情包」（ROADMAP 116）。
+
+        未登录 / 请求失败 / 接口返回非 0 一律返回 ``None``（与「登录了但确实没有
+        充电表情」的 ``[]`` 区分开），宿主据此决定是否保留旧缓存。
+        实测未登录时该接口也会返回 ``code=0``，只是 ``packages`` 为空数组，
+        因此这里先按登录态短路，避免把游客当成「没有充电表情」缓存下来。
+        """
+        if not self._cookie:
+            logger.debug("未登录，跳过账号充电表情（全站可用包需要登录态）")
+            return None
+        try:
+            data = await self._get_json(ACCOUNT_EMOTICON_URL, {"business": "reply"})
+        except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
+            logger.debug("获取账号充电表情失败：%s", exc)
+            return None
+        if data.get("code") != 0:
+            logger.debug("获取账号充电表情失败：code=%s message=%s",
+                         data.get("code"), data.get("message"))
+            return None
+        packages = parse_account_charge_emoticons(data.get("data"))
+        logger.debug("账号充电表情：%d 个全站可用包", len(packages))
+        return packages
+
+    async def get_up_charge_emoticons(self, up_mid: int) -> Optional[List[Dict[str, Any]]]:
+        """查询某 UP 的充电表情与**当前账号的使用权益**（ROADMAP 116）。
+
+        返回 ``None`` = 未登录 / 缺 csrf / 请求失败（宿主保留旧缓存）；
+        ``[]`` = 该 UP 没有充电表情或当前账号无使用权（宿主不展示其充电包）；
+        非空 = 已解锁的充电表情包。
+
+        ``203010`` 是该 UP 没有充电表情时的业务码，按空结果处理而不是失败。
+        """
+        if not self._cookie:
+            return None
+        csrf = self.csrf
+        if not csrf:
+            logger.debug("缺少 bili_jct，跳过 UP %s 的充电权益查询", up_mid)
+            return None
+        try:
+            data = await self._get_json(
+                UP_CHARGE_RIGHT_URL, {"csrf": csrf, "up_mid": int(up_mid)})
+        except (aiohttp.ClientError, asyncio.TimeoutError, ApiError) as exc:
+            logger.debug("获取 UP %s 的充电权益失败：%s", up_mid, exc)
+            return None
+        code = data.get("code")
+        if code == CHARGE_EMOTICON_UPGRADE_CODE:
+            logger.debug("UP %s 没有充电表情（code=%s）", up_mid, code)
+            return []
+        if code != 0:
+            logger.debug("获取 UP %s 的充电权益失败：code=%s message=%s",
+                         up_mid, code, data.get("message"))
+            return None
+        packages = parse_up_charge_emoticons(data.get("data"), int(up_mid))
+        logger.debug("UP %s 的充电表情：%s", up_mid,
+                     f"{len(packages[0]['emoticons'])} 个（已解锁）"
+                     if packages else "无使用权或没有表情")
+        return packages
 
     async def get_following_live_marks(self, wanted: Optional[Set[int]] = None) -> Dict[int, int]:
         """抓「我关注的 UP」列表，取出各主播**上次直播结束时刻**（ROADMAP 97）。

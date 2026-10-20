@@ -63,7 +63,7 @@ python -m venv .venv
 ## 4. 测试
 
 ```bash
-.venv\Scripts\python -m unittest discover -s tests -q   # 当前 611 项，全绿
+.venv\Scripts\python -m unittest discover -s tests -q   # 当前 715 项，全绿
 ```
 
 没有网络依赖。改动后**必跑**：`py_compile` + 这套 unittest；涉及 Qt 控件逻辑时先在
@@ -345,3 +345,64 @@ SC 头部信息行新增 `已播 01:23:45`（排在「舰长」之后、粉丝�
   不能用 `exec`），且与其它弹出菜单一致设 `WindowStaysOnTopHint`（预览浮窗可能置顶）。
 - **测试**：`tests/test_dm_rooms_ux.py`（9 项：房间表只读 AST、两版对话框两列表、刷新范围回归、
   独立窗口接线、offscreen 复现下拉可用与候选顺序）+ `test_quick_danmaku.py` 的合并规则 5 项。
+
+## 17. 充电表情包（ROADMAP 116，会话 2026-10-20）
+
+### 为什么 `GetEmoticons` 拿不到
+
+`GetEmoticons?room_id=` 的语义是「**这个直播间能发什么**」，实测即便在该 UP 的直播间、
+账号已充电、该 UP 已满 1000 人，也只返回免费表情 / 房间专属 / UP 主大表情 / 装扮表情，
+**不返回充电表情包**。充电表情属于「**账号在全站能用什么**」，是另一个维度：
+
+- `GET https://api.bilibili.com/x/emote/user/panel/web?business=reply`（带 Cookie）
+  - 只有 `pkg_type == 12` 才是充电包：`{id, text:"某某UP（充电）", type:12, ref_mid, url(封面),
+    emote:[{text:"[UPOWER_<mid>_<名字>]", url, meta:{size, alias}, flags:{...}}]}`；
+  - `type == 3` 是购买所得的表情包，**直播间弹幕发不出去，必须忽略**；
+  - 未登录时 `packages` 为空数组（所以未登录直接短路，不要把游客结果当成「没有充电表情」缓存）。
+- `GET https://api.bilibili.com/x/upowerv2/gw/rights/guide?csrf=<bili_jct>&up_mid=<mid>`
+  - `data.up.name` 是 UP 名；`data.rights[].right_list[]` 里 `right_type == "emote"` 的项带
+    `locked` 与 `list:[{id,name,icon}]`；
+  - **权益判定只认 `locked == false` 且 list 非空**（实测同一批表情在 `level_type=10` 是
+    `locked=false`、`level_type=20` 是 `locked=true`，多档要按 unique 去重）；
+  - `code=203010` 表示该 UP 没有充电表情 → 按空结果处理（`_API_QUIET_CODES` 已把它降为 debug）。
+
+### 展示与合并口径（用户确认「两者结合」）
+
+- 自己直播间：显示该 UP **全部已解锁**充电表情（来自权益接口的 `locked=false` 项）；
+- 其它直播间：只显示**已判定全站可用 + 当前账号有权益**的充电包（账号面板下发是候选，
+  展示层再按 `ref_mid` 用权益接口复核；**没查过 / 无权益一律不展示**）；
+- 顺序：房间包 → 当前 UP 充电包 → 其它 UP 全站包；同 UP 的两份来源合成一个包
+  （保留账号面板真实 `id` / 包名 / 封面，补入权益接口独有的表情）；
+- 跨包按 `unique` 去重、**房间包优先**；空包剔除；没有充电包时原样返回（零行为变化）。
+
+### 代码位置与约定
+
+- `api.py`：`ACCOUNT_EMOTICON_URL` / `UP_CHARGE_RIGHT_URL` / `CHARGE_EMOTICON_TYPE=12` /
+  `CHARGE_EMOTICON_SIZE=162`；纯函数 `parse_account_charge_emoticons`、
+  `parse_up_charge_emoticons`（权益接口不返回包 id，**包 id 用 UP mid**，保证「按包 id 记忆」）；
+  方法 `get_account_charge_emoticons` / `get_up_charge_emoticons`（失败返回 `None` 以保留旧缓存）。
+- `gui_app.merge_charge_emoticons` / `package_ref_mid`：两版共用纯函数。
+- 两版宿主：`_charge_global` / `_charge_up` / `_charge_up_at` / `_emoticon_display`，
+  冷却 `CHARGE_EMOTICON_REFRESH_COOLDOWN_S = 600`（**不要**复用按房间的 30 秒冷却）；
+  Tk 事件 `("charge_emoticons", …)`、Qt 队列同名 kind；登录态变化（`dm_state`）时全部清空。
+- 发送：`upower_[UPOWER_<mid>_<name>]` 就是 `emoticon_unique`，现有 `send_danmaku(emoticon=…)`
+  已把 unique 作为 msg、`dm_type=1`，无需改动。
+
+### 踩过的坑
+
+1. **不能凭 `upower_` 前缀识别充电表情**：`GetEmoticons` 里的「装扮表情」（`pkg_type=5`）
+   unique 也是 `upower_[张AiNi和老E_ICU]`，只是没有 `UPOWER_` 子串；必须靠账号面板的
+   `type=12` + `ref_mid`，解析层再加 `UPOWER_` 兜底。
+2. `flags.unlocked` **不是权益标记**（已购买的 type=3 包同样为 `false`），权益只能看
+   `rights/guide` 的 `locked`。
+3. 包 id 不能用负数（`emoticon_package_id` 把负数当脏值归 0），故权益包用 **UP mid**。
+4. 粉丝牌自动发弹幕只认 `room_` 前缀（`medal_tasks.room_exclusive_emoticons`），
+   充电表情 `upower_` 不会被误选；改这块时别破坏该过滤。
+
+### 验证方式
+
+- 本机 cookie 只读探针（验证后删除）：账号面板 1 个充电包（14 个表情，162×162）/
+  同一 UP 的权益接口 14 个已解锁 / 未充电 UP 返回 `[]` 或 `203010`；
+- Qt offscreen 冒烟（验证后删除）：下拉出现「灰泽满Hazel（充电）」、翻页正常、
+  发送参数 `emoticon={"unique": "upower_[UPOWER_1298779265_品]", …}`；
+- `tests/test_charge_emoticons.py` 33 项；故障植入（移除展示层权益过滤）应触发 2 项失败。

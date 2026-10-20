@@ -1264,7 +1264,8 @@ class RoomChatWindow(tk.Toplevel):
             return
         self.emoticon_panel.pack(side="top", fill="x", before=self._send_row)
         self._emoticon_visible = True
-        packages = self.host._emoticons.get(self._room_id)
+        # 宿主缓存里已含「房间包 + 有权益的充电包」（ROADMAP 116），直接用合并结果
+        packages = self.host._display_emoticons(self._room_id)
         if packages:
             self._emoticon_packages = list(packages)
             self._show_emoticon_page(0)
@@ -1275,6 +1276,7 @@ class RoomChatWindow(tk.Toplevel):
             self._emoticon_hint_label.pack(side="top", fill="x", padx=4)
         # 表情包会随粉丝灯牌升级解锁：每次展开都后台刷新一次（宿主带冷却）
         self.host._request_room_packages(self._room_id)
+        self.host._ensure_charge_emoticons(self._room_id)
 
     def _hide_emoticon_panel(self) -> None:
         self._hide_emoticon_tooltip()

@@ -81,6 +81,7 @@ from .cli import COOKIE_FILE_NAME, _pending_flush_loop, resolve_cookie
 from .client import LIVE_STATUS_TEXT, RoomClient
 from .cookie_server import DEFAULT_COOKIE_PORT, wait_for_extension_cookie
 from .gui_app import (
+    CHARGE_EMOTICON_REFRESH_COOLDOWN_S,
     EMOTICON_REFRESH_COOLDOWN_S,
     FOLLOWING_REFRESH_COOLDOWN_S,
     MEDAL_AUTO_INTERVAL_MS,
@@ -89,9 +90,11 @@ from .gui_app import (
     SORT_MODE_TEXTS,
     APP_ICON_PATH,
     NEW_ROOM_MARK_S,
+    package_ref_mid,
     backfill_offline_marks,
     dm_history_push,
     emoticon_packages_signature,
+    merge_charge_emoticons,
     format_live_mark,
     merge_offline_marks,
     move_quick_preset,
@@ -854,6 +857,12 @@ class QtScMonitorApp(QMainWindow):
         # 房间号 -> 可用表情包（表情面板与「弹幕表情悬浮看原图」共用，见 Tk 版 self._emoticons）
         self._emoticons: Dict[int, list] = {}
         self._emoticon_fetched_at: Dict[int, float] = {}
+        # 充电表情包（ROADMAP 116）：账号级全站包 + 按 UP 的权益结论，冷却独立于房间
+        self._charge_global: Optional[list] = None
+        self._charge_global_at = 0.0
+        self._charge_up: Dict[int, list] = {}
+        self._charge_up_at: Dict[int, float] = {}
+        self._emoticon_display: Dict[int, list] = {}
 
         self._medal_running: set = set()
         self._runner: Optional[MedalTaskRunner] = None
@@ -1994,6 +2003,7 @@ class QtScMonitorApp(QMainWindow):
             self._emoticon_memory.pop(room_id, None)
             self._emoticons.pop(room_id, None)
             self._emoticon_fetched_at.pop(room_id, None)
+            self._emoticon_display.pop(room_id, None)
             if room_id in self._room_order:
                 self.table.removeRow(self._room_order.index(room_id))
                 self._room_order.remove(room_id)
@@ -2492,8 +2502,125 @@ class QtScMonitorApp(QMainWindow):
         self.ui_queue.put(("emoticons", {"room_id": room_id, "packages": packages}))
 
     def emoticons_for(self, room_id) -> Optional[list]:
-        """已缓存的该房间表情包；尚未加载过返回 None（区别于「加载过但为空」）。"""
-        return self._emoticons.get(room_id)
+        """该房间最终展示的表情包（房间包 + 有权益的充电包）。
+
+        尚未加载过房间表情时返回 ``None``（区别于「加载过但为空」），面板据此
+        显示「正在加载」而不是一个错误的空列表。
+        """
+        if self._emoticons.get(room_id) is None:
+            return None
+        return self._display_emoticons(room_id)
+
+    # ---------- 充电表情包（ROADMAP 116） ----------
+
+    def _room_uid(self, room_id) -> int:
+        """房间对应主播的 uid（0 = 未知，此时不查该 UP 的充电权益）。"""
+        entry = self.entries.get(int(room_id))
+        try:
+            return max(0, int(getattr(entry, "uid", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _rebuild_display_emoticons(self, room_id) -> list:
+        """重算某房间的展示列表：房间包 + 已通过权益校验的充电包。"""
+        room_id = int(room_id)
+        uid = self._room_uid(room_id)
+        entitled_global = [package for package in (self._charge_global or [])
+                           if isinstance(package, dict)
+                           and self._charge_up.get(package_ref_mid(package))]
+        merged = merge_charge_emoticons(
+            self._emoticons.get(room_id) or [], entitled_global,
+            self._charge_up.get(uid) or [], uid)
+        self._emoticon_display[room_id] = merged
+        return merged
+
+    def _display_emoticons(self, room_id) -> list:
+        """该房间最终展示的表情包列表（带房间级缓存）。"""
+        room_id = int(room_id)
+        cached = self._emoticon_display.get(room_id)
+        if cached is not None:
+            return cached
+        return self._rebuild_display_emoticons(room_id)
+
+    def request_charge_emoticons(self, room_id: int) -> None:
+        """补拉充电表情（账号级全站包 + 当前 UP 的权益，10 分钟冷却）。"""
+        api = self.hub.api
+        if api is None or not api.logged_in or room_id is None:
+            return
+        uid = self._room_uid(room_id)
+        now = time.monotonic()
+        need_global = (now - self._charge_global_at
+                       >= CHARGE_EMOTICON_REFRESH_COOLDOWN_S)
+        need_up = bool(uid) and (now - self._charge_up_at.get(uid, 0.0)
+                                 >= CHARGE_EMOTICON_REFRESH_COOLDOWN_S)
+        if not need_global and not need_up:
+            log_data.debug("充电表情缓存有效（房间 %s，UP %s），不重复请求", room_id, uid or "-")
+            return
+        if need_global:
+            self._charge_global_at = now
+        if need_up:
+            self._charge_up_at[uid] = now
+        log_data.debug("刷新充电表情（房间 %s，UP %s；账号包%s，UP 权益%s）",
+                       room_id, uid or "-",
+                       "要刷新" if need_global else "命中缓存",
+                       "要刷新" if need_up else "命中缓存")
+        self.hub.submit(self._async_load_charge_emoticons(
+            room_id, uid, need_global, need_up))
+
+    async def _async_load_charge_emoticons(self, room_id: int, uid: int,
+                                           need_global: bool, need_up: bool) -> None:
+        """后台拉取：先账号级全站包，再逐个 UP 确认使用权（结论按 UP 缓存）。"""
+        api = self.hub.api
+        if api is None:
+            return
+        started = time.monotonic()
+        global_packages = (await api.get_account_charge_emoticons()
+                           if need_global else None)
+        targets: List[int] = [uid] if (need_up and uid) else []
+        for package in global_packages or []:
+            mid = package_ref_mid(package)
+            if mid and mid != uid:
+                targets.append(mid)
+        results: Dict[int, Optional[list]] = {}
+        now = time.monotonic()
+        for mid in dict.fromkeys(mid for mid in targets if mid):
+            if (mid != uid and mid in self._charge_up
+                    and now - self._charge_up_at.get(mid, 0.0)
+                    < CHARGE_EMOTICON_REFRESH_COOLDOWN_S):
+                continue  # 已有未过期的权益结论：不重复请求
+            results[mid] = await api.get_up_charge_emoticons(mid)
+        self.ui_queue.put(("charge_emoticons", {
+            "room_id": room_id,
+            "global": global_packages,
+            "results": results,
+            "elapsed": time.monotonic() - started,
+        }))
+
+    def _on_charge_emoticons(self, payload: dict) -> None:
+        """充电表情结果回投：写缓存、失效展示缓存，并给绑定该房间的面板重绘。"""
+        room_id = int(payload.get("room_id") or 0)
+        global_packages = payload.get("global")
+        if global_packages is not None:
+            self._charge_global = global_packages
+            log_data.info("账号充电表情：%d 个全站可用包（房间 %s）",
+                          len(global_packages), room_id)
+        for mid, packages in (payload.get("results") or {}).items():
+            mid = int(mid)
+            if packages is None:
+                continue  # 请求失败：保留旧结论
+            self._charge_up[mid] = packages
+            self._charge_up_at[mid] = time.monotonic()
+            if not packages:
+                log_data.debug("UP %s 无充电表情使用权（或没有充电表情），不展示其充电包", mid)
+        self._emoticon_display.clear()  # 账号级结果：所有房间的展示列表都可能变化
+        log_data.debug("充电表情刷新完成（房间 %s，%.0fms，账号包 %s 个，权益结论 %s 个）",
+                       room_id, (payload.get("elapsed") or 0) * 1000,
+                       len(self._charge_global or []),
+                       len(payload.get("results") or {}))
+        merged = self.emoticons_for(room_id)
+        if merged is not None:
+            for panel in self.dm_panels_for(room_id):
+                panel.on_emoticons({"room_id": room_id, "packages": merged})
 
     def _emoticon_semaphore(self) -> asyncio.Semaphore:
         """在事件循环内惰性创建并发信号量（避免绑定到错误的 loop）。"""
@@ -2615,8 +2742,14 @@ class QtScMonitorApp(QMainWindow):
                                           "（粉丝灯牌升级等可能解锁新表情包）",
                                           package_room, len(previous), len(packages))
                         self._emoticons[package_room] = packages
-                    for panel in self.dm_panels_for(payload.get("room_id")):
-                        panel.on_emoticons(payload)
+                        self._emoticon_display.pop(package_room, None)
+                    room_id = payload.get("room_id")
+                    merged = self.emoticons_for(room_id) if room_id is not None else None
+                    for panel in self.dm_panels_for(room_id):
+                        panel.on_emoticons({"room_id": room_id,
+                                            "packages": merged or []})
+                elif kind == "charge_emoticons":
+                    self._on_charge_emoticons(item[1])
                 elif kind == "emoticon_image":
                     # 图片按 URL 缓存、payload 无房间号：广播给所有弹幕面板（各自按需取用）
                     for panel in list(self._dm_panels):
@@ -2860,6 +2993,12 @@ class QtScMonitorApp(QMainWindow):
         # 可用表情随登录身份变化：缓存与刷新冷却一并失效
         self._emoticons.clear()
         self._emoticon_fetched_at.clear()
+        self._emoticon_display.clear()
+        # 充电表情与账号绑定：换账号后旧的权益结论全部作废
+        self._charge_global = None
+        self._charge_global_at = 0.0
+        self._charge_up.clear()
+        self._charge_up_at.clear()
         # 所有弹幕视图（主界面 + 各独立窗口）一起刷新登录态与发送门控
         for panel in list(self._dm_panels):
             panel.on_login_changed()
