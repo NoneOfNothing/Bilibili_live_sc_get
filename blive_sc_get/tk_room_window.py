@@ -59,6 +59,14 @@ from .gui_app import (
     text_scrolled_to_bottom,
     unseen_badge_text,
 )
+from .text_search import (
+    ScSearchHit,
+    dm_line_matches,
+    iter_sc_hits,
+    search_counter,
+    step_index,
+)
+from .tk_search_bar import SearchBar
 from .log_categories import CATEGORY_WINDOW, get_logger
 from .overlay import apply_noactivate
 
@@ -87,9 +95,19 @@ class RoomChatWindow(tk.Toplevel):
         self._closing = False
         # 视图级状态（与主界面互不影响）
         self._history_gen = 0
+        self._pending_gen = 0  # 最近一次历史请求代际（过期结果也要据此解除加载中，ROADMAP 117）
         self._loaded_count = 0
         self._has_more = False
         self._loading_more = False
+        # 搜索（ROADMAP 118）：SC 搜全量落盘历史（优先最新），弹幕只搜当前视图
+        self._sc_search_hits: List = []
+        self._sc_search_index = 0
+        self._sc_search_gen = 0
+        self._sc_search_pending: Optional[ScSearchHit] = None
+        self._sc_search_pages = 0
+        self._sc_search_truncated = False
+        self._dm_search_lines: List[int] = []
+        self._dm_search_index = 0
         self._sc_unseen = 0
         self._dm_unseen = 0
         self._bottom_at = {"sc": True, "dm": True}
@@ -172,6 +190,15 @@ class RoomChatWindow(tk.Toplevel):
                            ("price_100", "#cc4444"), ("price_500", "#9932cc")):
             self.sc_text.tag_configure(tag, foreground=color)
         self.sc_text.bind("<Button-1>", self._on_sc_click)
+        for tag, color in (("search_all", "#fff0b3"), ("search_current", "#ffcf70")):
+            self.sc_text.tag_configure(tag, background=color)
+        # 搜索条（ROADMAP 118）：Ctrl+F 按焦点唤起；SC 搜全量落盘历史
+        self.sc_search_bar = SearchBar(
+            self.sc_frame, before=self.sc_text,
+            on_query=self._run_sc_search,
+            on_next=lambda: self._step_sc_search(1),
+            on_prev=lambda: self._step_sc_search(-1),
+            on_close=self._close_sc_search)
         self.sc_badge = ttk.Button(self.sc_frame, text="", width=BADGE_WIDTH,
                                    command=self._on_sc_badge_clicked)
 
@@ -196,6 +223,15 @@ class RoomChatWindow(tk.Toplevel):
         self.dm_text.bind("<Motion>", self._on_dm_motion)
         self.dm_text.bind("<Leave>", lambda _e: self._hide_emoticon_tooltip())
         self.dm_text.bind("<Escape>", lambda _e: self._hide_emoticon_panel())
+        for tag, color in (("search_all", "#fff0b3"), ("search_current", "#ffcf70")):
+            self.dm_text.tag_configure(tag, background=color)
+        self.dm_search_bar = SearchBar(
+            self.dm_frame, before=self.dm_text,
+            on_query=self._run_dm_search,
+            on_next=lambda: self._step_dm_search(1),
+            on_prev=lambda: self._step_dm_search(-1),
+            on_close=self._close_dm_search)
+        self.bind("<Control-f>", self._on_ctrl_f)
         self.dm_text.bind("<Configure>", lambda e: self._on_text_configure(e, "dm"))
         self.dm_badge = ttk.Button(self.dm_frame, text="", width=BADGE_WIDTH,
                                    command=self._on_dm_badge_clicked)
@@ -420,6 +456,8 @@ class RoomChatWindow(tk.Toplevel):
                 item = self._queue.get_nowait()
                 if item[0] == "history":
                     self._on_history_loaded(item[1])
+                elif item[0] == "sc_search":
+                    self._on_sc_search_result(item[1])
         except queue.Empty:
             pass
         # 与主界面一致：同一轮轮询里更新吸底状态并清除已读的未读计数
@@ -448,6 +486,8 @@ class RoomChatWindow(tk.Toplevel):
         else:
             self._sc_unseen += 1
             self._refresh_badges()
+        if getattr(self, "sc_search_bar", None) is not None and self.sc_search_bar.winfo_manager():
+            self._schedule_sc_search_tags()
 
     def _append_info(self, text: str) -> None:
         follow = text_scrolled_to_bottom(self.sc_text.yview())
@@ -541,8 +581,11 @@ class RoomChatWindow(tk.Toplevel):
     def _load_history(self, room_id: int, skip: int = 0) -> None:
         self._history_gen += 1
         gen = self._history_gen
+        self._pending_gen = gen
         storage = self.host.hub.storage
         if storage is None:
+            self._loading_more = False
+            self._pending_gen = 0
             self._append_info("（后台网络初始化中，稍后会自动加载历史 SC…）")
             return
         if skip == 0:
@@ -573,6 +616,9 @@ class RoomChatWindow(tk.Toplevel):
     def _on_history_loaded(self, payload: dict) -> None:
         if self._closing:
             return
+        if payload.get("gen") == self._pending_gen:
+            # 这一代请求已回来：无论是否采用结果都先解除加载中（ROADMAP 117）
+            self._loading_more = False
         if payload["gen"] != self._history_gen or payload["room_id"] != self._room_id:
             return
         room_id = payload["room_id"]
@@ -604,6 +650,8 @@ class RoomChatWindow(tk.Toplevel):
             text.insert("1.0", marker, "info")
             text.configure(state="disabled")
             text.see("end")
+            self._refresh_sc_search_tags()
+            self._resolve_sc_search_pending()
             return
         # 向上翻页：整块插到顶部
         top_line = int(text.index("@0,0").split(".")[0])
@@ -628,6 +676,7 @@ class RoomChatWindow(tk.Toplevel):
         lines_added = int(text.index("end-1c").split(".")[0]) - lines_before
         text.configure(state="disabled")
         text.see(f"{max(top_line + lines_added, 1)}.0")
+        self._resolve_sc_search_pending()
 
     @staticmethod
     def _render_record(text: tk.Text, record: dict, deleted: dict, at: str) -> None:
@@ -654,6 +703,325 @@ class RoomChatWindow(tk.Toplevel):
         if self.sc_text.yview()[0] > 0.001:
             return
         self._load_history(self._room_id, skip=self._loaded_count)
+
+    # ---------- 搜索（ROADMAP 118：Ctrl+F，SC 全量 / 弹幕当前视图） ----------
+
+    @staticmethod
+    def _focus_in(widget, container) -> bool:
+        while widget is not None:
+            if widget is container:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _on_ctrl_f(self, _event=None):
+        focus = self.focus_get()
+        if focus is None:
+            return
+        if self._focus_in(focus, self.dm_frame):
+            self._open_dm_search()
+        elif self._focus_in(focus, self.sc_frame):
+            self._open_sc_search()
+        else:
+            return
+        return "break"
+
+    # ---- SC ----
+
+    def _open_sc_search(self) -> None:
+        self.sc_search_bar.reveal()
+        if self.sc_search_bar.query().strip():
+            self._run_sc_search(self.sc_search_bar.query())
+
+    def _close_sc_search(self) -> None:
+        bar = getattr(self, "sc_search_bar", None)
+        if bar is None:
+            return
+        bar.hide_bar()
+        self._sc_search_hits = []
+        self._sc_search_index = 0
+        self._sc_search_pending = None
+        self._sc_search_truncated = False
+        self._clear_sc_search_tags()
+
+    def _clear_sc_search_tags(self) -> None:
+        for tag in ("search_all", "search_current"):
+            try:
+                self.sc_text.tag_remove(tag, "1.0", "end")
+            except tk.TclError:
+                pass
+
+    def _run_sc_search(self, query: str = "") -> None:
+        bar = getattr(self, "sc_search_bar", None)
+        if bar is None:
+            return
+        query = (query if isinstance(query, str) else "").strip()
+        self._sc_search_gen += 1
+        gen = self._sc_search_gen
+        self._sc_search_hits = []
+        self._sc_search_index = 0
+        self._sc_search_pending = None
+        self._sc_search_truncated = False
+        self._clear_sc_search_tags()
+        if not query:
+            bar.set_counter("无匹配")
+            bar.set_navigation_enabled(False)
+            return
+        storage = self.host.hub.storage
+        if storage is None:
+            bar.set_counter("暂无历史")
+            bar.set_navigation_enabled(False)
+            return
+        bar.set_counter("搜索中…")
+        bar.set_navigation_enabled(False)
+        room_id = self._room_id
+        queue_ = self._queue
+
+        def worker() -> None:
+            try:
+                hits, truncated = iter_sc_hits(
+                    storage.iter_sc_history_desc(room_id), query)
+            except Exception:
+                log_data.exception("独立窗口搜索历史 SC 失败 room=%s", room_id)
+                hits, truncated = [], False
+            queue_.put(("sc_search", {
+                "gen": gen, "room_id": room_id, "query": query,
+                "hits": hits, "truncated": truncated,
+            }))
+
+        threading.Thread(target=worker, name=f"roomwin-sc-search-{room_id}",
+                         daemon=True).start()
+
+    def _on_sc_search_result(self, payload: dict) -> None:
+        if payload.get("gen") != self._sc_search_gen:
+            return
+        if payload.get("room_id") != self._room_id:
+            return
+        bar = getattr(self, "sc_search_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        hits = list(payload.get("hits") or [])
+        self._sc_search_hits = hits
+        self._sc_search_index = 0
+        self._sc_search_truncated = bool(payload.get("truncated"))
+        bar.set_navigation_enabled(bool(hits))
+        bar.set_counter(search_counter(0, len(hits), truncated=self._sc_search_truncated))
+        log_data.debug("独立窗口 SC 搜索完成：房间 %s，命中 %d%s",
+                       self._room_id, len(hits),
+                       "（已截断）" if self._sc_search_truncated else "")
+        self._refresh_sc_search_tags()
+        if hits:
+            self._jump_to_sc_search_hit(hits[0])
+
+    def _step_sc_search(self, delta: int) -> None:
+        total = len(self._sc_search_hits)
+        if total <= 0:
+            return
+        self._sc_search_index = step_index(self._sc_search_index, total, delta)
+        self.sc_search_bar.set_counter(search_counter(
+            self._sc_search_index, total, truncated=self._sc_search_truncated))
+        self._jump_to_sc_search_hit(self._sc_search_hits[self._sc_search_index])
+
+    def _jump_to_sc_search_hit(self, hit: ScSearchHit) -> None:
+        if hit.index < self._loaded_count:
+            if self._locate_sc_search_hit(hit):
+                self._sc_search_pending = None
+                return
+        self._sc_search_pending = hit
+        self._sc_search_pages = 0
+        self._request_more_for_sc_search()
+
+    def _request_more_for_sc_search(self) -> None:
+        hit = self._sc_search_pending
+        bar = getattr(self, "sc_search_bar", None)
+        if hit is None or bar is None:
+            return
+        if hit.index < self._loaded_count:
+            self._resolve_sc_search_pending()
+            return
+        if not self._has_more:
+            self._sc_search_pending = None
+            bar.set_counter("目标记录过旧，已停止加载")
+            return
+        if self._loading_more:
+            return
+        if self._sc_search_pages >= 50:
+            self._sc_search_pending = None
+            bar.set_counter("目标记录过旧，已停止加载")
+            return
+        self._sc_search_pages += 1
+        self._load_history(self._room_id, skip=self._loaded_count)
+
+    def _resolve_sc_search_pending(self) -> None:
+        hit = self._sc_search_pending
+        if hit is None:
+            return
+        if hit.index < self._loaded_count:
+            self._sc_search_pending = None
+            self._locate_sc_search_hit(hit)
+            return
+        self._request_more_for_sc_search()
+
+    def _locate_sc_search_hit(self, hit: ScSearchHit) -> bool:
+        if not hit.sc_id:
+            return False
+        try:
+            ranges = self.sc_text.tag_ranges(f"sc:{hit.sc_id}")
+        except tk.TclError:
+            return False
+        if not ranges:
+            return False
+        line = str(ranges[0]).split(".", 1)[0]
+        try:
+            self.sc_text.see(f"{line}.0")
+        except tk.TclError:
+            return False
+        self._refresh_sc_search_tags()
+        return True
+
+    def _refresh_sc_search_tags(self) -> None:
+        bar = getattr(self, "sc_search_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        self._clear_sc_search_tags()
+        query = bar.query().strip()
+        if query:
+            count = tk.IntVar()
+            start = "1.0"
+            while True:
+                try:
+                    index = self.sc_text.search(
+                        query, start, stopindex="end", nocase=True, count=count)
+                except tk.TclError:
+                    break
+                if not index:
+                    break
+                end = f"{index}+{count.get()}c"
+                self.sc_text.tag_add("search_all", index, end)
+                start = end
+        if self._sc_search_hits:
+            hit = self._sc_search_hits[
+                max(0, min(self._sc_search_index, len(self._sc_search_hits) - 1))]
+            try:
+                ranges = self.sc_text.tag_ranges(f"sc:{hit.sc_id}")
+            except tk.TclError:
+                ranges = ()
+            if ranges:
+                line = str(ranges[0]).split(".", 1)[0]
+                self.sc_text.tag_add("search_current", f"{line}.0", f"{line}.end")
+
+    def _schedule_sc_search_tags(self) -> None:
+        bar = getattr(self, "sc_search_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        try:
+            self.after(200, self._refresh_sc_search_tags)
+        except tk.TclError:
+            pass
+
+    # ---- 弹幕 ----
+
+    def _open_dm_search(self) -> None:
+        self.dm_search_bar.reveal()
+        if self.dm_search_bar.query().strip():
+            self._run_dm_search(self.dm_search_bar.query())
+
+    def _close_dm_search(self) -> None:
+        bar = getattr(self, "dm_search_bar", None)
+        if bar is None:
+            return
+        bar.hide_bar()
+        self._dm_search_lines = []
+        self._dm_search_index = 0
+        self._clear_dm_search_tags()
+
+    def _clear_dm_search_tags(self) -> None:
+        for tag in ("search_all", "search_current"):
+            try:
+                self.dm_text.tag_remove(tag, "1.0", "end")
+            except tk.TclError:
+                pass
+
+    def _run_dm_search(self, query: str = "") -> None:
+        bar = getattr(self, "dm_search_bar", None)
+        if bar is None:
+            return
+        query = (query if isinstance(query, str) else "").strip()
+        self._dm_search_lines = []
+        self._dm_search_index = 0
+        self._clear_dm_search_tags()
+        if not query:
+            bar.set_counter("无匹配")
+            bar.set_navigation_enabled(False)
+            return
+        try:
+            last_line = int(self.dm_text.index("end-1c").split(".", 1)[0])
+        except tk.TclError:
+            last_line = 0
+        matches = []
+        for line in range(1, last_line + 1):
+            try:
+                text = self.dm_text.get(f"{line}.0", f"{line}.end")
+            except tk.TclError:
+                continue
+            if dm_line_matches(text, query):
+                matches.append(line)
+        matches.reverse()  # 优先最新（文档末尾）
+        self._dm_search_lines = matches
+        bar.set_navigation_enabled(bool(matches))
+        bar.set_counter(search_counter(0, len(matches)))
+        self._refresh_dm_search_tags()
+        if matches:
+            self._scroll_to_dm_line(matches[0])
+
+    def _step_dm_search(self, delta: int) -> None:
+        total = len(self._dm_search_lines)
+        if total <= 0:
+            return
+        self._dm_search_index = step_index(self._dm_search_index, total, delta)
+        self.dm_search_bar.set_counter(search_counter(self._dm_search_index, total))
+        self._refresh_dm_search_tags()
+        self._scroll_to_dm_line(self._dm_search_lines[self._dm_search_index])
+
+    def _scroll_to_dm_line(self, line: int) -> None:
+        try:
+            self.dm_text.see(f"{line}.0")
+        except tk.TclError:
+            pass
+
+    def _refresh_dm_search_tags(self) -> None:
+        bar = getattr(self, "dm_search_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        self._clear_dm_search_tags()
+        query = bar.query().strip()
+        if query:
+            count = tk.IntVar()
+            start = "1.0"
+            while True:
+                try:
+                    index = self.dm_text.search(
+                        query, start, stopindex="end", nocase=True, count=count)
+                except tk.TclError:
+                    break
+                if not index:
+                    break
+                end = f"{index}+{count.get()}c"
+                self.dm_text.tag_add("search_all", index, end)
+                start = end
+        if self._dm_search_lines:
+            line = self._dm_search_lines[
+                max(0, min(self._dm_search_index, len(self._dm_search_lines) - 1))]
+            self.dm_text.tag_add("search_current", f"{line}.0", f"{line}.end")
+
+    def _schedule_dm_search_tags(self) -> None:
+        bar = getattr(self, "dm_search_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        try:
+            self.after(200, self._refresh_dm_search_tags)
+        except tk.TclError:
+            pass
 
     # ---------- 未读徽标 / 吸底 ----------
 
@@ -757,6 +1125,8 @@ class RoomChatWindow(tk.Toplevel):
         else:
             self._dm_unseen += len(batch)
             self._refresh_badges()
+        if getattr(self, "dm_search_bar", None) is not None and self.dm_search_bar.winfo_manager():
+            self._schedule_dm_search_tags()
 
     def _trim_dm_text(self) -> None:
         text = self.dm_text

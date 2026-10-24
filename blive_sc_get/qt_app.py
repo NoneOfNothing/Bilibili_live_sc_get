@@ -2707,6 +2707,14 @@ class QtScMonitorApp(QMainWindow):
                     else:
                         log_data.debug("历史 SC 结果无对应面板（token=%s）",
                                        item[1].get("token"))
+                elif kind == "sc_search":
+                    # 全量 SC 搜索结果（ROADMAP 118）：同样按 token 找发起面板
+                    panel = self._sc_panels.get(int(item[1].get("token") or 0))
+                    if panel is not None:
+                        panel.on_sc_search_result(item[1])
+                    else:
+                        log_data.debug("SC 搜索结果无对应面板（token=%s）",
+                                       item[1].get("token"))
                 elif kind == "add_result":
                     self._on_add_result(item[1])
                 elif kind == "room_info":

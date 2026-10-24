@@ -80,6 +80,8 @@ from .log_categories import (
     CATEGORY_WINDOW,
     get_logger,
 )
+from .qt_search_bar import SearchBar
+from .text_search import dm_line_matches, search_counter, step_index
 
 logger = logging.getLogger("gui_qt.dm")
 log_window = get_logger(CATEGORY_WINDOW, "gui_qt.dm.window")
@@ -307,6 +309,22 @@ class DmPanel(QWidget):
         self.dm_text.setLineWrapMode(QTextEdit.WidgetWidth)
         self.dm_text.viewport().installEventFilter(self)
         self.dm_text.installEventFilter(self)
+        # 搜索条（ROADMAP 118）：默认隐藏，Ctrl+F 唤起；只搜当前内存视图（最近约 4000 行）
+        self.search_bar = SearchBar(self)
+        outer.addWidget(self.search_bar)
+        self._dm_search_matches: list = []  # 命中的 QTextBlock（**最新优先**）
+        self._dm_search_index = 0
+        self._dm_search_refresh = QTimer(self)
+        self._dm_search_refresh.setSingleShot(True)
+        self._dm_search_refresh.setInterval(200)
+        self._dm_search_refresh.timeout.connect(self._run_dm_search)
+        self.search_bar.queryChanged.connect(self._run_dm_search)
+        self.search_bar.nextRequested.connect(lambda: self._step_dm_search(1))
+        self.search_bar.prevRequested.connect(lambda: self._step_dm_search(-1))
+        self.search_bar.closed.connect(self._close_search)
+        self._search_shortcut = QShortcut(QKeySequence.Find, self)
+        self._search_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._search_shortcut.activated.connect(self._open_search)
         outer.addWidget(self.dm_text, 1)
         self.dm_badge = self.host._make_unseen_badge(self.dm_text)
         self.dm_badge.clicked.connect(self._on_dm_badge_clicked)
@@ -397,10 +415,10 @@ class DmPanel(QWidget):
         self.emoticon_panel.setVisible(False)
         outer.addWidget(self.emoticon_panel)
 
-        # Esc 收起表情面板（与 Tk 版一致；焦点在弹幕区/输入框内均生效）
+        # Esc：搜索条开着时先关搜索（清高亮），否则收起表情面板
         self._escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
         self._escape_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self._escape_shortcut.activated.connect(self.hide_emoticon_panel)
+        self._escape_shortcut.activated.connect(self._on_escape)
 
         outer.addLayout(send)
 
@@ -533,6 +551,105 @@ class DmPanel(QWidget):
         else:
             self._dm_unseen += len(batch)
         self._trim_dm_text()
+        if getattr(self, "search_bar", None) is not None and self.search_bar.isVisible():
+            # 文档变了（新弹幕 / 裁剪），命中的 block 可能失效：去抖重跑当前查询
+            self._dm_search_refresh.start()
+
+    # ---------- 搜索（ROADMAP 118：只搜当前内存视图，优先最新） ----------
+
+    def _open_search(self) -> None:
+        if not self.visible:
+            return
+        self.search_bar.reveal()
+        if self.search_bar.query().strip():
+            self._run_dm_search()
+
+    def _close_search(self) -> None:
+        try:
+            self.search_bar.hide_bar()
+        except AttributeError:
+            return
+        self._clear_dm_search_highlight()
+        self._dm_search_matches = []
+        self._dm_search_index = 0
+
+    def _on_escape(self) -> None:
+        """Esc：搜索条开着先关它，否则收起表情面板（保持原行为）。"""
+        bar = getattr(self, "search_bar", None)
+        if bar is not None and bar.isVisible():
+            self._close_search()
+            return
+        self.hide_emoticon_panel()
+
+    def _clear_dm_search_highlight(self) -> None:
+        self.dm_text.setExtraSelections([])
+
+    def _run_dm_search(self, query: str = "") -> None:
+        """扫描当前文档，命中块按**最新优先**排列；空查询清空高亮与计数。"""
+        bar = getattr(self, "search_bar", None)
+        if bar is None:
+            return
+        query = (query or bar.query()).strip()
+        self._clear_dm_search_highlight()
+        self._dm_search_matches = []
+        self._dm_search_index = 0
+        if not query or not bar.isVisible():
+            bar.set_counter("无匹配")
+            bar.set_navigation_enabled(False)
+            return
+        matches = []
+        block = self.dm_text.document().begin()
+        while block.isValid():
+            if dm_line_matches(block.text(), query):
+                matches.append(block)
+            block = block.next()
+        matches.reverse()  # 文档旧→新，反转后 0 = 最新
+        self._dm_search_matches = matches
+        bar.set_navigation_enabled(bool(matches))
+        bar.set_counter(search_counter(0, len(matches)))
+        self._apply_dm_search_highlight(query)
+        if matches:
+            self._scroll_to_block(matches[0])
+
+    def _apply_dm_search_highlight(self, query: str) -> None:
+        """全部匹配浅黄背景；当前匹配（整行）橙色，覆盖在全部匹配之上。"""
+        selections = []
+        if query and self.search_bar.isVisible():
+            document = self.dm_text.document()
+            cursor = QTextCursor(document)
+            while True:
+                found = document.find(query, cursor)
+                if found.isNull():
+                    break
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = found
+                selection.format.setBackground(QColor("#fff0b3"))
+                selections.append(selection)
+                cursor = found
+        if self._dm_search_matches:
+            index = max(0, min(self._dm_search_index, len(self._dm_search_matches) - 1))
+            current = QTextCursor(self._dm_search_matches[index])
+            current.select(QTextCursor.BlockUnderCursor)
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = current
+            selection.format.setBackground(QColor("#ffcf70"))
+            selections.append(selection)
+        self.dm_text.setExtraSelections(selections)
+
+    def _scroll_to_block(self, block) -> None:
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        self.dm_text.setTextCursor(cursor)
+        self.dm_text.ensureCursorVisible()
+
+    def _step_dm_search(self, delta: int) -> None:
+        total = len(self._dm_search_matches)
+        if total <= 0:
+            return
+        self._dm_search_index = step_index(self._dm_search_index, total, delta)
+        self.search_bar.set_counter(search_counter(self._dm_search_index, total))
+        self._apply_dm_search_highlight(self.search_bar.query().strip())
+        self._scroll_to_block(self._dm_search_matches[self._dm_search_index])
 
     # ---------- 弹幕交互：点击跳转/复制 + 右键回复/@ + 表情悬浮 ----------
 
@@ -1095,6 +1212,7 @@ class DmPanel(QWidget):
 
     def clear_view(self) -> None:
         """清空弹幕显示区（切换直播间时调用，避免不同房间的弹幕混在一起）。"""
+        self._close_search()  # 旧文档没了：命中的 block / 高亮都失效
         self.dm_text.clear()
         self._dm_image_blocks.clear()  # 待换图的行随文档一起丢弃
         self._dm_unseen = 0
@@ -1843,6 +1961,9 @@ class DmPanel(QWidget):
             self._sync_strip_width()  # 图标变大后重算自然宽度（横向滚动范围）
         # 弹幕流里此前只显示触发词的那些行：图片到了就原地换成图
         self._fill_dm_emoticon_blocks(url, pixmap)
+        # 换图会改动文本文档（触发词 → 占位符），已保存的命中 block 位置需要重算
+        if getattr(self, "search_bar", None) is not None and self.search_bar.isVisible():
+            self._dm_search_refresh.start()
         # 开关关闭时弹幕里没有图：正显示的提示窗若在等这张原图，补上
         if not self._dm_emoticon_image:
             info = self._emoji_tip_info
@@ -1896,6 +2017,7 @@ class DmPanel(QWidget):
     # ---------- 外部联动 ----------
 
     def on_room_selected(self, room_id: Optional[int]) -> None:
+        self._close_search()  # 搜索结果属于上一个房间，切房即清
         self._clear_dm_reply_target()
         self._refresh_dm_send_state()
         # 发送颜色 / 模式：按房间套用记忆（ROADMAP 106）；随后到达的本房间可用项

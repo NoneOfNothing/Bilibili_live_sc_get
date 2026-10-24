@@ -21,9 +21,9 @@ import time
 import webbrowser
 from typing import Callable, Optional, Tuple
 
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextCharFormat, QTextCursor
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QTextEdit, QVBoxLayout, QWidget
 
 from .gui_app import (
     HISTORY_PAGE_SIZE,
@@ -36,6 +36,14 @@ from .gui_app import (
 )
 from .log_categories import CATEGORY_DATA, get_logger
 from .qt_dm_panel import BottomHoldTextEdit
+from .qt_search_bar import SearchBar
+from .text_search import (
+    ScSearchHit,
+    iter_sc_hits,
+    sc_hit_tooltip,
+    search_counter,
+    step_index,
+)
 
 logger = logging.getLogger("gui_qt.sc")
 log_data = get_logger(CATEGORY_DATA, "gui_qt.sc.data")
@@ -75,7 +83,22 @@ class ScPanel(QWidget):
         self._loaded_count = 0
         self._has_more = False
         self._loading_more = False
+        # 最近一次发出的历史请求代际：结果回来（哪怕随后因切房/新请求被丢弃）都要
+        # 据此解除「加载中」，否则一次过期结果就能把上滑加载永久卡死（ROADMAP 117）
+        self._pending_gen = 0
+        # 清空文本/首次渲染期间屏蔽「到顶触发」：`sc_text.clear()` 会把滚动条打到 0，
+        # 若不屏蔽会在结果处理中途误发一次翻页请求，随后又因代际前进被丢弃
+        self._suspend_history_trigger = False
         self._sc_unseen = 0
+        # 搜索（ROADMAP 118）：SC 覆盖**全部落盘历史**，命中按最新优先；
+        # 未加载的命中先记 pending，补加载到目标页后再跳转
+        self._search_hits: list = []
+        self._search_index = 0
+        self._search_query = ""
+        self._search_gen = 0
+        self._search_pending_hit: Optional[ScSearchHit] = None
+        self._search_load_pages = 0
+        self._search_truncated = False
         self._header_tick = 0.0  # 头部行上次因「已播」刷新时刻（秒级节流用）
         self._build_ui()
         host.register_sc_panel(self)
@@ -113,8 +136,25 @@ class ScPanel(QWidget):
         self.sc_text.setFont(QFont("Microsoft YaHei UI", 10))
         self.sc_text.setLineWrapMode(BottomHoldTextEdit.WidgetWidth)
         self.sc_text.verticalScrollBar().valueChanged.connect(self._on_sc_wheel)
+        # 已经停在顶部时继续滚轮，滚动值不会再变化（valueChanged 不触发）；
+        # 这里补一层 Wheel 监听，保证「到顶后重试」不会被漏掉（ROADMAP 117）
+        self.sc_text.viewport().installEventFilter(self)
         # 点击 SC 里的用户名 → 打开其个人空间（与 Tk 版 _on_sc_click 一致）
         self.sc_text.click_handler = self._on_sc_clicked
+        # 搜索条（ROADMAP 118）：默认隐藏，Ctrl+F 唤起；搜全量落盘历史
+        self.search_bar = SearchBar(self, placeholder="搜索全部 SC 历史…（回车下一个，Shift+回车上一个，Esc 关闭）")
+        layout.addWidget(self.search_bar)
+        self._search_refresh = QTimer(self)
+        self._search_refresh.setSingleShot(True)
+        self._search_refresh.setInterval(200)
+        self._search_refresh.timeout.connect(self._refresh_sc_search_highlight)
+        self.search_bar.queryChanged.connect(self._run_sc_search)
+        self.search_bar.nextRequested.connect(lambda: self._step_sc_search(1))
+        self.search_bar.prevRequested.connect(lambda: self._step_sc_search(-1))
+        self.search_bar.closed.connect(self._close_search)
+        self._search_shortcut = QShortcut(QKeySequence.Find, self)
+        self._search_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._search_shortcut.activated.connect(self._open_search)
         layout.addWidget(self.sc_text, 1)
         self.sc_badge = self.host._make_unseen_badge(self.sc_text)
         self.sc_badge.clicked.connect(self._on_sc_badge_clicked)
@@ -164,28 +204,59 @@ class ScPanel(QWidget):
 
         SC 文本区**不立即清空**（与原实现一致）：等历史加载回来时再清，期间先显示
         「正在加载历史 SC…」提示；切到「无选中房间」时才清空。
+
+        切房先重置分页状态：否则上一个房间残留的 `_loading_more=True` 会让新房间
+        的上滑加载直接被挡掉（ROADMAP 117）。
         """
+        self._close_search()  # 搜索结果属于上一个房间，切房即清
         if room_id is None:
             self.clear_view()
             return
+        self._reset_history_state()
         self.update_header()
         self.update_total()
         self.load_history(room_id)
 
+    def _reset_history_state(self) -> None:
+        """重置分页状态（**不动** ``_history_gen``：代际只由发起请求推进）。"""
+        self._loaded_count = 0
+        self._has_more = False
+        self._loading_more = False
+        self._pending_gen = 0
+
+    def _clear_text(self) -> None:
+        """只清空文本，不动分页状态；清空期间屏蔽到顶触发。
+
+        `sc_text.clear()` 会把滚动条值打到 0 并触发 `valueChanged`——若此时
+        `_has_more` 已为真，就会在结果处理中途误发一次翻页请求，紧接着又被
+        `clear_view` 推进的代际作废，`_loading_more` 永久卡 True（ROADMAP 117）。
+        """
+        previous = self._suspend_history_trigger
+        self._suspend_history_trigger = True
+        try:
+            self.sc_text.clear()
+        finally:
+            self._suspend_history_trigger = previous
+
     def clear_view(self) -> None:
-        self.sc_text.clear()
+        self._close_search()
+        self._clear_text()
         self._sc_unseen = 0
         self.sc_badge.hide()
-        self._history_gen += 1
+        self._reset_history_state()
 
     # ---------- 历史分页 ----------
 
     def load_history(self, room_id: int, skip: int = 0) -> None:
         self._history_gen += 1
         gen = self._history_gen
+        self._pending_gen = gen
         log_data.debug("读取历史 SC：房间 %s，skip=%d", room_id, skip)
         storage = self.host.hub.storage
         if storage is None:
+            # 没有请求真正发出：不能留下「加载中」，否则后续上滑永远被挡
+            self._loading_more = False
+            self._pending_gen = 0
             self.append_info("（后台网络初始化中，稍后会自动加载历史 SC…）")
             return
         if skip == 0:
@@ -216,7 +287,12 @@ class ScPanel(QWidget):
 
     def on_history_loaded(self, payload: dict) -> None:
         """宿主按 token 路由回来的历史结果（只处理本面板发起的那一次）。"""
-        if payload["gen"] != self._history_gen:
+        gen = payload.get("gen")
+        if gen == self._pending_gen:
+            # 这一代请求已经回来：无论随后是否采用，先解除「加载中」。
+            # 若因切房 / 被新请求取代而丢弃结果却不动这个标志，上滑加载会永久失效。
+            self._loading_more = False
+        if gen != self._history_gen:
             return
         if payload["room_id"] != self.room_id:
             return
@@ -227,14 +303,14 @@ class ScPanel(QWidget):
         skip = int(payload.get("skip") or 0)
         self.host._sc_total[room_id] = total
         self.update_total()
-        self._loading_more = False
         self._loaded_count = skip + len(records)
         self._has_more = self._loaded_count < total
         log_data.debug("历史 SC 读取完成：房间 %s，skip=%d，本页 %d 条，累计 %d/%d 条",
                        room_id, skip, len(records), self._loaded_count, total)
         marker = self._history_marker(self._loaded_count, total)
         if skip == 0:
-            self.clear_view()
+            # 只清文本、不动分页代际：clear_view() 会重置状态，不适合在结果处理中途调用
+            self._clear_text()
             if not records:
                 self.append_info("（尚无 SC 记录，收到新 SC 后会实时显示在这里）")
                 return
@@ -243,6 +319,7 @@ class ScPanel(QWidget):
             self.append_info(f"（历史 {total} 条sc记录）")
             self._prepend_info(marker)
             self._scroll_to_bottom()
+            self._resolve_search_pending()
             return
         # 向上翻页：更早记录插在顶部，最终顺序与 Tk 版一致 ——
         # [新标记][本页记录][（已读取 x 条历史记录）][旧内容…]
@@ -255,15 +332,238 @@ class ScPanel(QWidget):
         self._prepend_block(block)
         self._prepend_info(marker)
         self._restore_top_anchor(anchor)
+        self._resolve_search_pending()
 
     def _maybe_load_more(self) -> None:
         room_id = self.room_id
         if (room_id is None or not self._has_more
-                or self._loading_more or self.host.hub.storage is None):
+                or self._loading_more or self._suspend_history_trigger
+                or self.host.hub.storage is None):
             return
         if self.sc_text.verticalScrollBar().value() > 0:
             return
         self.load_history(room_id, skip=self._loaded_count)
+
+    # ---------- 搜索（ROADMAP 118：全量落盘历史，优先最新） ----------
+
+    def _open_search(self) -> None:
+        if self.room_id is None:
+            return
+        self.search_bar.reveal()
+        if self.search_bar.query().strip():
+            self._run_sc_search()
+
+    def _close_search(self) -> None:
+        bar = getattr(self, "search_bar", None)
+        if bar is None:
+            return
+        bar.hide_bar()
+        self._search_hits = []
+        self._search_index = 0
+        self._search_pending_hit = None
+        self._search_query = ""
+        self._search_truncated = False
+        self._clear_sc_search_highlight()
+
+    def _clear_sc_search_highlight(self) -> None:
+        self.sc_text.setExtraSelections([])
+
+    def _run_sc_search(self, query: str = "") -> None:
+        """后台读全量落盘历史并匹配；空查询只清高亮，不读盘。"""
+        bar = getattr(self, "search_bar", None)
+        if bar is None:
+            return
+        query = (query or bar.query()).strip()
+        self._search_gen += 1
+        gen = self._search_gen
+        self._search_hits = []
+        self._search_index = 0
+        self._search_pending_hit = None
+        self._search_query = query
+        self._search_truncated = False
+        self._clear_sc_search_highlight()
+        if not query or not bar.isVisible():
+            bar.set_counter("无匹配")
+            bar.set_navigation_enabled(False)
+            return
+        room_id = self.room_id
+        storage = self.host.hub.storage
+        if room_id is None or storage is None:
+            bar.set_counter("暂无历史")
+            bar.set_navigation_enabled(False)
+            return
+        bar.set_counter("搜索中…")
+        bar.set_navigation_enabled(False)
+        token = self.token
+        ui_queue = self.host.ui_queue
+
+        def worker() -> None:
+            started = time.monotonic()
+            try:
+                hits, truncated = iter_sc_hits(
+                    storage.iter_sc_history_desc(room_id), query)
+            except Exception:
+                log_data.exception("搜索历史 SC 失败 room=%s", room_id)
+                hits, truncated = [], False
+            ui_queue.put(("sc_search", {
+                "gen": gen, "room_id": room_id, "token": token, "query": query,
+                "hits": hits, "truncated": truncated,
+                "elapsed": time.monotonic() - started,
+            }))
+
+        threading.Thread(target=worker, name=f"sc-search-{room_id}",
+                         daemon=True).start()
+
+    def on_sc_search_result(self, payload: dict) -> None:
+        """宿主按 token 路由回的全量搜索结果（过期 / 换房直接丢弃）。"""
+        if payload.get("token") != self.token:
+            return
+        if payload.get("gen") != self._search_gen:
+            return
+        if payload.get("room_id") != self.room_id:
+            return
+        bar = getattr(self, "search_bar", None)
+        if bar is None or not bar.isVisible():
+            return
+        hits = list(payload.get("hits") or [])
+        self._search_hits = hits
+        self._search_index = 0
+        self._search_truncated = bool(payload.get("truncated"))
+        bar.set_navigation_enabled(bool(hits))
+        bar.set_counter(search_counter(0, len(hits), truncated=self._search_truncated))
+        log_data.debug("SC 搜索完成：房间 %s，命中 %d%s，%.0fms",
+                       self.room_id, len(hits),
+                       "（已截断）" if self._search_truncated else "",
+                       (payload.get("elapsed") or 0) * 1000)
+        self._apply_sc_search_highlight()
+        if hits:
+            self._jump_to_search_hit(hits[0])
+
+    def _step_sc_search(self, delta: int) -> None:
+        total = len(self._search_hits)
+        if total <= 0:
+            return
+        self._search_index = step_index(self._search_index, total, delta)
+        self.search_bar.set_counter(search_counter(
+            self._search_index, total, truncated=self._search_truncated))
+        self._jump_to_search_hit(self._search_hits[self._search_index])
+
+    def _jump_to_search_hit(self, hit: ScSearchHit) -> None:
+        """已加载则直接滚动；未加载则记 pending、按需补页后再跳。"""
+        if hit.index < self._loaded_count:
+            block = self._find_sc_block(hit.sc_id)
+            if block is not None:
+                self._search_pending_hit = None
+                self._scroll_to_sc_block(block)
+                self._apply_sc_search_highlight()
+                return
+        self._search_pending_hit = hit
+        self._search_load_pages = 0
+        self._request_more_for_search()
+
+    def _request_more_for_search(self) -> None:
+        hit = self._search_pending_hit
+        bar = getattr(self, "search_bar", None)
+        if hit is None or bar is None:
+            return
+        if hit.index < self._loaded_count:
+            self._resolve_search_pending()
+            return
+        if not self._has_more:
+            self._search_pending_hit = None
+            bar.set_counter("目标记录过旧，已停止加载")
+            return
+        if self._loading_more:
+            return  # 当前页回来后会由 _resolve_search_pending 继续
+        if self._search_load_pages >= 50:
+            self._search_pending_hit = None
+            bar.set_counter("目标记录过旧，已停止加载")
+            log_data.info("SC 搜索跳转：补加载 50 页仍未找到记录 %s，停止", hit.sc_id)
+            return
+        room_id = self.room_id
+        if room_id is None:
+            self._search_pending_hit = None
+            return
+        self._search_load_pages += 1
+        self.load_history(room_id, skip=self._loaded_count)
+
+    def _resolve_search_pending(self) -> None:
+        """一页历史加载完成后：目标已可见则跳转，否则继续补页。"""
+        hit = self._search_pending_hit
+        if hit is None:
+            return
+        if hit.index < self._loaded_count:
+            self._search_pending_hit = None
+            block = self._find_sc_block(hit.sc_id)
+            if block is not None:
+                self._scroll_to_sc_block(block)
+                self._apply_sc_search_highlight()
+            return
+        self._request_more_for_search()
+
+    def _find_sc_block(self, sc_id: str):
+        """按 ``sc_id`` 在文档里定位记录块（每条记录的首段带 ``_SC_ID_KEY``）。"""
+        if not sc_id:
+            return None
+        block = self.sc_text.document().begin()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                fragment = it.fragment()
+                if (fragment.isValid()
+                        and str(fragment.charFormat().property(_SC_ID_KEY) or "") == sc_id):
+                    return block
+                it += 1
+            block = block.next()
+        return None
+
+    def _scroll_to_sc_block(self, block) -> None:
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        self.sc_text.setTextCursor(cursor)
+        self.sc_text.ensureCursorVisible()
+        # 跳到命中属于「主动定位」，不应被吸底逻辑拉回底部
+        bottom = getattr(self.host, "_bottom_at", None)
+        if isinstance(bottom, dict):
+            bottom["sc"] = False
+
+    def _apply_sc_search_highlight(self) -> None:
+        """全部匹配浅黄；当前命中的整条记录橙色（覆盖在上面）。"""
+        bar = getattr(self, "search_bar", None)
+        if bar is None or not bar.isVisible():
+            self.sc_text.setExtraSelections([])
+            return
+        query = bar.query().strip()
+        selections = []
+        if query:
+            document = self.sc_text.document()
+            cursor = QTextCursor(document)
+            while True:
+                found = document.find(query, cursor)
+                if found.isNull():
+                    break
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = found
+                selection.format.setBackground(QColor("#fff0b3"))
+                selections.append(selection)
+                cursor = found
+        hit = self._search_hits[self._search_index] if self._search_hits else None
+        if hit is not None:
+            block = self._find_sc_block(hit.sc_id)
+            if block is not None:
+                current = QTextCursor(block)
+                current.select(QTextCursor.BlockUnderCursor)
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = current
+                selection.format.setBackground(QColor("#ffcf70"))
+                selections.append(selection)
+        self.sc_text.setExtraSelections(selections)
+
+    def _refresh_sc_search_highlight(self) -> None:
+        """实时新增 / 翻页插入内容后去抖重建高亮（不重新读盘）。"""
+        if getattr(self, "search_bar", None) is None or not self.search_bar.isVisible():
+            return
+        self._apply_sc_search_highlight()
 
     # ---------- 渲染 ----------
 
@@ -300,6 +600,8 @@ class ScPanel(QWidget):
             # 用户正在向上翻阅：累加未读计数并显示「N 条新SC ↓」徽标
             self._sc_unseen += 1
             self.sync_unseen_badge()
+        if getattr(self, "search_bar", None) is not None and self.search_bar.isVisible():
+            self._search_refresh.start()  # 新内容进来：去抖重建高亮
 
     def append_info(self, text: str) -> None:
         follow = self._sc_at_bottom()
@@ -486,6 +788,12 @@ class ScPanel(QWidget):
     def _on_sc_wheel(self, _value: int) -> None:
         if self.sc_text.verticalScrollBar().value() <= 0:
             self._maybe_load_more()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
+        """滚轮到顶重试：停在顶部后滚动值不再变化，valueChanged 不会再触发。"""
+        if obj is self.sc_text.viewport() and event.type() == QEvent.Wheel:
+            self._maybe_load_more()
+        return super().eventFilter(obj, event)
 
     def _sc_at_bottom(self) -> bool:
         bar = self.sc_text.verticalScrollBar()

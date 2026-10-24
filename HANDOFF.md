@@ -63,7 +63,7 @@ python -m venv .venv
 ## 4. 测试
 
 ```bash
-.venv\Scripts\python -m unittest discover -s tests -q   # 当前 715 项，全绿
+.venv\Scripts\python -m unittest discover -s tests -q   # 当前 758 项，全绿
 ```
 
 没有网络依赖。改动后**必跑**：`py_compile` + 这套 unittest；涉及 Qt 控件逻辑时先在
@@ -406,3 +406,104 @@ SC 头部信息行新增 `已播 01:23:45`（排在「舰长」之后、粉丝�
 - Qt offscreen 冒烟（验证后删除）：下拉出现「灰泽满Hazel（充电）」、翻页正常、
   发送参数 `emoticon={"unique": "upower_[UPOWER_1298779265_品]", …}`；
 - `tests/test_charge_emoticons.py` 33 项；故障植入（移除展示层权益过滤）应触发 2 项失败。
+
+## 18. SC 历史分页状态机（ROADMAP 117，会话 2026-10-25）
+
+### 现象与根因
+
+Qt 主界面 / 房间独立窗口：滚轮、滚动条、中键三种方式全部「到顶不加载」，规律是
+**同一进程内成功上滑加载过一次后，切走再重进该房间就失效，重启恢复**。
+
+离屏探针（假 storage 250 条 / 每页 100）复现出的故障链：
+
+1. 切房/重进时 `on_history_loaded(skip=0)` 调 `clear_view()`；
+2. `clear_view()` **先** `sc_text.clear()` → 滚动条被打到 0 → `valueChanged` →
+   `_maybe_load_more()`（此时 `_has_more` 刚置真、`_loading_more` 为假）→ **误发**
+   一次 `skip>0` 翻页请求并置 `_loading_more=True`；
+3. `clear_view()` **随后** `_history_gen += 1`，把这代请求作废；
+4. 结果回来 `gen` 不匹配 → `on_history_loaded` 直接 return，`_loading_more` 永久 True；
+5. 之后所有到顶触发都被 `_maybe_load_more` 的 `_loading_more` 挡住。
+
+新进程里文本区为空，首次 `clear()` 不改变滚动值 → 第一次正常，直到再次重进。
+
+### 修复要点（`qt_sc_panel.ScPanel`，Tk 同步）
+
+- **代际只由 `load_history()` 推进**：`clear_view()` 不再改 `_history_gen`，改走
+  `_reset_history_state()`（清 `_loaded_count/_has_more/_loading_more/_pending_gen`）。
+- **`_clear_text()`**：只清文本，期间 `_suspend_history_trigger=True` 屏蔽到顶触发；
+  `on_history_loaded(skip==0)` 用它而不是 `clear_view()`，避免在结果处理中途重置状态。
+- **`_pending_gen`**：结果回来只要 `gen == _pending_gen` 就先解除 `_loading_more`，
+  **哪怕随后因切房 / 被新请求取代而丢弃**。这是「过期结果不卡死」的关键，别删。
+  `storage is None` 时也不留「加载中」。
+- **`apply_room()` 先重置分页状态**：切房/重进必清 `_loading_more`。
+- **到顶重试**：Qt 给 `sc_text.viewport()` 装 `eventFilter` 监听 `QEvent.Wheel`
+  （停在顶部后滚动值不再变化、`valueChanged` 不触发）；Tk 在 `_autoscroll_tick`
+  里补 `_maybe_load_more`（中键自动滚动不走滚动条 command）。Tk 两处同步 `_pending_gen`。
+
+### 约定
+
+- 分页参数：`HISTORY_PAGE_SIZE = 100`；`_loaded_count` 是「已读取条数」，
+  `_has_more = _loaded_count < total`；`total = count_sc_records()`。
+- 顶部状态行只留一条（`_drop_top_marker`），每页边界插「（已读取 x 条历史记录）」，
+  视口恢复走 `scroll_value_for_anchor`（ROADMAP 95），别动。
+- 测试：`tests/test_sc_history_paging.py`（13 项：重进仍可加载、清空不误发、读完即停、
+  过期结果复位、切房重置、到顶触发/重复请求拦截、两版接线）。
+- 复现探针写法：offscreen + 假 host（`_make_unseen_badge` / `_place_unseen_badge` 直接绑
+  `QtScMonitorApp` 方法）+ 假 storage（`load_sc_page` 按 skip 切片）；记录 `storage.calls`
+  序列与 `_has_more/_loading_more/_loaded_count`，即可稳定复现与回归。
+
+## 19. SC / 弹幕搜索（ROADMAP 118，会话 2026-10-25）
+
+### 需求口径（用户确认）
+
+- **SC 搜全部落盘历史**（不只已加载的 100 条）；**弹幕只搜当前内存视图**（最近约 4000 行）。
+- **跟随焦点分两区**：焦点在 SC 区就唤起 SC 搜索条，在弹幕区就唤起弹幕搜索条，两条互不影响。
+- **全部匹配高亮 + 上一个/下一个 + 计数 + Esc 关闭**，结果**优先最新**。
+- Qt + Tk 两版、主界面 + 房间独立窗口全部支持。
+
+### 新增模块
+
+- `text_search.py`（纯函数，两版共用）：`normalize_query`（strip + casefold）、
+  `sc_record_matches` / `sc_record_text`、`sc_preview`（命中附近截 80 字）、
+  `iter_sc_hits(records_desc, query, limit=2000)`（最新→更旧，返回 `(hits, truncated)`）、
+  `dm_line_matches` / `dm_match_indices`、`step_index`（循环）、`search_counter`。
+- `qt_search_bar.SearchBar`：输入框 + 计数 + ↑↓ + ✕；去抖 180ms；回车下一个、
+  Shift+回车上一个、Esc 关闭；`reveal()` 记录并恢复唤起前焦点。
+- `tk_search_bar.SearchBar`：`trace_add` 去抖；`<Return>` / `<Shift-Return>` / `<Escape>`
+  返回 `"break"`；`reveal()` 才 `pack(side="top", before=文本)`，`hide_bar()` 收起。
+
+### 接入与状态
+
+- **Qt**：`ScPanel` / `DmPanel` 各挂 `QShortcut(QKeySequence.Find)` +
+  `Qt.WidgetWithChildrenShortcut`（焦点在哪个面板子树就触发哪个，发送输入框内也生效）。
+  高亮用 `QTextEdit.ExtraSelection`：全部浅黄 `#fff0b3`、当前匹配橙色 `#ffcf70`。
+- **Tk**：主界面与独立窗口 `bind("<Control-f>")`，`_focus_in()` 判断焦点属于
+  `sc_frame` 还是 `dm_frame`；高亮用 `tag_configure("search_all"/"search_current")`
+  + `Text.search(..., nocase=True, count=...)`。
+- **SC 全量搜索**：后台线程读 `storage.iter_sc_history_desc(room_id)` → `iter_sc_hits`，
+  结果经 Qt `ui_queue.put(("sc_search", {token, gen, room_id, hits, truncated}))`
+  （宿主按 token 回投）或 Tk 各自队列（主界面 `ui_queue` / 独立窗口 `_queue`）。
+  命中已加载（`hit.index < _loaded_count`）→ 按 `sc_id` 定位（Qt 扫块上
+  `_SC_ID_KEY`，Tk 用 `sc:<id>` tag）；未加载 → 记 `_search_pending_hit`，
+  复用 `load_history(skip=_loaded_count)` 连续补页（上限 50 页），
+  每页 `on_history_loaded` 末尾 `_resolve_search_pending()` 继续定位。
+  **不要**直接改 `_loading_more` / `_pending_gen`：ROADMAP 117 的状态机负责这些。
+- **弹幕搜索**：Qt 遍历 `QTextDocument` 块匹配（`dm_line_matches(block.text())`），
+  反转成最新优先；Tk 逐行 `get(line.0, line.end)` 匹配后反转。初始定位第 1 个（最新），
+  「下一个」走向更旧。
+- **清理**：关闭搜索 / Esc / 切房 / `clear_view` 都要清 `ExtraSelection` 或两个 tag、
+  清空命中列表与 pending；Tk 主界面 `_clear_sc_view` / `_clear_dm_view` 里已接入。
+  独立窗口固定房间，首次历史加载只清文本、不关搜索（`_clear_sc_view` 里**没有**
+  `_close_sc_search`，别照抄主界面）。
+- **实时刷新**：新增 SC / 弹幕、翻页插入、表情图换图、4000 行裁剪后去抖（200ms）重建高亮，
+  不重新读盘；只有输入变化才重新搜索。
+
+### 测试
+
+- `tests/test_text_search.py`（19 项：匹配/大小写/摘要/最新优先/上限截断/计数/循环）。
+- `tests/test_sc_dm_search.py`（11 项：Qt 弹幕命中与循环、Esc/切房清理、SC 全量 250 条、
+  跳未加载记录补页、Tk AST 接线）。
+- 复现/冒烟：Qt 用 `test_sc_history_paging._FakeHost`（`_FakeStorage` 需实现
+  `iter_sc_history_desc`）；Tk 用真实 `tk.Tk()` 构造 `SearchBar` 验证
+  `winfo_manager()` 的 `pack` / 空切换与去抖。
+- 真实数据只读验证：`SCStorage('data').iter_sc_history_desc(5050)` 4551 条，搜「哈」命中 14 条。
