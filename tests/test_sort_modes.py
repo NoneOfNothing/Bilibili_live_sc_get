@@ -16,7 +16,10 @@ from blive_sc_get.gui_app import (
     NEW_ROOM_MARK_S,
     SORT_MODE_HELP,
     SORT_MODE_TEXTS,
+    adopt_orphan_offline_marks,
     backfill_offline_marks,
+    config_last_saved_at,
+    following_fetch_due,
     merge_offline_marks,
     order_room_ids,
     prune_live_marks,
@@ -62,6 +65,14 @@ def _called_attrs(node) -> set:
 
 def _consts(node) -> set:
     return {sub.value for sub in ast.walk(node) if isinstance(sub, ast.Constant)}
+
+
+def _first_call_line(node, name: str):
+    """``node`` 里第一次（按行号）调用 ``name(...)`` 的行号；没调用返回 ``None``。"""
+    lines = [sub.lineno for sub in ast.walk(node)
+             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+             and sub.func.id == name]
+    return min(lines) if lines else None
 
 
 class UpdateOfflineAtTests(unittest.TestCase):
@@ -362,6 +373,95 @@ class SortModeTextsTests(unittest.TestCase):
         self.assertNotIn("（按住行拖动可调整顺序", source, "静态长提示应已移除")
 
 
+class FollowingFetchDueTests(unittest.TestCase):
+    """关注列表抓取的冷却判定（ROADMAP 97 的数据源开关）。
+
+    回归现场：以前用 ``0.0`` 表示「本次运行还没抓过」，而 ``time.monotonic()`` 在 Windows
+    上返回**开机以来的秒数**——开机不满 10 分钟就启动程序时（实测 monotonic≈66 秒），
+    ``now - 0.0 < 600`` 成立，首次抓取被误判成「刚抓过」而跳过；触发点只有「后台就绪」
+    与「切到按直播状态」两处，一次跳过就再没机会重试。后果是 21/37 个房间的下播时刻永远
+    停在 2000-01-01 占位档（实测关注列表接口本可给出全部 21 个真实值）。
+    """
+
+    def test_first_fetch_always_due(self):
+        self.assertTrue(following_fetch_due(None, 66.0),
+                        "首次抓取必须放行（开机 66 秒启动也要抓）")
+        self.assertTrue(following_fetch_due(None, 0.0))
+
+    def test_cooldown_window(self):
+        self.assertFalse(following_fetch_due(1000.0, 1599.0, 600.0), "冷却未到不该重复抓")
+        self.assertTrue(following_fetch_due(1000.0, 1600.0, 600.0), "冷却到点应放行")
+        self.assertTrue(following_fetch_due(1000.0, 5000.0, 600.0))
+
+    def test_bad_last_fetch_value_is_treated_as_never(self):
+        self.assertTrue(following_fetch_due("坏值", 10.0), "脏值当作没抓过，宁可多抓一次")
+
+    def test_zero_sentinel_would_be_blocked(self):
+        """说明为什么初值必须改 ``None``：``0.0`` 在开机 10 分钟内会被判成「刚抓过」。"""
+        self.assertFalse(following_fetch_due(0.0, 66.0),
+                         "0.0 哨兵正是本次 bug 的成因（距上次 66 秒 < 600 秒冷却）")
+
+
+class AdoptOrphanMarksTests(unittest.TestCase):
+    """异常退出（断电 / 硬关机 / 结束进程）后的下播时刻兜底。
+
+    ``closeEvent`` 没机会执行 ⇒ 退出估算没写；开播时 ``update_offline_at`` 又把上一场的
+    关播记录清掉了。于是「上次仍在直播」的房间重启后既无开播也无关播记录，会被
+    ``backfill_offline_marks`` 填成 2000-01-01 沉底。启动时拿配置文件 mtime（最后一次成功
+    落盘的时刻，必然不晚于关机时刻）补一个估算值，至少能排对先后。
+    """
+
+    MOMENT = 1793910000.0
+
+    def test_orphan_gets_estimate(self):
+        offline = {11: 1793900000.0}
+        live = {22: 1793890000.0}
+        filled = adopt_orphan_offline_marks(offline, live, [11, 22], self.MOMENT)
+        self.assertEqual(filled, 1)
+        self.assertEqual(offline[22], self.MOMENT, "孤儿房间应补上估算值")
+        self.assertEqual(offline[11], 1793900000.0, "已有真实记录不许覆盖")
+
+    def test_normal_exit_has_no_orphan(self):
+        """正常退出：退出估算已写过下播时刻，两个表都有它 → 不补。"""
+        offline = {11: self.MOMENT}
+        live = {11: 1793890000.0}
+        self.assertEqual(adopt_orphan_offline_marks(offline, live, [11], self.MOMENT), 0)
+        self.assertEqual(offline, {11: self.MOMENT})
+
+    def test_room_without_live_record_is_not_adopted(self):
+        """从未观察到直播（两个表都没有）：留给 backfill 的 2000 占位，不当孤儿。"""
+        offline = {}
+        self.assertEqual(adopt_orphan_offline_marks(offline, {}, [11], self.MOMENT), 0)
+        self.assertEqual(offline, {})
+
+    def test_bad_moment_is_ignored(self):
+        for moment in (None, 0, -1.0, "坏值", NEW_ROOM_MARK_S):
+            with self.subTest(moment=moment):
+                offline = {11: NEW_ROOM_MARK_S}
+                live = {22: 1000.0}
+                self.assertEqual(adopt_orphan_offline_marks(offline, live, [22], moment), 0)
+                self.assertNotIn(22, offline, "非法 / 不晚于占位的时刻不得写入")
+
+    def test_bad_room_keys_skipped(self):
+        offline = {}
+        live = {22: 1000.0}
+        self.assertEqual(
+            adopt_orphan_offline_marks(offline, live, ["坏值", None, 22], self.MOMENT), 1)
+        self.assertEqual(offline, {22: self.MOMENT})
+
+    def test_config_mtime_helper(self):
+        """配置 mtime 读得到；文件不存在给 ``None``（调用方跳过兜底）。"""
+        self.assertIsInstance(
+            config_last_saved_at(ROOT / "blive_sc_get" / "gui_app.py"), float)
+        self.assertIsNone(config_last_saved_at(ROOT / "_不存在的配置_.json"))
+
+    def test_orphan_estimate_loses_to_real_offline_time(self):
+        """兜底值只是下限：关注列表的真实下播时刻更晚，合并时自动取真实值。"""
+        offline = {22: self.MOMENT}                     # 启动兜底（关机前最后落盘时刻）
+        real = {22: self.MOMENT + 3000}                 # 关机后 50 分钟才真正下播
+        self.assertEqual(merge_offline_marks(offline, real), {22: self.MOMENT + 3000})
+
+
 class FollowingOfflineMarksTests(unittest.TestCase):
     """「上次直播结束时刻」的来源、合并与接线（ROADMAP 97）。
 
@@ -423,6 +523,51 @@ class FollowingOfflineMarksTests(unittest.TestCase):
                 handler = _method(tree, cls, "_on_following_marks")
                 self.assertIn("_remote_offline_at", _attr_names(handler))
                 self.assertIn("_sort_dirty", _attr_names(handler), "拿到值后未触发重排")
+
+    def test_fetch_cooldown_uses_none_sentinel(self):
+        """冷却初值必须是 ``None``：``0.0`` 会被开机秒数误判成「刚抓过」（两版）。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                init = _method(_module_tree(module), cls, "__init__")
+                values = []
+                for node in ast.walk(init):
+                    if isinstance(node, ast.Assign):
+                        targets, value = node.targets, node.value
+                    elif isinstance(node, ast.AnnAssign):  # 带类型注解的赋值
+                        targets, value = [node.target], node.value
+                    else:
+                        continue
+                    if any(isinstance(t, ast.Attribute)
+                           and t.attr == "_following_fetched_at" for t in targets):
+                        values.append(value)
+                self.assertEqual(len(values), 1, "冷却计时初值应只赋值一次")
+                self.assertIsInstance(values[0], ast.Constant, "初值必须是字面量 None")
+                self.assertIsNone(values[0].value, "冷却哨兵必须改成 None（0.0 会被误判）")
+
+    def test_startup_adopts_orphans_before_backfill(self):
+        """启动恢复：先按配置 mtime 补「异常退出时仍在直播」的房间，再 backfill 占位。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                init = _method(_module_tree(module), cls, "__init__")
+                self.assertIn("config_last_saved_at", _names(init),
+                              "未取配置文件最后落盘时刻（异常退出兜底的时间基准）")
+                adopt_line = _first_call_line(init, "adopt_orphan_offline_marks")
+                backfill_line = _first_call_line(init, "backfill_offline_marks")
+                self.assertIsNotNone(adopt_line, "启动时未做异常退出兜底")
+                self.assertLess(adopt_line, backfill_line,
+                                "兜底必须在 backfill 之前（否则先被 2000 占位填掉）")
+
+    def test_hosts_persist_following_marks(self):
+        """真实下播时刻要回写本地并落盘：否则每次启动都得重抓，抓不到就退回占位值。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("qt_app.py", "QtScMonitorApp")):
+            with self.subTest(module=module):
+                handler = _method(_module_tree(module), cls, "_on_following_marks")
+                self.assertIn("merge_offline_marks", _names(handler), "未合并进本地记录")
+                self.assertIn("_offline_at", _attr_names(handler), "未回写 _offline_at")
+                self.assertIn("_save_config", _called_attrs(handler), "回写后未落盘")
 
     def test_sorting_uses_merged_marks(self):
         for module, cls, method in (("gui_app.py", "ScMonitorApp", "_sorted_room_ids"),

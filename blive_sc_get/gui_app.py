@@ -281,6 +281,64 @@ def backfill_offline_marks(offline_at: dict, room_ids,
     return filled
 
 
+def config_last_saved_at(path) -> Optional[float]:
+    """配置文件最后一次成功落盘的时刻（epoch 秒）；读不到返回 ``None``（非纯函数）。
+
+    用作异常退出（断电 / 硬关机）后的下播时刻估算：文件 mtime 必然不晚于关机时刻，
+    是「至少播到这一刻」的正确下界。文件不存在 / 无权限时返回 ``None``，调用方跳过兜底。
+    """
+    try:
+        return float(Path(path).stat().st_mtime)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def adopt_orphan_offline_marks(offline_at: dict, live_started_at: dict, room_ids,
+                               moment: Optional[float], *,
+                               skip: float = NEW_ROOM_MARK_S) -> int:
+    """给「上次退出时仍在直播」的房间补一个估算下播时刻（就地更新，返回补了几个）。
+
+    断电 / 硬关机 / 结束进程都不会走 ``closeEvent``，退出估算（
+    ``_record_shutdown_offline_estimate``）没机会写入；而开播时 :func:`update_offline_at`
+    又会把**上一场**的关播记录清掉。于是这些房间重启后既无开播也无关播记录，只能被
+    :func:`backfill_offline_marks` 填成 2000-01-01，在「按直播状态」里沉到最底部，与真实
+    下播先后彻底脱钩。本函数在 backfill **之前**调用，先把这批「孤儿」认出来。
+
+    判定条件（两者同时成立才算孤儿）：
+
+    - ``live_started_at`` 里有它——说明上次运行期它确实处于「直播中」（下播会清空）；
+    - ``offline_at`` 里没有它——说明从未观测到它关播。
+
+    ``moment`` 必须传**配置文件最后一次成功落盘的时刻**（``gui_rooms.json`` 的 mtime）：
+    它必然不晚于关机时刻，是「至少播到这一刻」的正确下界。**不要传当前时间**——重启时
+    拿 ``time.time()`` 会把关机期间下播的房间错误地排到已下播分组的最前面。
+
+    ``skip`` 是占位值下限：``moment`` 不晚于它（或非法 / 非正）就整体放弃，宁可保留
+    占位也不用一个更早的假时间。
+
+    限制：``live_started_at`` 只保留 :data:`LIVE_MARK_MAX_AGE_S`（24 小时）内的记录，
+    更久以前的历史不会被当成孤儿（那时也谈不上「刚下播」，退回占位逻辑即可）。
+    写入的估算值之后会被关注列表的真实值覆盖（:func:`merge_offline_marks` 取较晚者）。
+    """
+    try:
+        value = float(moment)
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0 or value <= float(skip):
+        return 0
+    filled = 0
+    for room_id in room_ids:
+        try:
+            key = int(room_id)
+        except (TypeError, ValueError):
+            continue
+        if key not in live_started_at or offline_at.get(key) is not None:
+            continue
+        offline_at[key] = value
+        filled += 1
+    return filled
+
+
 def update_offline_at(offline_at: dict, room_id: int, is_live: bool,
                       now: Optional[float] = None, *, was_live: bool = False) -> bool:
     """维护「最近关播时刻」（epoch 秒，就地更新字典），返回是否有变化（纯函数，两版共用）。
@@ -391,6 +449,27 @@ FOLLOWING_REFRESH_COOLDOWN_S = 600.0
 一次抓取要翻若干页（20 条/页，实测 600 条约 3.5 秒），只在「按直播状态」排序需要它时抓；
 该冷却避免频繁翻页（接口需登录态，频繁请求有风控风险）。
 """
+
+
+def following_fetch_due(last_fetched_at: Optional[float], now: float,
+                        cooldown: float = FOLLOWING_REFRESH_COOLDOWN_S) -> bool:
+    """现在是否该抓关注列表（纯函数，两版共用；ROADMAP 97）。
+
+    ``last_fetched_at`` 传 ``None`` 表示**本次运行还没抓过**，一律放行。以前用 ``0.0``
+    当「没抓过」的哨兵，而 ``time.monotonic()`` 在 Windows 上返回的是**开机以来的秒数**：
+    开机不满一个冷却时长（10 分钟）就启动程序时，``now - 0`` 小于冷却值，首次抓取被误判成
+    「刚抓过」而跳过；触发点只有「后台就绪」与「切到按直播状态」两处，一旦跳过就再没机会
+    重试——真实下播时刻一次都取不到，占位值（2000-01-01）让一半房间永远沉底。
+
+    ``now`` 用 ``time.monotonic()``（只比较运行期间的间隔），**不要**用 ``time.time()``。
+    """
+    if last_fetched_at is None:
+        return True
+    try:
+        elapsed = float(now) - float(last_fetched_at)
+    except (TypeError, ValueError):
+        return True  # 脏值：当作「没抓过」，宁可多抓一次也别永久不抓
+    return elapsed >= float(cooldown)
 
 
 def merge_offline_marks(local: dict, remote: dict) -> dict:
@@ -1373,6 +1452,16 @@ class ScMonitorApp:
         #   _offline_at   ：各房间最近一次关播时刻（仅排序用）
         # 读取时丢掉过旧/非法的记录（见 prune_live_marks），恢复情况由 restore_live_marks 记日志。
         self.live_started_at, self._offline_at = restore_live_marks(self.ui_prefs)
+        # 异常退出兜底（断电 / 硬关机 / 结束进程不会走 closeEvent）：上次仍在直播的房间
+        # 既无开播也无关播记录，用**配置文件最后一次落盘时刻**当估算下播时刻，避免下一步被
+        # 填成 2000-01-01 沉底。正常退出时退出估算已写过记录，这里不会命中。
+        last_saved = config_last_saved_at(self.config_path)
+        adopted = adopt_orphan_offline_marks(
+            self._offline_at, self.live_started_at, self.entries, last_saved)
+        if adopted:
+            log_data.info("已为 %d 个「上次退出时仍在直播」的房间补上估算关播时刻 %s"
+                          "（异常退出兜底，不再被填成占位值）",
+                          adopted, format_live_mark(last_saved))
         # 没记过关播时刻的房间（老数据）补一个「很久之前」的默认值：让它们确定性地沉底，
         # 而不是凭自定义顺序插进中间（ROADMAP 110）
         backfilled = backfill_offline_marks(self._offline_at, self.entries)
@@ -1380,10 +1469,12 @@ class ScMonitorApp:
             log_data.info("已为 %d 个没有关播记录的房间补上默认标记（很久之前，排序沉底）",
                           backfilled)
         self._live_duration_tick = 0.0  # 「已播」字段上次刷新时刻（秒级节流用）
-        # 关注列表给出的**真实下播时刻**（ROADMAP 97，仅本次运行有效）：程序关闭期间下播的
-        # 房间收不到关播信号，只能靠它排序；与 _offline_at 合并时取较晚的那个。
+        # 关注列表给出的**真实下播时刻**（ROADMAP 97）：程序关闭期间下播的房间收不到关播
+        # 信号，只能靠它排序；拿到后同时回写 `_offline_at` 并落盘（下次启动无需重抓）。
         self._remote_offline_at: Dict[int, float] = {}
-        self._following_fetched_at = 0.0  # 上次抓关注列表的时间(monotonic)，冷却用
+        # 上次抓关注列表的时间（monotonic）。None = 本次运行还没抓过，必须放行（见
+        # following_fetch_due：用 0.0 当哨兵会被开机秒数误判成「刚抓过」而永不抓取）
+        self._following_fetched_at: Optional[float] = None
         self._offline_estimate_done = False  # 退出时的「下播时刻估算」是否已落盘
         self._sort_dirty = False  # 「按直播状态」有房间状态变了、待本轮轮询末尾统一重排
         self._drag_warn_id: Optional[str] = None  # 「当前排序不可拖动」提示的 after id
@@ -5215,9 +5306,9 @@ class ScMonitorApp:
             log_data.debug("跳过关注列表抓取：后台未就绪或未登录（该接口需要登录态）")
             return
         now = time.monotonic()
-        if now - self._following_fetched_at < FOLLOWING_REFRESH_COOLDOWN_S:
+        if not following_fetch_due(self._following_fetched_at, now):
             log_data.debug("跳过关注列表抓取：距上次 %.0f 秒，未到 %.0f 秒冷却（%s）",
-                           now - self._following_fetched_at,
+                           now - float(self._following_fetched_at or 0.0),
                            FOLLOWING_REFRESH_COOLDOWN_S, reason)
             return
         self._following_fetched_at = now
@@ -5232,7 +5323,12 @@ class ScMonitorApp:
         self.ui_queue.put(("following", {"marks": marks}))
 
     def _on_following_marks(self, payload: dict) -> None:
-        """关注列表结果到达：更新排序用的下播时刻（只留我们监听的房间）。"""
+        """关注列表结果到达：更新排序用的下播时刻，并**回写落盘**（只留我们监听的房间）。
+
+        回写很关键：以前只存在内存里，每次启动都得重抓，抓不到（未登录 / 断网 / 没关注）
+        就退回 2000-01-01 占位，一半房间永远沉底。合并走 :func:`merge_offline_marks`
+        （同一房间取较晚值），不会覆盖运行期观测到的更新记录。
+        """
         marks: Dict[int, float] = {}
         for room_id, moment in (payload.get("marks") or {}).items():
             try:
@@ -5249,6 +5345,12 @@ class ScMonitorApp:
         self._remote_offline_at = marks
         log_room.debug("关注列表给出 %d 个监听房间的真实下播时刻（供「按直播状态」排序）",
                        len(marks))
+        merged = merge_offline_marks(self._offline_at, marks)
+        if merged != self._offline_at:
+            self._offline_at = merged
+            self._save_config()  # 真实下播时刻落盘：重启后无需再抓，也不怕抓取失败
+            log_room.info("「按直播状态」：%d 个真实下播时刻已合并进本地记录并落盘"
+                          "（现共 %d 个房间有下播时刻）", len(marks), len(merged))
         if self._sort_mode() == "status":
             self._sort_dirty = True  # 交给本轮轮询末尾统一重排（与其它重排路径一致）
 
@@ -5260,6 +5362,9 @@ class ScMonitorApp:
         （比真实下播时刻略早，但相对先后是对的）。之后若从关注列表拿到真实下播时刻，会取较晚
         的那个。只写一次，写的就是 ``_offline_at``（与运行期观测到的关播同一张表，**永久保留**
         ——它只参与排序、不驱动「已播」，不做按龄裁剪）。
+
+        走 :func:`update_offline_at` 而不是直接赋值：它保证**严格递增**（现有最大值 + 1ms），
+        同一轮退出的几个房间不再共用同一个时间戳，先后关系确定（否则组内只能退回自定义顺序）。
         """
         if self._offline_estimate_done:
             return
@@ -5267,11 +5372,12 @@ class ScMonitorApp:
         now = time.time()
         rooms = [int(room_id) for room_id, state in self.live_state.items()
                  if state == "直播中" and room_id in self.entries]
-        for room_id in rooms:
-            self._offline_at[room_id] = now
-        if rooms:
+        recorded = [room_id for room_id in rooms
+                    if update_offline_at(self._offline_at, room_id, False, now,
+                                         was_live=True)]
+        if recorded:
             log_room.debug("退出时记录 %d 个仍在直播的房间的下播时刻（估算，供重启后排序）：%s",
-                           len(rooms), sorted(rooms))
+                           len(recorded), sorted(recorded))
             self._save_config()
 
     def _sorted_room_ids(self) -> List[int]:
