@@ -6288,15 +6288,30 @@ class ScMonitorApp:
             except tk.TclError:
                 pass
 
-    def _run_dm_search(self, query: str = "") -> None:
+    def _run_dm_search(self, query: str = "", *,
+                       keep_current: bool = False) -> None:
+        """扫描当前弹幕文档，命中行按**最新优先**排列。
+
+        ``keep_current=True``（新弹幕到达 / 4000 行裁剪触发的重算）时保持当前命中、
+        不滚动视口——否则一来新弹幕就把用户正在看的结果拽回最新一条。
+        """
         bar = getattr(self, "dm_search_bar", None)
         if bar is None:
             return
         query = (query if isinstance(query, str) else "").strip()
+        old_index = self._dm_search_index
+        anchor = ""
+        if keep_current and self._dm_search_lines:
+            old_line = self._dm_search_lines[
+                max(0, min(old_index, len(self._dm_search_lines) - 1))]
+            try:
+                anchor = self.dm_text.get(f"{old_line}.0", f"{old_line}.end")
+            except tk.TclError:
+                anchor = ""
         self._dm_search_lines = []
-        self._dm_search_index = 0
         self._clear_dm_search_tags()
         if not query:
+            self._dm_search_index = 0
             bar.set_counter("无匹配")
             bar.set_navigation_enabled(False)
             return
@@ -6314,11 +6329,24 @@ class ScMonitorApp:
                 matches.append(line)
         matches.reverse()  # 优先最新（文档末尾）
         self._dm_search_lines = matches
+        if keep_current and matches:
+            found = next((i for i, line in enumerate(matches)
+                          if self._dm_line_text(line) == anchor), None)
+            self._dm_search_index = (found if found is not None
+                                     else min(old_index, len(matches) - 1))
+        else:
+            self._dm_search_index = 0
         bar.set_navigation_enabled(bool(matches))
-        bar.set_counter(search_counter(0, len(matches)))
+        bar.set_counter(search_counter(self._dm_search_index, len(matches)))
         self._refresh_dm_search_tags()
-        if matches:
-            self._scroll_to_dm_line(matches[0])
+        if matches and not keep_current:
+            self._scroll_to_dm_line(matches[self._dm_search_index])
+
+    def _dm_line_text(self, line: int) -> str:
+        try:
+            return self.dm_text.get(f"{line}.0", f"{line}.end")
+        except tk.TclError:
+            return ""
 
     def _step_dm_search(self, delta: int) -> None:
         total = len(self._dm_search_lines)
@@ -6361,10 +6389,11 @@ class ScMonitorApp:
             self.dm_text.tag_add("search_current", f"{line}.0", f"{line}.end")
 
     def _schedule_dm_search_tags(self) -> None:
+        """新弹幕 / 裁剪后去抖重算：保持当前命中，不跳回第一个。"""
         bar = getattr(self, "dm_search_bar", None)
         if bar is None or not bar.winfo_manager():
             return
-        self.root.after(200, self._refresh_dm_search_tags)
+        self.root.after(200, lambda: self._run_dm_search(keep_current=True))
 
     def _bind_autoscroll(self, text: tk.Text) -> None:
         """中键点击进入/退出快速滚动模式（同浏览器自动滚动）。

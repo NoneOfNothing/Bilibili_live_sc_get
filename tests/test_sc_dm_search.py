@@ -129,6 +129,47 @@ class DmSearchTests(_QtCase):
         self.assertEqual(panel.search_bar.counter.text(), "无匹配")
         self.assertFalse(panel.search_bar.next_btn.isEnabled())
 
+    def test_new_danmaku_keeps_current_hit(self):
+        """新弹幕到达时不能把当前命中重置为第 1 个（用户报告的 BUG）。"""
+        panel = self._panel()
+        panel._open_search()
+        panel.search_bar.set_query("天气")
+        panel._run_dm_search("天气")
+        panel._step_dm_search(1)
+        self.assertEqual(panel._dm_search_index, 1)
+        current = panel._dm_search_matches[1].text()
+
+        panel.append_dm_batch([
+            {"text": "新弹幕一条", "uname": "丁", "uid": 4, "dmid": "d", "time": 4},
+        ])
+        # 走真实接线：文档变化后由 200ms 定时器重算（必须带 keep_current）
+        panel._dm_search_refresh.stop()
+        panel._dm_search_refresh.timeout.emit()
+
+        self.assertEqual(panel._dm_search_index, 1, "当前命中被重置为第一个")
+        self.assertEqual(panel.search_bar.counter.text(), "第 2/2 个")
+        self.assertEqual(panel._dm_search_matches[1].text(), current)
+
+    def test_new_matching_danmaku_keeps_anchor(self):
+        """新增一条也命中的弹幕：命中数变化，但当前选中仍是原来那条。"""
+        panel = self._panel()
+        panel._open_search()
+        panel.search_bar.set_query("天气")
+        panel._run_dm_search("天气")
+        panel._step_dm_search(1)
+        current = panel._dm_search_matches[1].text()
+
+        panel.append_dm_batch([
+            {"text": "天气 又一条", "uname": "丁", "uid": 4, "dmid": "d", "time": 4},
+        ])
+        panel._dm_search_refresh.stop()
+        panel._dm_search_refresh.timeout.emit()
+
+        self.assertEqual(len(panel._dm_search_matches), 3)
+        self.assertEqual(panel._dm_search_matches[panel._dm_search_index].text(),
+                         current, "新增命中后锚点跑到别的记录了")
+        self.assertEqual(panel.search_bar.counter.text(), "第 3/3 个")
+
 
 class ScFullSearchTests(_QtCase):
     def setUp(self):
@@ -179,6 +220,21 @@ class ScFullSearchTests(_QtCase):
         self.assertEqual(self.panel.sc_text.extraSelections(), [])
         self.assertEqual(self.panel._search_hits, [])
 
+    def test_new_sc_keeps_search_index(self):
+        """新 SC 到达只重建高亮，不重置当前命中的序号。"""
+        self.panel._open_search()
+        self.panel._run_sc_search("消息")
+        _pump(self.panel, self.host)
+        self.panel._search_index = 10
+        self.panel.append_sc("2026-10-25 12:00:00", {
+            "id": 99999, "uid": 1, "user": {"uname": "新观众"},
+            "message": "消息 新内容", "price": 30, "time": 30,
+        })
+        self.panel._refresh_sc_search_highlight()
+        self.assertEqual(self.panel._search_index, 10,
+                         "新 SC 到达后搜索序号被重置")
+        self.assertEqual(len(self.panel._search_hits), 250)
+
 
 class TkSearchWiringTests(unittest.TestCase):
     def test_main_ctrl_f_follows_focus(self):
@@ -219,6 +275,20 @@ class TkSearchWiringTests(unittest.TestCase):
                 source = (PKG / module).read_text(encoding="utf-8")
                 self.assertIn("QKeySequence.Find", source)
                 self.assertIn("WidgetWithChildrenShortcut", source)
+
+    def test_tk_new_danmaku_keeps_hit(self):
+        """新弹幕到达后的重算必须带 keep_current（否则跳回第一个）。"""
+        for module, cls in (("gui_app.py", "ScMonitorApp"),
+                            ("tk_room_window.py", "RoomChatWindow")):
+            with self.subTest(module=module):
+                tree = _tree(module)
+                schedule = _method(tree, cls, "_schedule_dm_search_tags")
+                self.assertIn("keep_current=True", ast.unparse(schedule),
+                              f"{cls} 的新弹幕重算会重置搜索选中")
+                run = _method(tree, cls, "_run_dm_search")
+                args = {a.arg for a in run.args.args}
+                args |= {a.arg for a in run.args.kwonlyargs}
+                self.assertIn("keep_current", args)
 
     def test_qt_highlight_cleared_on_close(self):
         tree = _tree("qt_sc_panel.py")

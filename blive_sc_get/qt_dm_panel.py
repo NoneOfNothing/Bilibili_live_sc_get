@@ -317,7 +317,9 @@ class DmPanel(QWidget):
         self._dm_search_refresh = QTimer(self)
         self._dm_search_refresh.setSingleShot(True)
         self._dm_search_refresh.setInterval(200)
-        self._dm_search_refresh.timeout.connect(self._run_dm_search)
+        # 文档变化（新弹幕 / 裁剪）时**保持当前命中**重算，不能跳回第 1 个
+        self._dm_search_refresh.timeout.connect(
+            lambda: self._run_dm_search(keep_current=True))
         self.search_bar.queryChanged.connect(self._run_dm_search)
         self.search_bar.nextRequested.connect(lambda: self._step_dm_search(1))
         self.search_bar.prevRequested.connect(lambda: self._step_dm_search(-1))
@@ -584,16 +586,28 @@ class DmPanel(QWidget):
     def _clear_dm_search_highlight(self) -> None:
         self.dm_text.setExtraSelections([])
 
-    def _run_dm_search(self, query: str = "") -> None:
-        """扫描当前文档，命中块按**最新优先**排列；空查询清空高亮与计数。"""
+    def _run_dm_search(self, query: str = "", *,
+                       keep_current: bool = False) -> None:
+        """扫描当前文档，命中块按**最新优先**排列；空查询清空高亮与计数。
+
+        ``keep_current=True``（新弹幕到达 / 裁剪 / 换图触发的重算）时必须：
+        保持当前命中不跳回第 1 个，也不滚动视口——否则用户正在看某条结果，
+        一来新弹幕就被拽回最新，等于「搜索被打断」。
+        """
         bar = getattr(self, "search_bar", None)
         if bar is None:
             return
         query = (query or bar.query()).strip()
+        old_index = self._dm_search_index
+        anchor = ""
+        if keep_current and self._dm_search_matches:
+            current = self._dm_search_matches[
+                max(0, min(old_index, len(self._dm_search_matches) - 1))]
+            anchor = current.text()
         self._clear_dm_search_highlight()
         self._dm_search_matches = []
-        self._dm_search_index = 0
         if not query or not bar.isVisible():
+            self._dm_search_index = 0
             bar.set_counter("无匹配")
             bar.set_navigation_enabled(False)
             return
@@ -605,11 +619,19 @@ class DmPanel(QWidget):
             block = block.next()
         matches.reverse()  # 文档旧→新，反转后 0 = 最新
         self._dm_search_matches = matches
+        if keep_current and matches:
+            # 优先按锚点文本找回同一条命中；找不到（被裁剪）就退到原位置附近
+            found = next((i for i, item in enumerate(matches)
+                          if item.text() == anchor), None)
+            self._dm_search_index = (found if found is not None
+                                     else min(old_index, len(matches) - 1))
+        else:
+            self._dm_search_index = 0
         bar.set_navigation_enabled(bool(matches))
-        bar.set_counter(search_counter(0, len(matches)))
+        bar.set_counter(search_counter(self._dm_search_index, len(matches)))
         self._apply_dm_search_highlight(query)
-        if matches:
-            self._scroll_to_block(matches[0])
+        if matches and not keep_current:
+            self._scroll_to_block(matches[self._dm_search_index])
 
     def _apply_dm_search_highlight(self, query: str) -> None:
         """全部匹配浅黄背景；当前匹配（整行）橙色，覆盖在全部匹配之上。"""

@@ -497,6 +497,12 @@ Qt 主界面 / 房间独立窗口：滚轮、滚动条、中键三种方式全�
   `_close_sc_search`，别照抄主界面）。
 - **实时刷新**：新增 SC / 弹幕、翻页插入、表情图换图、4000 行裁剪后去抖（200ms）重建高亮，
   不重新读盘；只有输入变化才重新搜索。
+- **文档变化必须保持当前命中（2026-11-07 修复）**：`_run_dm_search(keep_current=True)` 时
+  先记当前命中的**文本锚点**，重算后按锚点找回同一条、**不滚动视口**；只有用户改查询词
+  （`queryChanged`）才回到「最新优先第 1 个」。Qt 的 200ms 定时器、Tk 两处的
+  `_schedule_dm_search_tags` 都必须传 `keep_current=True`——直接连无参 `_run_dm_search`
+  会让新弹幕一到就把选中重置为第一个（用户报告过的 BUG）。SC 侧 `_refresh_sc_search_highlight`
+  只重建高亮、不动 `_search_index`，同样不要改成重跑搜索。
 
 ### 测试
 
